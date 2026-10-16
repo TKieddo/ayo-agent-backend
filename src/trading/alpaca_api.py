@@ -247,23 +247,29 @@ class AlpacaAPI:
         return order
 
     async def place_take_profit(self, asset: str, is_long: bool, quantity: float, tp_price: float):
-        """Place a limit order that takes profit (sell for long, buy for short)."""
+        """Place a limit order that takes profit (sell for long, buy for short).
+
+        ``quantity`` is honored when smaller than the open position (scale-out).
+        """
         symbol = self._to_symbol(asset)
         qty = self._round_qty(asset, quantity)
         pos = await self._get_raw_position(symbol)
         if pos:
-            qty = self._round_qty(asset, abs(float(pos.get("qty", 0) or 0)))
+            pos_qty = self._round_qty(asset, abs(float(pos.get("qty", 0) or 0)))
+            if qty <= 0 or qty > pos_qty:
+                qty = pos_qty
         if qty <= 0:
             raise ValueError(f"No qty for TP on {asset}")
 
         side = "sell" if is_long else "buy"
+        tif = "gtc" if self.is_crypto(asset) else "day"
         body = {
             "symbol": symbol,
             "qty": str(qty),
             "side": side,
             "type": "limit",
             "limit_price": str(round(float(tp_price), 4)),
-            "time_in_force": "gtc",
+            "time_in_force": tif,
         }
         order = await self._retry(lambda: self._request("POST", "/v2/orders", json_body=body))
         logger.info(f"Alpaca TP {side.upper()} {symbol} @ {tp_price} qty={qty}")
@@ -275,18 +281,21 @@ class AlpacaAPI:
         qty = self._round_qty(asset, quantity)
         pos = await self._get_raw_position(symbol)
         if pos:
-            qty = self._round_qty(asset, abs(float(pos.get("qty", 0) or 0)))
+            pos_qty = self._round_qty(asset, abs(float(pos.get("qty", 0) or 0)))
+            if qty <= 0 or qty > pos_qty:
+                qty = pos_qty
         if qty <= 0:
             raise ValueError(f"No qty for SL on {asset}")
 
         side = "sell" if is_long else "buy"
+        tif = "gtc" if self.is_crypto(asset) else "day"
         body = {
             "symbol": symbol,
             "qty": str(qty),
             "side": side,
             "type": "stop",
             "stop_price": str(round(float(sl_price), 4)),
-            "time_in_force": "gtc",
+            "time_in_force": tif,
         }
         order = await self._retry(lambda: self._request("POST", "/v2/orders", json_body=body))
         logger.info(f"Alpaca SL {side.upper()} {symbol} @ {sl_price} qty={qty}")
@@ -306,6 +315,84 @@ class AlpacaAPI:
 
     async def _get_raw_position_async(self, symbol: str) -> Optional[Dict]:
         return await self._retry(lambda: self._get_raw_position(symbol))
+
+    @staticmethod
+    def _bar_timeframe(interval: str) -> str:
+        """Map bot intervals to Alpaca stock bar timeframes."""
+        m = {
+            "1m": "1Min",
+            "5m": "5Min",
+            "15m": "15Min",
+            "30m": "30Min",
+            "1h": "1Hour",
+            "4h": "4Hour",
+            "1d": "1Day",
+        }
+        return m.get((interval or "15m").lower(), "15Min")
+
+    async def get_stock_bars(
+        self,
+        asset: str,
+        interval: str = "15m",
+        limit: int = 100,
+    ) -> List[List[Any]]:
+        """OHLCV bars as [ts_ms, open, high, low, close, volume] for equities."""
+        symbol = self._to_symbol(asset)
+        if self.is_crypto(asset):
+            # Stock scanner/strategy should never request crypto pairs here
+            logger.warning(f"get_stock_bars called for crypto-like {asset}; skipping")
+            return []
+        tf = self._bar_timeframe(interval)
+        try:
+            data = await self._retry(
+                lambda: self._request(
+                    "GET",
+                    "/v2/stocks/bars",
+                    params={
+                        "symbols": symbol,
+                        "timeframe": tf,
+                        "limit": str(min(int(limit or 100), 1000)),
+                        "adjustment": "split",
+                        "feed": str(CONFIG.get("alpaca_data_feed") or "iex"),
+                    },
+                    base=self.data_base,
+                )
+            )
+            bars_map = (data or {}).get("bars") or {}
+            raw = bars_map.get(symbol) or []
+            if not isinstance(raw, list):
+                return []
+            out: List[List[Any]] = []
+            for b in raw:
+                ts = b.get("t") or b.get("timestamp")
+                try:
+                    if isinstance(ts, str):
+                        # 2024-01-02T14:30:00Z
+                        from datetime import datetime as _dt
+                        ts_ms = int(_dt.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+                    else:
+                        ts_ms = int(ts or 0)
+                except Exception:
+                    ts_ms = 0
+                out.append([
+                    ts_ms,
+                    float(b.get("o") or 0),
+                    float(b.get("h") or 0),
+                    float(b.get("l") or 0),
+                    float(b.get("c") or 0),
+                    float(b.get("v") or 0),
+                ])
+            return out
+        except Exception as e:
+            logger.error(f"Alpaca bars error for {asset}: {e}")
+            return []
+
+    async def get_clock(self) -> Dict[str, Any]:
+        try:
+            return await self._retry(lambda: self._request("GET", "/v2/clock")) or {}
+        except Exception as e:
+            logger.debug(f"Alpaca clock error: {e}")
+            return {}
 
     async def get_current_price(self, asset: str) -> float:
         symbol = self._to_symbol(asset)

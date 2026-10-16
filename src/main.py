@@ -30,6 +30,9 @@ from src.utils.trading_settings import get_trading_settings, get_max_leverage_fo
 from src.utils.volatility_stops import ExitPlan, build_exit_plan, normalize_tp_mode
 from src.utils import reentry_guard, profit_ladder, risk_governor
 from src.utils import mechanical_scalp as mech
+from src.utils import stock_strategy as stock_strat
+from src.utils.stock_session import is_stock_market_open_for_entries
+from src.stock_scanner import scan_stocks, stock_universe
 from src.utils.trend_filter import check_trend_agreement
 from src.utils.forex_session import is_forex_session_open, looks_like_forex as _looks_like_forex
 
@@ -67,6 +70,17 @@ _MECH_STATE: dict = {
     "last_pair_refresh_at": None,
     "managed_assets": set(),  # assets whose open position came from this book
     "open_trades": {},        # asset -> fill record (survives active_trades reconciliation)
+}
+
+# Alpaca stock book — independent of crypto mechanical / pair hunter
+_STOCK_STATE: dict = {
+    "active_set": [],         # scanner top-N symbols
+    "last_scan_at": None,
+    "managed_assets": set(),
+    "open_trades": {},        # symbol -> {entry, stop, tp, qty, side, scale_out_done}
+    "skips": {},
+    "last_cycle_at": None,
+    "scanner_rows": [],
 }
 _MECH_OI = mech.OIHistory()
 _MECH_STATS = mech.ScalpStats()
@@ -227,7 +241,7 @@ def main():
     taapi = TechnicalAnalysisClient()
     exchange_name = CONFIG.get("exchange", "aster").lower()
     
-    # Multi-exchange: explicit flag, or auto when IG + a crypto venue + FOREX_ASSETS are all set
+    # Multi-exchange: explicit flag, or auto when a second venue (IG/Alpaca) is configured
     use_multi_exchange = str(CONFIG.get("MULTI_EXCHANGE_MODE", "false")).lower() == "true"
     if not use_multi_exchange:
         _has_ig = bool(CONFIG.get("ig_api_key") and CONFIG.get("ig_username") and CONFIG.get("ig_password"))
@@ -237,9 +251,14 @@ def main():
             or (CONFIG.get("aster_user_address") and CONFIG.get("aster_private_key"))
         )
         _has_fx = bool(str(CONFIG.get("forex_assets") or "").strip())
+        _has_alpaca = bool(CONFIG.get("alpaca_api_key") and CONFIG.get("alpaca_api_secret"))
+        _has_stocks = bool(str(CONFIG.get("stock_assets") or "").strip())
         if _has_ig and _has_crypto and _has_fx:
             use_multi_exchange = True
             logging.info("🌐 Auto-enabled multi-exchange (crypto venue + IG forex credentials detected)")
+        elif _has_alpaca and _has_crypto and _has_stocks:
+            use_multi_exchange = True
+            logging.info("🌐 Auto-enabled multi-exchange (crypto venue + Alpaca stocks detected)")
 
     if use_multi_exchange:
         # Multi-exchange mode: trade on multiple exchanges simultaneously
@@ -682,6 +701,8 @@ def main():
                         "pnl": pnl_usd,
                         "executed_at": datetime.now(timezone.utc).isoformat(),
                         "order_id": f"mech-{setup_tag}-{key}-{int(datetime.now(timezone.utc).timestamp())}",
+                        "book": "crypto",
+                        "venue": "okx",
                     }
                     sb.table("trades").insert(row).execute()
                     add_event(f"💾 Mechanical close logged to trades: {key} [{setup_tag}] pnl=${pnl_usd:.2f} ({close_reason})")
@@ -1921,6 +1942,255 @@ def main():
             "reentry_cooldowns": reentry_guard.active_cooldowns(),
         }
 
+    def _alpaca_client():
+        """Return the Alpaca exchange only — never fall back to OKX for stocks."""
+        if use_multi_exchange and exchange_manager and exchange_manager.has_exchange("alpaca"):
+            return exchange_manager.exchanges.get("alpaca")
+        if exchange_name == "alpaca":
+            return hyperliquid
+        return None
+
+    async def _persist_stock_scanner_rows(rows: list) -> None:
+        if not rows:
+            return
+        try:
+            sb = _get_pair_hunter_supabase_client()
+            if not sb:
+                return
+            for row in rows:
+                try:
+                    sb.table("stock_scanner_stats").upsert(row, on_conflict="asset").execute()
+                except Exception as e:
+                    logging.debug(f"stock_scanner_stats upsert failed: {e}")
+        except Exception as e:
+            logging.debug(f"stock scanner persist skipped: {e}")
+
+    async def _log_stock_trade(symbol: str, side: str, size: float, price: float, pnl: float = 0.0, order_id: str = "") -> None:
+        try:
+            sb = _get_pair_hunter_supabase_client()
+            if not sb:
+                return
+            row = {
+                "symbol": symbol,
+                "side": side,
+                "size": abs(float(size or 0)) or 0.001,
+                "price": float(price or 0),
+                "fee": 0.0,
+                "pnl": float(pnl or 0),
+                "executed_at": datetime.now(timezone.utc).isoformat(),
+                "order_id": order_id or f"stock-{symbol}-{int(datetime.now(timezone.utc).timestamp())}",
+                "book": "stocks",
+                "venue": "alpaca",
+            }
+            sb.table("trades").insert(row).execute()
+        except Exception as e:
+            logging.warning(f"Stock trade insert failed for {symbol}: {e}")
+
+    async def _stock_book_cycle(trading_settings: dict) -> None:
+        """Alpaca-only stock cycle: scanner → trend/pullback → ATR SL / 1.5R TP + scale-out."""
+        alpaca = _alpaca_client()
+        if not alpaca:
+            return
+        pool = stock_universe()
+        if not pool:
+            return
+        if str(CONFIG.get("enable_stock_scanner", True)).lower() in ("0", "false", "no", "off"):
+            # Still allow trading the full curated pool when scanner is off
+            pass
+
+        cfg = stock_strat.resolve_stock_config(trading_settings)
+        now = datetime.now(timezone.utc)
+        _STOCK_STATE["last_cycle_at"] = now.isoformat()
+
+        # Refresh scanner on a clock
+        refresh_min = float(CONFIG.get("stock_scanner_refresh_minutes") or 15)
+        last_scan = _STOCK_STATE.get("last_scan_at")
+        need_scan = True
+        if last_scan:
+            try:
+                age = (now - datetime.fromisoformat(str(last_scan))).total_seconds()
+                need_scan = age >= refresh_min * 60
+            except Exception:
+                need_scan = True
+
+        enable_scanner = str(CONFIG.get("enable_stock_scanner", True)).lower() in ("1", "true", "yes", "on")
+        if enable_scanner and need_scan:
+            try:
+                active, rows = await scan_stocks(alpaca, top_n=int(CONFIG.get("stock_scanner_top_n") or 5), pool=pool)
+                if active:
+                    _STOCK_STATE["active_set"] = active
+                    _STOCK_STATE["scanner_rows"] = rows
+                    _STOCK_STATE["last_scan_at"] = now.isoformat()
+                    await _persist_stock_scanner_rows(rows)
+                    add_event(f"📈 STOCK SCANNER: {', '.join(active)}")
+                elif not _STOCK_STATE.get("active_set"):
+                    _STOCK_STATE["active_set"] = pool[: int(CONFIG.get("stock_scanner_top_n") or 5)]
+            except Exception as e:
+                add_event(f"⚠️ Stock scanner error: {e}")
+                if not _STOCK_STATE.get("active_set"):
+                    _STOCK_STATE["active_set"] = pool[: int(CONFIG.get("stock_scanner_top_n") or 5)]
+        elif not _STOCK_STATE.get("active_set"):
+            _STOCK_STATE["active_set"] = pool[: int(CONFIG.get("stock_scanner_top_n") or 5)]
+
+        # Live Alpaca positions for the stock book only
+        try:
+            state = await alpaca.get_user_state()
+        except Exception as e:
+            add_event(f"⚠️ Alpaca state error: {e}")
+            return
+        positions = state.get("positions") or []
+        open_map = {}
+        for p in positions:
+            sym = str(p.get("symbol") or p.get("coin") or "").upper()
+            qty = _safe_float(p.get("quantity") or p.get("szi"), 0)
+            if sym and abs(qty) > 0:
+                open_map[sym] = p
+
+        # Reconcile managed closes
+        for sym in list(_STOCK_STATE["managed_assets"]):
+            if sym not in open_map:
+                rec = _STOCK_STATE["open_trades"].pop(sym, {}) or {}
+                _STOCK_STATE["managed_assets"].discard(sym)
+                pnl = _safe_float(rec.get("last_unrealized"), 0)
+                add_event(f"📕 Stock closed {sym} (book=stocks)")
+                await _log_stock_trade(
+                    sym,
+                    "sell" if str(rec.get("side") or "buy") == "buy" else "buy",
+                    float(rec.get("qty") or 0),
+                    float(rec.get("entry") or 0),
+                    pnl=pnl,
+                )
+
+        # Scale-out at 1R + move stop to breakeven
+        for sym, pos in open_map.items():
+            rec = _STOCK_STATE["open_trades"].get(sym)
+            if not rec or rec.get("scale_out_done"):
+                continue
+            entry = _safe_float(rec.get("entry") or pos.get("entry_price") or pos.get("entryPx"), 0)
+            stop = _safe_float(rec.get("stop"), 0)
+            qty = abs(_safe_float(pos.get("quantity") or pos.get("szi"), 0))
+            px = _safe_float(pos.get("current_price") or pos.get("markPrice"), 0)
+            if entry <= 0 or stop <= 0 or qty <= 0 or px <= 0:
+                continue
+            stop_dist = abs(entry - stop)
+            if stop_dist <= 0:
+                continue
+            is_long = str(rec.get("side") or "buy") == "buy"
+            r_mult = ((px - entry) / stop_dist) if is_long else ((entry - px) / stop_dist)
+            trigger_r = float(rec.get("scale_out_at_r") or cfg["scale_out_at_r"])
+            frac = float(rec.get("scale_out_fraction") or cfg["scale_out_fraction"])
+            if r_mult < trigger_r or frac <= 0:
+                continue
+            close_qty = max(0.0001, round(qty * frac, 4))
+            try:
+                if is_long:
+                    await alpaca.place_sell_order(sym, close_qty, reduce_only=True)
+                else:
+                    await alpaca.place_buy_order(sym, close_qty, reduce_only=True)
+                # Re-pin stop to breakeven on remainder
+                remain = max(0.0, qty - close_qty)
+                if remain > 0:
+                    try:
+                        await alpaca.cancel_all_orders(sym)
+                    except Exception:
+                        pass
+                    await alpaca.place_stop_loss(sym, is_long, remain, entry)
+                    tp = _safe_float(rec.get("tp"), 0)
+                    if tp > 0:
+                        await alpaca.place_take_profit(sym, is_long, remain, tp)
+                rec["scale_out_done"] = True
+                rec["qty"] = remain
+                _STOCK_STATE["open_trades"][sym] = rec
+                add_event(f"✂️ Stock scale-out {sym}: {frac*100:.0f}% at {trigger_r}R → BE stop")
+            except Exception as e:
+                add_event(f"⚠️ Stock scale-out failed {sym}: {e}")
+
+        # Session gate for NEW entries only (exits/scale-out above still run).
+        # Alpaca /v2/clock is source of truth (weekends, NYSE holidays, early closes).
+        open_ok, sess = await is_stock_market_open_for_entries(
+            alpaca,
+            now=now,
+            allow_overnight=bool(cfg["allow_overnight"]),
+            entry_cutoff_minutes=int(cfg.get("entry_cutoff_minutes") or 10),
+        )
+        _STOCK_STATE["session"] = {"open": open_ok, "reason": sess, "at": now.isoformat()}
+        if not open_ok:
+            add_event(f"📊 Stocks session CLOSED ({sess}) — exits only, no new entries")
+            return
+
+        max_pos = int(cfg["max_positions"])
+        if len(open_map) >= max_pos:
+            return
+
+        candidates = [s for s in (_STOCK_STATE.get("active_set") or []) if s not in open_map]
+        for sym in candidates:
+            if len(open_map) + len([a for a in _STOCK_STATE["managed_assets"] if a not in open_map]) >= max_pos:
+                break
+            if sym in _STOCK_STATE["managed_assets"]:
+                continue
+            try:
+                # Re-check clock immediately before each order (session can flip mid-cycle)
+                still_open, sess2 = await is_stock_market_open_for_entries(
+                    alpaca,
+                    now=datetime.now(timezone.utc),
+                    allow_overnight=bool(cfg["allow_overnight"]),
+                    entry_cutoff_minutes=int(cfg.get("entry_cutoff_minutes") or 10),
+                )
+                if not still_open:
+                    add_event(f"📊 Stocks session flipped to CLOSED ({sess2}) — aborting entries")
+                    break
+                bars_15 = await alpaca.get_stock_bars(sym, interval=str(cfg["interval"]), limit=120)
+                bars_1h = await alpaca.get_stock_bars(sym, interval=str(cfg["htf_interval"]), limit=80)
+                result = stock_strat.evaluate(sym, bars_15 or [], bars_1h or [], settings=trading_settings, now=now)
+                if isinstance(result, stock_strat.StockSkip):
+                    _STOCK_STATE["skips"][sym] = {"reason": result.reason, "at": now.isoformat()}
+                    continue
+                sig = result
+                # Market entry + exchange-native SL/TP
+                if sig.is_long:
+                    order = await alpaca.place_buy_order(sym, sig.qty)
+                else:
+                    order = await alpaca.place_sell_order(sym, sig.qty)
+                try:
+                    await alpaca.place_stop_loss(sym, sig.is_long, sig.qty, sig.stop)
+                    await alpaca.place_take_profit(sym, sig.is_long, sig.qty, sig.take_profit)
+                except Exception as e:
+                    add_event(f"⚠️ Stock {sym}: entry ok but SL/TP pin failed: {e}")
+                oid = ""
+                try:
+                    oids = alpaca.extract_oids(order or {})
+                    oid = oids[0] if oids else ""
+                except Exception:
+                    pass
+                _STOCK_STATE["managed_assets"].add(sym)
+                _STOCK_STATE["open_trades"][sym] = {
+                    "entry": sig.entry,
+                    "stop": sig.stop,
+                    "tp": sig.take_profit,
+                    "qty": sig.qty,
+                    "side": sig.side,
+                    "scale_out_at_r": sig.scale_out_at_r,
+                    "scale_out_fraction": sig.scale_out_fraction,
+                    "scale_out_done": False,
+                    "notional": sig.notional,
+                    "risk_usd": sig.risk_usd,
+                    "book": "stocks",
+                    "venue": "alpaca",
+                    "opened_at": now.isoformat(),
+                }
+                open_map[sym] = {"symbol": sym, "quantity": sig.qty if sig.is_long else -sig.qty}
+                add_event(
+                    f"📗 STOCK {sig.side.upper()} {sym} qty={sig.qty} @~{sig.entry:.2f} "
+                    f"SL={sig.stop:.2f} TP={sig.take_profit:.2f} (${sig.notional:.0f} / risk ${sig.risk_usd:.1f}) "
+                    f"— {sig.rationale}"
+                )
+                await _log_stock_trade(sym, sig.side, sig.qty, sig.entry, pnl=0.0, order_id=oid)
+                # One new entry per cycle keeps the $200 book calm
+                break
+            except Exception as e:
+                add_event(f"⚠️ Stock entry failed {sym}: {e}")
+                logging.error(f"Stock entry error {sym}: {e}", exc_info=True)
+
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
         nonlocal invocation_count, initial_account_value
@@ -2317,8 +2587,16 @@ def main():
             ig_ready = bool(
                 use_multi_exchange and exchange_manager and "ig" in exchange_manager.exchanges
             )
-            # Strip any FX symbols that leaked into the crypto/pair-hunter list.
-            decision_assets = [a for a in decision_assets if not _looks_like_forex(a)]
+            # Strip any FX / stock symbols that leaked into the crypto/pair-hunter list.
+            _stock_set_decision = {
+                p.strip().upper()
+                for p in str(CONFIG.get("stock_assets") or "").replace(",", " ").split()
+                if p.strip()
+            }
+            decision_assets = [
+                a for a in decision_assets
+                if not _looks_like_forex(a) and (a or "").upper() not in _stock_set_decision
+            ]
             if not enable_forex:
                 add_event("💱 Forex PAUSED (ENABLE_FOREX=false) — crypto only this cycle")
             elif forex_assets and not ig_ready:
@@ -2371,6 +2649,17 @@ def main():
             _LIVE_SETTINGS.update(trading_settings)
             _LAST_KNOWN_EQUITY["value"] = float(account_value or 0.0) or _LAST_KNOWN_EQUITY.get("value")
             default_leverage = trading_settings["leverage"]
+
+            # ═════════════════════════════════════════════════════════════════
+            # STOCK BOOK (Alpaca only): scanner + trend/pullback. Runs even when
+            # crypto mechanical mode is on — never mixes into OKX / pair hunter.
+            # ═════════════════════════════════════════════════════════════════
+            try:
+                await _stock_book_cycle(trading_settings)
+            except Exception as e:
+                import traceback
+                add_event(f"❌ Stock book cycle error: {e}")
+                logging.error(f"Stock book cycle error: {traceback.format_exc()}")
 
             # ═════════════════════════════════════════════════════════════════
             # MECHANICAL MODE: DeepSeek is parked. No TAAPI pulls, no prompt, no
