@@ -1,3 +1,7 @@
+# ayo-agent-backend
+
+This is the trading bot. The website is the separate folder `ayo-dashboard`. Keys for running this bot are in `.env` in this folder.
+
 # Nocturne: AI Trading Agent
 
 This project implements an AI-powered trading agent that leverages LLM models to analyze real-time market data, make informed trading decisions, and execute trades on Aster DEX or Binance Futures. The agent runs in a continuous loop, monitoring specified cryptocurrency assets at configurable intervals, using technical indicators to decide on buy/sell/hold actions, and manages positions with take-profit and stop-loss orders.

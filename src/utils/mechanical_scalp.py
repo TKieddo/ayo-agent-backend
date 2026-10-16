@@ -1204,18 +1204,15 @@ class ScalpStats:
     def record_close(self, pnl_usd: float, fee_usd: float = 0.0) -> None:
         pnl = float(pnl_usd or 0.0)
         self.data["closes"] += 1
-        if pnl >= 0.5:
+        # Any non-zero result changes the account. Only an exact $0.00 close is flat.
+        if pnl > 0:
             self.data["wins"] += 1
             self.data["gross_profit"] += pnl
-        elif pnl <= -0.5:
+        elif pnl < 0:
             self.data["losses"] += 1
             self.data["gross_loss"] += abs(pnl)
         else:
             self.data["scratches"] += 1
-            if pnl >= 0:
-                self.data["gross_profit"] += pnl
-            else:
-                self.data["gross_loss"] += abs(pnl)
         self.data["fees"] += abs(float(fee_usd or 0.0))
         self.data["last_close"] = {"pnl": round(pnl, 4), "at": datetime.now(timezone.utc).isoformat()}
         self._save()

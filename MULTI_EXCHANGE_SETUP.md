@@ -2,19 +2,28 @@
 
 ## Overview
 
-Your trading system now supports **simultaneous trading on multiple exchanges**! You can trade crypto on Aster and Binance at the same time.
+Trade multiple asset classes in one agent process with **hard-split routing** (no cross-venue fallback):
+
+| List | Venue |
+|------|--------|
+| `CRYPTO_ASSETS` | OKX / Binance / Aster only |
+| `STOCK_ASSETS` | Alpaca only |
+| `FOREX_ASSETS` | IG only |
+
+If the required venue is missing or a symbol is unmapped, that asset is **skipped** — crypto never falls through to Alpaca, and stocks never hit OKX.
+
+Dashboard UI: Crypto \| Stocks \| Forex pill. Stocks/Forex tabs are scaffolding until Alpaca/IG keys + lists are enabled.
 
 ## How It Works
 
 ### Single Exchange Mode (Default)
 - Trade on ONE exchange at a time
-- Set `EXCHANGE=aster` or `EXCHANGE=binance` in `.env`
-- All assets trade on that single exchange
+- Set `EXCHANGE=okx`, `binance`, `aster`, `alpaca`, or `ig` in `.env`
+- Universe is filtered to that venue’s class only (e.g. OKX → `CRYPTO_ASSETS` only)
 
-### Multi-Exchange Mode (NEW!)
+### Multi-Exchange Mode
 - Trade on MULTIPLE exchanges simultaneously
-- Crypto assets (BTC, ETH, SOL) → Aster or Binance
-- System automatically routes each asset to the correct exchange
+- Explicit lists only — no “try the other broker” fallback
 
 ## Setup Instructions
 
@@ -42,17 +51,17 @@ ASSETS=BTC ETH SOL BNB AVAX
 INTERVAL=5m
 ```
 
-### 2. Asset Mapping
+### 2. Asset Mapping (hard-split)
 
-The system automatically maps assets to exchanges:
+```env
+CRYPTO_ASSETS=BTC ETH SOL
+STOCK_ASSETS=AAPL TSLA
+FOREX_ASSETS=EURUSD GBPUSD
+```
 
-**Crypto Assets** → Aster/Hyperliquid:
-- BTC, ETH, SOL, BNB, DOGE, XRP, ADA, etc.
-- Any asset that looks like crypto
-
-**Forex Pairs** → Pepperstone:
-- EURUSD, GBPUSD, USDJPY, AUDUSD, etc.
-- Any pair containing USD, EUR, GBP, JPY, etc.
+- **Crypto** → preferred `EXCHANGE`, then okx → binance → aster (never alpaca/ig)
+- **Stocks** → alpaca only (skip if Alpaca not initialized)
+- **Forex / metals** → ig only (skip if IG not initialized)
 
 ### 3. Run the Agent
 
@@ -72,10 +81,11 @@ The system will:
 - No need to switch between exchanges
 - All positions tracked in one dashboard
 
-### ✅ Automatic Routing
-- System automatically routes each asset to correct exchange
-- Crypto → Aster/Hyperliquid
-- Forex → Pepperstone
+### ✅ Hard-split routing
+- Crypto → OKX / Binance / Aster
+- Stocks → Alpaca
+- Forex → IG
+- No cross-venue fallback
 
 ### ✅ Aggregated View
 - See all positions from all exchanges

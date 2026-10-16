@@ -81,12 +81,10 @@ def record_close(
     _STATE.trades += 1
     _STATE.closes.append({"asset": asset, "pnl": pnl, "at": _now().isoformat()})
 
-    # Scratches under $0.50 are leftover partials, not a new decision. Counting them
-    # turned one bad idea into a 14-loss streak and then a 2-hour pause that expired
-    # mid-session so the bot went straight back in.
-    if pnl <= -0.50:
+    # Any loss below $0.00 extends the streak. Any profit above $0.00 clears it.
+    if pnl < 0:
         _STATE.consecutive_losses += 1
-    elif pnl >= 0.50:
+    elif pnl > 0:
         _STATE.consecutive_losses = 0
 
     max_streak = int(_setting(trading_settings, "max_consecutive_losses", 4) or 0)

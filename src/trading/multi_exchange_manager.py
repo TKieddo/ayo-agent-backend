@@ -66,11 +66,11 @@ class MultiExchangeManager:
                 self.exchanges["alpaca"] = AlpacaAPI()
                 paper = CONFIG.get("alpaca_paper", True)
                 self.exchange_configs["alpaca"] = {
-                    "type": "multi",
+                    "type": "stocks",
                     "name": f"Alpaca ({'paper' if paper else 'live'})",
                     "paper": paper,
                 }
-                logging.info(f"✅ Initialized Alpaca ({'paper' if paper else 'live'}) for stocks + crypto")
+                logging.info(f"✅ Initialized Alpaca ({'paper' if paper else 'live'}) for stocks only")
             except Exception as e:
                 logging.error(f"❌ Failed to initialize Alpaca: {e}")
 
@@ -117,51 +117,70 @@ class MultiExchangeManager:
         for name, config in self.exchange_configs.items():
             logging.info(f"   - {config['name']} ({config['type']})")
     
-    def _map_assets_to_exchanges(self):
-        """Map assets to their appropriate exchanges.
-        
-        Stocks -> Alpaca when available.
-        Crypto -> Aster/Binance preferred, else Alpaca.
-        """
-        def _split(raw: str) -> list:
-            if not raw:
-                return []
-            sep = "," if "," in raw else " "
-            return [a.strip().upper() for a in raw.split(sep) if a.strip()]
+    @staticmethod
+    def _split_assets(raw: str) -> list:
+        if not raw:
+            return []
+        sep = "," if "," in raw else " "
+        return [a.strip().upper() for a in raw.split(sep) if a.strip()]
 
-        crypto_assets = _split(CONFIG.get("crypto_assets") or "")
-        stock_assets = _split(CONFIG.get("stock_assets") or "")
-        forex_assets = _split(CONFIG.get("forex_assets") or "")
-        legacy = _split(CONFIG.get("assets") or "")
+    @staticmethod
+    def _looks_like_forex(asset_upper: str, forex_set: set) -> bool:
+        forex_ccy = ("USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD")
+        metals = ("XAUUSD", "XAGUSD", "GOLD", "SILVER")
+        return (
+            asset_upper in forex_set
+            or asset_upper in metals
+            or asset_upper.startswith("XAU")
+            or asset_upper.startswith("XAG")
+            or (
+                len(asset_upper) >= 6
+                and asset_upper[:3] in forex_ccy
+                and asset_upper[3:6] in forex_ccy
+            )
+        )
+
+    def _map_assets_to_exchanges(self):
+        """Hard-split: crypto→crypto venues only, stocks→Alpaca, forex→IG. No cross-venue fallback."""
+        crypto_assets = self._split_assets(CONFIG.get("crypto_assets") or "")
+        stock_assets = self._split_assets(CONFIG.get("stock_assets") or "")
+        forex_assets = self._split_assets(CONFIG.get("forex_assets") or "")
+        legacy = self._split_assets(CONFIG.get("assets") or "")
+
+        stock_set = set(stock_assets)
+        crypto_set = set(crypto_assets)
+        forex_set = set(forex_assets)
+
+        # Legacy ASSETS: crypto only when not claimed by stocks/forex lists.
+        for a in legacy:
+            if a in stock_set or a in forex_set or self._looks_like_forex(a, forex_set):
+                continue
+            if a not in crypto_set:
+                crypto_set.add(a)
+                crypto_assets.append(a)
+
         assets_list = []
         seen = set()
-        for a in crypto_assets + stock_assets + forex_assets + legacy:
+        for a in crypto_assets + stock_assets + forex_assets:
             if a not in seen:
                 seen.add(a)
                 assets_list.append(a)
 
-        stock_set = set(stock_assets)
-        crypto_set = set(crypto_assets)
+        CRYPTO_VENUES = ("okx", "binance", "aster")
 
         for asset_upper in assets_list:
-            # Explicit stocks always prefer Alpaca
-            if asset_upper in stock_set and "alpaca" in self.exchanges:
-                self.asset_to_exchange[asset_upper] = "alpaca"
+            # Stocks → Alpaca only (never IG / OKX)
+            if asset_upper in stock_set:
+                if "alpaca" in self.exchanges:
+                    self.asset_to_exchange[asset_upper] = "alpaca"
+                else:
+                    logging.warning(
+                        f"⚠️  Skipping {asset_upper}: stock requires Alpaca (not initialized)"
+                    )
                 continue
 
-            # Forex pairs (6+ char currency codes / FOREX_ASSETS) -> IG only.
-            # Never fall back to OKX/Binance — those venues have no EURUSD tickers.
-            forex_ccy = ("USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD")
-            metals = ("XAUUSD", "XAGUSD", "GOLD", "SILVER")
-            looks_forex = (
-                asset_upper in set(forex_assets)
-                or asset_upper in metals
-                or asset_upper.startswith("XAU")
-                or asset_upper.startswith("XAG")
-                or (len(asset_upper) >= 6 and any(c in asset_upper for c in forex_ccy)
-                    and asset_upper[:3] in forex_ccy and asset_upper[3:6] in forex_ccy)
-            )
-            if looks_forex:
+            # Forex / metals → IG only
+            if self._looks_like_forex(asset_upper, forex_set):
                 if "ig" in self.exchanges:
                     self.asset_to_exchange[asset_upper] = "ig"
                 else:
@@ -170,12 +189,12 @@ class MultiExchangeManager:
                     )
                 continue
 
-            # Crypto: prefer the configured EXCHANGE, then other futures venues, then Alpaca/IG
-            if asset_upper in crypto_set or asset_upper not in stock_set:
+            # Crypto → crypto venues only (never Alpaca / IG)
+            if asset_upper in crypto_set:
                 preferred = str(CONFIG.get("exchange") or "").lower()
                 crypto_order = []
-                for name in (preferred, "okx", "binance", "aster", "alpaca", "ig"):
-                    if name and name not in crypto_order:
+                for name in (preferred, "okx", "binance", "aster"):
+                    if name and name in CRYPTO_VENUES and name not in crypto_order:
                         crypto_order.append(name)
                 routed = False
                 for name in crypto_order:
@@ -184,100 +203,48 @@ class MultiExchangeManager:
                         routed = True
                         break
                 if not routed:
-                    logging.warning(f"⚠️  No exchange available for {asset_upper}")
+                    logging.warning(
+                        f"⚠️  Skipping {asset_upper}: no crypto venue (okx/binance/aster) available"
+                    )
                 continue
 
-            if "alpaca" in self.exchanges:
-                self.asset_to_exchange[asset_upper] = "alpaca"
-            elif "ig" in self.exchanges:
-                self.asset_to_exchange[asset_upper] = "ig"
-            else:
-                logging.warning(f"⚠️  No exchange available for {asset_upper}")
+            logging.warning(
+                f"⚠️  Skipping {asset_upper}: not in CRYPTO_ASSETS / STOCK_ASSETS / FOREX_ASSETS"
+            )
 
-        if assets_list:
-            logging.info(f"✅ Asset mapping complete: {len(assets_list)} assets -> {self.asset_to_exchange}")
+        if self.asset_to_exchange:
+            logging.info(
+                f"✅ Asset mapping complete (hard-split, no cross-venue fallback): "
+                f"{self.asset_to_exchange}"
+            )
         else:
-            logging.warning("⚠️  No assets configured in ASSETS / STOCK_ASSETS / CRYPTO_ASSETS")
-    
+            logging.warning(
+                "⚠️  No assets mapped — set CRYPTO_ASSETS / STOCK_ASSETS / FOREX_ASSETS"
+            )
+
     def get_exchange_for_asset(self, asset: str) -> Optional[Any]:
-        """Get the appropriate exchange for an asset.
-        
-        Args:
-            asset: Asset symbol (e.g., 'BTC', 'EURUSD')
-            
-        Returns:
-            Exchange instance or None
-        """
-        asset_upper = asset.upper()
-        forex_ccy = ("USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD")
-        looks_forex = (
-            asset_upper in ("XAUUSD", "XAGUSD", "GOLD", "SILVER")
-            or asset_upper.startswith("XAU")
-            or asset_upper.startswith("XAG")
-            or (len(asset_upper) >= 6 and asset_upper[:3] in forex_ccy and asset_upper[3:6] in forex_ccy)
-        )
-        if looks_forex:
-            if "ig" in self.exchanges:
-                return self.exchanges["ig"]
-            logging.warning(f"⚠️  No IG exchange for forex asset {asset_upper}")
+        """Map-only lookup. No cascade / auto-detect fallback across venues."""
+        asset_upper = (asset or "").upper()
+        if not asset_upper:
             return None
-        
-        # Check explicit mapping first
-        if asset_upper in self.asset_to_exchange:
-            exchange_name = self.asset_to_exchange[asset_upper]
-            exchange = self.exchanges.get(exchange_name)
-            if exchange:
-                return exchange
-            else:
-                logging.warning(f"⚠️  Exchange '{exchange_name}' not found for asset {asset_upper}")
-        
-        # Default to available crypto exchange
-        if "aster" in self.exchanges:
-            logging.debug(f"🔍 Auto-detected {asset_upper} -> Aster")
-            return self.exchanges["aster"]
-        elif "binance" in self.exchanges:
-            logging.debug(f"🔍 Auto-detected {asset_upper} -> Binance")
-            return self.exchanges["binance"]
-        elif "okx" in self.exchanges:
-            logging.debug(f"🔍 Auto-detected {asset_upper} -> OKX")
-            return self.exchanges["okx"]
-        elif "alpaca" in self.exchanges:
-            logging.debug(f"🔍 Auto-detected {asset_upper} -> Alpaca")
-            return self.exchanges["alpaca"]
-        
-        logging.error(f"❌ No exchange found for asset {asset_upper}")
+
+        exchange_name = self.asset_to_exchange.get(asset_upper)
+        if not exchange_name:
+            logging.warning(f"⚠️  No mapped venue for {asset_upper} (hard-split: skip)")
+            return None
+
+        exchange = self.exchanges.get(exchange_name)
+        if exchange:
+            return exchange
+        logging.warning(
+            f"⚠️  Mapped venue '{exchange_name}' not initialized for {asset_upper}"
+        )
         return None
-    
+
     def get_exchange_name_for_asset(self, asset: str) -> Optional[str]:
-        """Get the exchange name for an asset.
-        
-        Args:
-            asset: Asset symbol
-            
-        Returns:
-            Exchange name or None
-        """
-        asset_upper = asset.upper()
-        
-        if asset_upper in self.asset_to_exchange:
-            return self.asset_to_exchange[asset_upper]
-        
-        # Auto-detect
-        forex_indicators = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"]
-        if len(asset_upper) >= 6 and any(fx in asset_upper for fx in forex_indicators):
-            if "ig" in self.exchanges:
-                return "ig"
-            return "pepperstone" if "pepperstone" in self.exchanges else None
-        
-        if "aster" in self.exchanges:
-            return "aster"
-        elif "binance" in self.exchanges:
-            return "binance"
-        elif "okx" in self.exchanges:
-            return "okx"
-        elif "hyperliquid" in self.exchanges:
-            return "hyperliquid"
-        return None
+        """Map-only venue name. No auto-detect."""
+        asset_upper = (asset or "").upper()
+        return self.asset_to_exchange.get(asset_upper)
     
     async def get_all_positions(self) -> Dict[str, List[Dict[str, Any]]]:
         """Get positions from all exchanges.
@@ -350,14 +317,7 @@ class MultiExchangeManager:
         return {"balance": balance, "total_value": total_value, "positions": positions}
 
     def get_exchanges_by_type(self, exchange_type: str) -> Dict[str, Any]:
-        """Get all exchanges of a specific type.
-        
-        Args:
-            exchange_type: "crypto" (only crypto exchanges are supported)
-            
-        Returns:
-            Dictionary of exchange name -> exchange instance
-        """
+        """Get all exchanges of a specific type (crypto | stocks | forex)."""
         return {
             name: exchange
             for name, exchange in self.exchanges.items()

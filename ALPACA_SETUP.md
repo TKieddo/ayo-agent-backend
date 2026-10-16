@@ -1,6 +1,10 @@
-# Alpaca Setup (Stocks + Crypto)
+# Alpaca Setup (Stocks only)
 
-Wire the AYO bot to Alpaca **paper** trading for US stocks and crypto.
+Wire the AYO bot to Alpaca **paper** trading for US **stocks**.
+
+**Hard-split rule:** `STOCK_ASSETS` → Alpaca only. Crypto stays on OKX/Binance/Aster via `CRYPTO_ASSETS` — there is **no** crypto→Alpaca or stock→OKX fallback. Unmapped symbols are skipped.
+
+Dashboard **Stocks** tab is UI scaffolding until you enable keys + `STOCK_ASSETS` below.
 
 ## 1. Get API keys
 
@@ -11,7 +15,7 @@ Wire the AYO bot to Alpaca **paper** trading for US stocks and crypto.
 
 Use **Trading API** keys — not Broker API.
 
-## 2. `.env` settings
+## 2. Alpaca-only process
 
 ```bash
 EXCHANGE=alpaca
@@ -19,68 +23,58 @@ ALPACA_API_KEY=your_key_id
 ALPACA_API_SECRET=your_secret
 ALPACA_PAPER=true
 
-# Stocks + crypto the bot will trade
 STOCK_ASSETS=AAPL TSLA NVDA MSFT
-CRYPTO_ASSETS=BTC ETH SOL
 INTERVAL=15m
 
-# Alpaca is not crypto-futures leverage — keep this low
 DEFAULT_LEVERAGE=1
 ALPACA_LEVERAGE=1
 MARGIN_PER_POSITION=100
 POSITION_SIZING_MODE=margin
 MAX_POSITIONS=4
 
-# Keep exits on (your close-path fixes)
 AGENT_MANAGE_EXITS=true
 ENABLE_STOP_LOSS_ORDERS=true
 TRADING_ENABLED=true
-
-# Still required for the LLM
 DEEPSEEK_API_KEY=your_deepseek_key
 ```
 
-Optional: put everything in one list:
+Do **not** put crypto tickers in `STOCK_ASSETS`. Do not rely on a mixed `ASSETS=` list for multi-venue routing.
+
+## 3. Multi-exchange (OKX crypto + Alpaca stocks)
 
 ```bash
-ASSETS=AAPL TSLA BTC ETH
+MULTI_EXCHANGE_MODE=true
+EXCHANGE=okx
+
+# OKX crypto
+OKX_API_KEY=...
+OKX_API_SECRET=...
+OKX_PASSPHRASE=...
+CRYPTO_ASSETS=BTC ETH SOL
+
+# Alpaca stocks
+ALPACA_API_KEY=...
+ALPACA_API_SECRET=...
+ALPACA_PAPER=true
+STOCK_ASSETS=AAPL TSLA
 ```
 
-## 3. Run
+Boot log should show routing like `{'BTC': 'okx', 'AAPL': 'alpaca'}` — never `BTC → alpaca`.
+
+## 4. Run
 
 ```bash
 cd "AYO-Trading-Agent-Backend---AI--main"
-# install deps if needed
 poetry install   # or: pip install -e .
 python -m src.main
 ```
 
-You should see:
-
-```text
-✅ Using Alpaca (paper) for stocks + crypto
-💰 Account Balance / Buying Power: $...
-```
-
-## 4. Notes
+## 5. Notes
 
 | Topic | Detail |
 |--------|--------|
 | Paper vs live | Keep `ALPACA_PAPER=true` until exits look solid |
 | Leverage | Spot/margin buying power — not 10x perps |
-| Market hours | US stocks: regular session; crypto: 24/7 on Alpaca |
+| Market hours | US stocks: regular session |
 | PDT | Live accounts under $25k have day-trade limits |
-| Data | Stock bars use Alpaca IEX feed (free); crypto can use Alpaca or Binance public data |
-
-## 5. Multi-exchange (optional)
-
-To keep Binance/Aster for crypto futures and Alpaca for stocks:
-
-```bash
-MULTI_EXCHANGE_MODE=true
-# set Binance/Aster keys AND Alpaca keys
-STOCK_ASSETS=AAPL TSLA
-CRYPTO_ASSETS=BTC ETH
-```
-
-Stocks route to Alpaca; crypto prefers Aster/Binance when configured.
+| Mechanical scalp | Crypto/OKX only — does not trade Alpaca stocks |

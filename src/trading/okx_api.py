@@ -791,15 +791,35 @@ class OKXAPI:
             logger.debug(f"OKX algo orders: {e}")
         return out
 
+    def _page_swap_fills(self, limit: int) -> List[Dict]:
+        """Walk OKX fills-history backward so a busy day cannot erase earlier closes."""
+        begin_ms = int((time.time() - 21 * 24 * 3600) * 1000)
+        wanted = max(1, int(limit))
+        after = None
+        rows: List[Dict] = []
+        for _ in range(25):
+            params = {"instType": "SWAP", "limit": "100", "begin": str(begin_ms)}
+            if after:
+                params["after"] = str(after)
+            data = self._request("GET", "/api/v5/trade/fills-history", params=params)
+            batch = data if isinstance(data, list) else []
+            if not batch:
+                break
+            rows.extend(batch)
+            oldest = batch[-1]
+            after = oldest.get("billId")
+            try:
+                oldest_ts = int(oldest.get("ts") or oldest.get("fillTime") or 0)
+            except (TypeError, ValueError):
+                oldest_ts = 0
+            if len(batch) < 100 or not after or oldest_ts <= begin_ms or len(rows) >= wanted:
+                break
+            time.sleep(0.2)
+        return rows[:wanted]
+
     async def get_recent_fills(self, limit: int = 50) -> List[Dict]:
         try:
-            data = await self._retry(
-                lambda: self._request(
-                    "GET",
-                    "/api/v5/trade/fills-history",
-                    params={"instType": "SWAP", "limit": str(min(limit, 100))},
-                )
-            )
+            data = await self._retry(self._page_swap_fills, max(limit, 1000))
             out = []
             for f in data if isinstance(data, list) else []:
                 asset = self._from_inst_id(f.get("instId", ""))

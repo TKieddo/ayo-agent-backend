@@ -191,19 +191,29 @@ def main():
     assets_env = CONFIG.get("assets")
     interval_env = CONFIG.get("interval")
     if (not args.assets or len(args.assets) == 0):
+        # Hard-split by venue type: never mix stocks into an OKX-only process (or
+        # crypto into Alpaca-only). Forex stays out of the base list until IG is live.
+        exchange_for_universe = (CONFIG.get("exchange") or "aster").lower()
+        multi_flag = str(CONFIG.get("MULTI_EXCHANGE_MODE", "false")).lower() == "true"
         merged = []
-        # Forex is IG-only. Do not merge FOREX_ASSETS into the base universe here —
-        # the loop adds them only when IG is live (avoids OKX 51001 spam when IG is down).
-        for key in ("crypto_assets", "stock_assets", "assets"):
-            merged.extend(_split_assets(CONFIG.get(key) or ""))
-        # Deduplicate while preserving order
+        if multi_flag:
+            for key in ("crypto_assets", "stock_assets", "assets"):
+                merged.extend(_split_assets(CONFIG.get(key) or ""))
+        elif exchange_for_universe in ("alpaca",):
+            merged.extend(_split_assets(CONFIG.get("stock_assets") or ""))
+        elif exchange_for_universe in ("ig", "ig.com", "igmarkets"):
+            merged.extend(_split_assets(CONFIG.get("forex_assets") or ""))
+        else:
+            # Crypto venues (okx / binance / aster): CRYPTO_ASSETS + legacy ASSETS only
+            merged.extend(_split_assets(CONFIG.get("crypto_assets") or ""))
+            merged.extend(_split_assets(CONFIG.get("assets") or ""))
         seen = set()
         args.assets = []
         for a in merged:
             if a not in seen:
                 seen.add(a)
                 args.assets.append(a)
-        if not args.assets and assets_env:
+        if not args.assets and assets_env and exchange_for_universe not in ("alpaca", "ig", "ig.com", "igmarkets"):
             args.assets = _split_assets(assets_env)
     if not args.interval and interval_env:
         args.interval = interval_env
@@ -687,11 +697,10 @@ def main():
                 logging.warning(f"Mechanical trade close insert failed for {key}: {e}")
 
         stats = pair_hunter_stats.get(key, {})
-        # Dust closes (partial leftovers under $0.50) were counted as full losses and
-        # dragged win rate to 0% on coins that had not actually been decided yet.
-        is_win = pnl_usd >= 0.50
-        is_loss = pnl_usd <= -0.50
-        total_trades = int(stats.get("total_trades", 0) or 0) + (1 if (is_win or is_loss) else 0)
+        # Every non-zero close counts. A few cents still changes the account.
+        is_win = pnl_usd > 0
+        is_loss = pnl_usd < 0
+        total_trades = int(stats.get("total_trades", 0) or 0) + 1
         wins = int(stats.get("wins", 0) or 0) + (1 if is_win else 0)
         losses = int(stats.get("losses", 0) or 0) + (1 if is_loss else 0)
         total_pnl_usd = float(stats.get("total_pnl_usd", 0.0) or 0.0) + pnl_usd
@@ -934,15 +943,36 @@ def main():
         return "mainnet", exchange_name
 
     def _ex_for(asset: str):
-        """Return the exchange that should handle this asset (IG for forex, OKX for crypto)."""
+        """Return the mapped venue for this asset. No cross-venue fallback."""
         if use_multi_exchange and exchange_manager:
-            ex = exchange_manager.get_exchange_for_asset(asset)
-            # Do not fall back to OKX for forex/metals when IG is missing.
-            if ex is None and _looks_like_forex(asset):
-                return None
-            return ex or hyperliquid
+            return exchange_manager.get_exchange_for_asset(asset)
         if _looks_like_forex(asset) and str(CONFIG.get("ENABLE_FOREX", "true")).lower() not in ("1", "true", "yes", "on"):
             return None
+        # Single-exchange: only trade the class that matches this process
+        if exchange_name in ("alpaca",) and _looks_like_forex(asset):
+            return None
+        if exchange_name in ("okx", "binance", "aster") and _looks_like_forex(asset):
+            return None
+        stock_set = {
+            p.strip().upper()
+            for p in str(CONFIG.get("stock_assets") or "").replace(",", " ").split()
+            if p.strip()
+        }
+        crypto_set = {
+            p.strip().upper()
+            for p in str(CONFIG.get("crypto_assets") or CONFIG.get("assets") or "").replace(",", " ").split()
+            if p.strip()
+        }
+        au = (asset or "").upper()
+        if exchange_name == "alpaca":
+            return hyperliquid if (not stock_set or au in stock_set) else None
+        if exchange_name in ("okx", "binance", "aster"):
+            if stock_set and au in stock_set:
+                return None
+            if crypto_set and au not in crypto_set and au not in stock_set:
+                # Allow mechanical universe symbols not listed in CRYPTO_ASSETS
+                pass
+            return hyperliquid
         return hyperliquid
 
     def _settings_for_asset(asset: str, base_settings: dict) -> dict:
@@ -1116,6 +1146,9 @@ def main():
             return False
         try:
             ex = _ex_for(asset)
+            if ex is None:
+                add_event(f"⚠️  Skip close for {asset}: no mapped venue ({reason})")
+                return False
             close_action = "sell" if is_long else "buy"
             if is_long:
                 await ex.place_sell_order(asset, size, reduce_only=True)
@@ -1226,7 +1259,11 @@ def main():
                 pos.get("entry_price") or pos.get("entryPx") or pos.get("entryPrice"), 0.0
             )
             try:
-                current = _safe_float(await _ex_for(asset).get_current_price(asset), 0.0)
+                _px_ex = _ex_for(asset)
+                if _px_ex is None:
+                    current = _safe_float(pos.get("current_price") or pos.get("markPrice"), 0.0)
+                else:
+                    current = _safe_float(await _px_ex.get_current_price(asset), 0.0)
             except Exception:
                 current = _safe_float(pos.get("current_price") or pos.get("markPrice"), 0.0)
             upl = _safe_float(
@@ -1926,10 +1963,19 @@ def main():
                 # Get the appropriate exchange for this asset
                 # In multi-exchange mode, use exchange_manager; otherwise use the single exchange
                 if use_multi_exchange and exchange_manager and coin:
-                    asset_exchange = exchange_manager.get_exchange_for_asset(coin) or exchange
+                    asset_exchange = exchange_manager.get_exchange_for_asset(coin)
+                    if asset_exchange is None:
+                        # Position may carry its own exchange tag from merged state
+                        pos_ex_name = (pos.get("exchange") or "").lower()
+                        asset_exchange = exchange_manager.exchanges.get(pos_ex_name) if pos_ex_name else None
+                    if asset_exchange is None:
+                        logging.debug(f"Skipping mark price for {coin}: no mapped venue")
+                        current_px = None
+                    else:
+                        current_px = await asset_exchange.get_current_price(coin) if coin else None
                 else:
                     asset_exchange = exchange
-                current_px = await asset_exchange.get_current_price(coin) if coin else None
+                    current_px = await asset_exchange.get_current_price(coin) if coin else None
                 
                 # Calculate PnL in dollars and percentage (same logic as PositionsTable)
                 unrealized_pnl = round_or_none(pos.get('pnl'), 4) or 0
@@ -2344,10 +2390,31 @@ def main():
                         f"Setups: session_impulse / range_mr / breakout_retest. Universe: {univ}…"
                     )
                     run_loop._mech_announced = True
-                candidates = [a for a in mech.liquid_universe(mech_cfg) if not _looks_like_forex(a)]
+                # Mechanical is crypto/OKX-only — never pull Alpaca stocks or IG forex into the loop
+                _mech_stock_set = {
+                    p.strip().upper()
+                    for p in str(CONFIG.get("stock_assets") or "").replace(",", " ").split()
+                    if p.strip()
+                }
+                _CRYPTO_VENUES = ("okx", "binance", "aster")
+
+                def _mech_allowed(sym: str) -> bool:
+                    au = (sym or "").upper()
+                    if not au or _looks_like_forex(au) or au in _mech_stock_set:
+                        return False
+                    if use_multi_exchange and exchange_manager:
+                        mapped = exchange_manager.get_exchange_name_for_asset(au)
+                        if mapped and mapped not in _CRYPTO_VENUES:
+                            return False
+                    return True
+
+                candidates = [a for a in mech.liquid_universe(mech_cfg) if _mech_allowed(a)]
                 for pos in positions:
                     a = str(pos.get("symbol") or pos.get("coin") or "").upper()
-                    if a and a not in candidates and not _looks_like_forex(a):
+                    pos_ex = str(pos.get("exchange") or "").lower()
+                    if pos_ex and pos_ex not in _CRYPTO_VENUES:
+                        continue
+                    if a and a not in candidates and _mech_allowed(a):
                         candidates.insert(0, a)
                 try:
                     await _mechanical_cycle(trading_settings, state, positions, candidates)
@@ -2366,7 +2433,7 @@ def main():
                 try:
                     asset_exchange = _ex_for(asset)
                     if asset_exchange is None:
-                        add_event(f"⏭️  Skipping {asset}: no exchange available (forex needs IG)")
+                        add_event(f"⏭️  Skipping {asset}: no mapped venue (hard-split)")
                         continue
                     current_price = await asset_exchange.get_current_price(asset)
                     if not current_price or float(current_price) <= 0:
@@ -4031,6 +4098,9 @@ def main():
                         # Get exchange max leverage for this asset
                         # Size against the venue that will take the order (IG cash ≠ OKX equity).
                         ex = _ex_for(asset)
+                        if ex is None:
+                            add_event(f"⏭️  Skipping entry for {asset}: no mapped venue (hard-split)")
+                            continue
                         try:
                             venue_state = await ex.get_user_state()
                             available_balance = float(venue_state.get("balance") or state.get("balance", 0.0) or 0)
@@ -5631,7 +5701,7 @@ def main():
             
             # Get all trades using get_recent_fills with timeout
             try:
-                trades = await asyncio.wait_for(exchange.get_recent_fills(limit=limit), timeout=12.0)
+                trades = await asyncio.wait_for(exchange.get_recent_fills(limit=max(limit, 1000)), timeout=30.0)
             except asyncio.TimeoutError:
                 logger.warning("get_recent_fills timed out after 12s, returning empty trades")
                 return web.json_response({
