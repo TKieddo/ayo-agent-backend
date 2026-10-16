@@ -6351,9 +6351,15 @@ def main():
             if amount <= 0:
                 return web.json_response({"error": "amount must be greater than 0"}, status=400)
             
-            # Get current price
+            # Get current price — _ex_for returns None when this process has no venue for the asset
+            ex = _ex_for(asset)
+            if ex is None:
+                return web.json_response(
+                    {"error": f"No exchange mapped for {asset} in this agent"},
+                    status=404,
+                )
             try:
-                current_price = await _ex_for(asset).get_current_price(asset)
+                current_price = await ex.get_current_price(asset)
                 if not current_price or current_price <= 0:
                     return web.json_response({"error": f"Could not get price for {asset}"}, status=404)
             except Exception as e:
@@ -6366,7 +6372,7 @@ def main():
             leverage = get_leverage_for_asset(asset, trading_settings.get('leverage', 10))
             
             # Get max leverage for asset from exchange
-            max_leverage = await get_max_leverage_for_asset(_ex_for(asset), asset)
+            max_leverage = await get_max_leverage_for_asset(ex, asset)
             leverage = min(leverage, max_leverage)
             
             # Calculate position size
