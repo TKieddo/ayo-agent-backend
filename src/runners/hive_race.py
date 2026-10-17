@@ -529,48 +529,54 @@ async def _refresh_ayo() -> None:
         start = float(_STATE.get("ayo_start_equity") or equity or START_EQUITY)
         positions = state.get("positions") or []
         pos = None
+        best_notional = -1.0
         upl_total = 0.0
+        open_count = 0
         for p in positions:
             try:
-                sz = float(p.get("size") or p.get("szi") or 0)
+                sz = float(p.get("size") or p.get("szi") or p.get("quantity") or 0)
             except (TypeError, ValueError):
                 sz = 0.0
             if abs(sz) <= 0:
                 continue
+            open_count += 1
             side = "long" if sz > 0 else "short"
-            coin = str(p.get("coin") or p.get("asset") or "").upper().replace("-USDT-SWAP", "").replace("-USDT", "")
+            coin = str(p.get("coin") or p.get("symbol") or p.get("asset") or "").upper()
+            coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "")
             entry = float(p.get("entryPx") or p.get("entry_price") or p.get("avgPx") or 0)
-            notional = abs(float(p.get("notionalUsd") or p.get("notional") or (abs(sz) * entry)))
+            mark = float(p.get("markPrice") or p.get("current_price") or entry)
+            notional = abs(float(p.get("notionalUsd") or p.get("notional") or (abs(sz) * (mark or entry or 0))))
             upl = float(p.get("pnl") or p.get("unrealized_pnl") or p.get("upl") or p.get("unrealizedPnl") or 0)
             upl_total += upl
-            if pos is None:
+            if notional >= best_notional:
+                best_notional = notional
                 pos = {
                     "coin": coin or "?",
                     "side": side,
                     "notional": round(notional, 2),
                     "entry_px": entry,
-                    "stop_px": float(p.get("stop_px") or 0),
-                    "added": notional > ENTRY_NOTIONAL * 1.2,
+                    "stop_px": float(p.get("stop_px") or p.get("liquidation_price") or p.get("liquidationPx") or 0),
+                    "added": False,
                 }
-        # Race rows share a $300 sheet. AYO's account is larger, so the comparable
-        # number is that sheet plus live open PnL. Account equity stays in the note.
-        mtm = START_EQUITY + upl_total
-        pct = (upl_total / START_EQUITY * 100) if START_EQUITY else 0.0
+        # Show the real OKX book on the race board (not the $300 race ledger).
+        pct = ((equity - start) / start * 100) if start else 0.0
         _STATE["runners"]["ayo"] = {
             "configured": True,
-            "equity": round(mtm, 4),
-            "mtm": round(mtm, 4),
+            "equity": round(equity, 4),
+            "mtm": round(equity, 4),
             "account_equity": round(equity, 2),
+            "ayo_start_equity": round(start, 2),
             "pct": round(pct, 2),
             "upl": round(upl_total, 4),
             "position": pos,
+            "open_count": open_count,
             "trades_today": 0,
             "fees_today": 0,
             "max_dd_pct": 0,
             "cap": None,
             "error": None,
             "trades": [],
-            "note": f"Live OKX book · account ${equity:,.0f}",
+            "note": f"Live OKX book · {open_count} open · race start ${start:,.0f}",
         }
     except Exception as exc:
         raw = _STATE["runners"].get("ayo") or {}
@@ -640,6 +646,9 @@ def snapshot() -> dict:
                 "pct": None if pct is None else round(float(pct), 2),
                 "upl": raw.get("upl"),
                 "position": pos,
+                "open_count": raw.get("open_count"),
+                "account_equity": raw.get("account_equity"),
+                "ayo_start_equity": raw.get("ayo_start_equity"),
                 "trades_today": raw.get("trades_today", 0),
                 "fees_today": raw.get("fees_today", 0),
                 "max_dd_pct": raw.get("max_dd_pct", 0),
