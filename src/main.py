@@ -38,6 +38,58 @@ from src.utils.forex_session import is_forex_session_open, looks_like_forex as _
 
 load_dotenv()
 
+# Coolify probes / as soon as the container starts. Exchange init takes several
+# seconds, so answer health on PORT immediately, then hand the port to aiohttp.
+_EARLY_HEALTH = {"server": None}
+
+
+def _api_bind():
+    host = os.getenv("API_HOST") or os.getenv("HOST") or "0.0.0.0"
+    port = int(os.getenv("PORT") or os.getenv("APP_PORT") or os.getenv("API_PORT") or "8080")
+    return host, port
+
+
+def start_early_health_server() -> None:
+    """Serve GET / and /health before the main aiohttp app is ready."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    host, port = _api_bind()
+
+    class _BootHealth(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = b'{"ok":true,"service":"ayo-trading-agent","booting":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A003
+            return
+
+    try:
+        server = ThreadingHTTPServer((host, port), _BootHealth)
+    except OSError as exc:
+        logging.warning("Early health server could not bind %s:%s (%s)", host, port, exc)
+        return
+    _EARLY_HEALTH["server"] = server
+    threading.Thread(target=server.serve_forever, name="early-health", daemon=True).start()
+    logging.info("Early health server listening on %s:%s", host, port)
+
+
+def stop_early_health_server() -> None:
+    server = _EARLY_HEALTH.get("server")
+    if not server:
+        return
+    try:
+        server.shutdown()
+        server.server_close()
+    except Exception:
+        pass
+    _EARLY_HEALTH["server"] = None
+
+
 
 def _safe_float(value, default: float = 0.0) -> float:
     """float() that tolerates None / '' / bad LLM JSON (avoids TypeError on NoneType)."""
@@ -161,7 +213,9 @@ logging.info("=" * 80)
 
 
 def clear_terminal():
-    """Clear the terminal screen on Windows or POSIX systems."""
+    """Clear the terminal screen on Windows or POSIX systems. No-op in Coolify/Docker."""
+    if not sys.stdout.isatty() or not os.getenv("TERM"):
+        return
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
@@ -184,6 +238,11 @@ def get_interval_seconds(interval_str):
 
 def main():
     """Parse CLI args, bootstrap dependencies, and launch the trading loop."""
+    # Answer Coolify/Docker healthchecks before exchange bootstrap blocks the port.
+    try:
+        start_early_health_server()
+    except Exception as e:
+        logging.warning("Early health server failed to start: %s", e)
     try:
         clear_terminal()
     except Exception as e:
@@ -5422,6 +5481,14 @@ def main():
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    async def handle_hive_race(request):
+        """Five mechanical demo runners plus the AYO row. No AYO keys are used."""
+        try:
+            from src.runners.hive_race import snapshot
+            return web.json_response(snapshot(), dumps=lambda o: json.dumps(o, default=json_default))
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
     async def handle_status(request):
         """Return API status and basic account info."""
         try:
@@ -6524,6 +6591,7 @@ def main():
         app.router.add_get('/api/trading-info', handle_trading_info)  # Add trading info endpoint
         app.router.add_get('/api/trades', handle_trades)  # Add trades endpoint
         app.router.add_get('/api/mechanical', handle_mechanical)  # Mechanical scalp book status
+        app.router.add_get('/api/hive-race', handle_hive_race)
         app.router.add_post('/api/test', handle_status)  # Alias for compatibility
         app.router.add_post('/api/alert/signal', handle_alert_signal)
         app.router.add_post('/api/position-protection', handle_position_protection)
@@ -6624,12 +6692,17 @@ def main():
         
         await start_api(app)
         from src.config_loader import CONFIG as CFG
+        # Free the port held by the early health thread before aiohttp binds.
+        await asyncio.to_thread(stop_early_health_server)
+        await asyncio.sleep(0.15)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, CFG.get("api_host"), int(CFG.get("api_port")))
         await site.start()
         
         logging.info(f"🌐 HTTP API server started on {CFG.get('api_host')}:{CFG.get('api_port')}")
+        from src.runners.hive_race import start_hive_race
+        asyncio.create_task(start_hive_race())
         
         # Start background task to continuously sync trades to Supabase
         # Check if exchange is BinanceAPI instance

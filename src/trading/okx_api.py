@@ -110,11 +110,19 @@ def probe_okx_usdt_swap(asset: str, base_url: Optional[str] = None) -> bool:
 class OKXAPI:
     """Client for OKX perpetual SWAP (crypto) — demo via x-simulated-trading header."""
 
-    def __init__(self):
-        api_key = CONFIG.get("okx_api_key")
-        api_secret = CONFIG.get("okx_api_secret")
-        passphrase = CONFIG.get("okx_passphrase")
-        demo = bool(CONFIG.get("okx_demo", True))
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        passphrase: Optional[str] = None,
+        demo: Optional[bool] = None,
+        td_mode: Optional[str] = None,
+    ):
+        api_key = api_key or CONFIG.get("okx_api_key")
+        api_secret = api_secret or CONFIG.get("okx_api_secret")
+        passphrase = passphrase or CONFIG.get("okx_passphrase")
+        if demo is None:
+            demo = bool(CONFIG.get("okx_demo", True))
 
         if not api_key or not api_secret or not passphrase:
             raise ValueError(
@@ -127,7 +135,7 @@ class OKXAPI:
         self.passphrase = passphrase
         self.demo = demo
         self.base = CONFIG.get("okx_base_url", "https://www.okx.com").rstrip("/")
-        self.td_mode = (CONFIG.get("okx_td_mode") or "cross").lower()  # cross | isolated
+        self.td_mode = (td_mode or CONFIG.get("okx_td_mode") or "cross").lower()  # cross | isolated
         self.pos_mode = (CONFIG.get("okx_pos_mode") or "net_mode").lower()  # net_mode | long_short_mode
         self.default_leverage = int(
             CONFIG.get("okx_leverage", CONFIG.get("default_leverage", 10)) or 10

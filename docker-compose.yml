@@ -9,9 +9,11 @@ services:
     container_name: trading-agent
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "8080:8080"
     environment:
-      - APP_PORT=3000
+      - PORT=8080
+      - APP_PORT=8080
+      - API_PORT=8080
       - API_HOST=0.0.0.0
       # Add your environment variables here or use .env file
       # - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
@@ -23,11 +25,11 @@ services:
     networks:
       - trading-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=4)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 120s
 
   # Next.js Dashboard (optional - can deploy separately)
   dashboard:
