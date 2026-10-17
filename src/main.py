@@ -5500,7 +5500,11 @@ def main():
         """Five mechanical demo runners plus the AYO row. No AYO keys are used."""
         try:
             from src.runners.hive_race import snapshot
-            return web.json_response(snapshot(), dumps=lambda o: json.dumps(o, default=json_default))
+            return web.json_response(
+                snapshot(),
+                dumps=lambda o: json.dumps(o, default=json_default),
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 

@@ -1,8 +1,7 @@
 """Fixed entry and exit rules for the five hive runners.
 
-Shared risk matches the public BeeBots momentum engine, resized for a $300
-book at 10x isolated: $30 margin ($300 notional) to enter, one +$15 add
-($450 notional) only after price has already run 1.5 x 1h ATR in favor.
+$300 race start equity, up to 3 concurrent opens at $40 margin ($400 notional)
+10x isolated, one +$15 margin add ($150 notional) after price has run 1.5x 1h ATR.
 """
 
 from __future__ import annotations
@@ -12,9 +11,13 @@ from typing import Dict, List, Optional
 
 START_EQUITY = 300.0
 LEVERAGE = 10
-ENTRY_NOTIONAL = 300.0
-ADD_NOTIONAL = 150.0
-MAX_NOTIONAL = 450.0
+ENTRY_MARGIN = 40.0
+ADD_MARGIN = 15.0
+ENTRY_NOTIONAL = ENTRY_MARGIN * LEVERAGE  # 400
+ADD_NOTIONAL = ADD_MARGIN * LEVERAGE  # 150
+MAX_SLOT_NOTIONAL = ENTRY_NOTIONAL + ADD_NOTIONAL  # 550
+MAX_NOTIONAL = MAX_SLOT_NOTIONAL  # backward-compatible alias
+MAX_OPENS = 3
 MIN_VOL_USD = 15_000_000.0
 MAX_SPREAD_BP = 8.0
 STOP_ATR = 2.5
@@ -22,9 +25,9 @@ TRAIL_ATR = 2.0
 MAX_STOP_PCT = 8.0
 MIN_HOLD_S = 30 * 60
 TIME_STOP_S = 12 * 3600
-COOLDOWN_S = 60 * 60
-MAX_TRADES = 3
-FEE_BUDGET = 1.50
+COOLDOWN_S = 10 * 60
+MAX_TRADES = 6
+FEE_BUDGET = 4.0
 DAILY_LOSS_PCT = 0.08
 RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
@@ -81,9 +84,16 @@ class Book:
     last_order_at: float = 0.0
     cap: Optional[str] = None
     position: Optional[Pos] = None
+    positions: List[Pos] = field(default_factory=list)
     blacklist: Dict[str, bool] = field(default_factory=dict)
     peak_equity: float = START_EQUITY
     max_dd_pct: float = 0.0
+
+    def sync_primary(self) -> None:
+        if self.positions:
+            self.position = max(self.positions, key=lambda p: p.notional)
+        else:
+            self.position = None
 
 
 @dataclass
@@ -285,66 +295,118 @@ def _blocked(book: Book, now: float) -> Optional[str]:
     return None
 
 
-def decide(runner: str, book: Book, coins: List[Coin], now: float) -> Action:
+def _open_slots(book: Book) -> List[Pos]:
+    if book.positions:
+        return list(book.positions)
+    if book.position:
+        return [book.position]
+    return []
+
+
+def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
+    if stop_hit(pos, mid):
+        return "stop"
+    if now - pos.opened_at >= TIME_STOP_S:
+        return "time_stop"
+    if coin is None:
+        return None
+    if runner == "mayhem":
+        if _against(pos, coin) or upl(pos, mid) < 0:
+            return "bail"
+    elif runner == "windward":
+        if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
+            return "trend_break"
+    elif runner == "orakelia":
+        if coin.ret1h < 0 or coin.vol_z < 0:
+            book.blacklist[pos.coin] = True
+            return "momentum_fade"
+    elif runner in ("peaksting", "peakstinger"):
+        if coin.ret1h > 0:
+            return "fade_weakened"
+    return None
+
+
+def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> List[Action]:
+    """Manage every open, then fill free slots. At most one open/add/rotate per call list."""
     by_coin = {c.coin: c for c in coins}
-    pos = book.position
-    if pos:
+    opens = _open_slots(book)
+    book.positions = opens
+    book.sync_primary()
+
+    # Hard caps: close everything if retired / daily loss.
+    block = _blocked(book, now)
+    if block in ("retired", "loss_stop"):
+        book.cap = block
+        return [Action("close", p.coin, p.side, reason=block) for p in opens] or [Action("hold", reason=block)]
+
+    # Trim OKX orphans above the race slot cap (smallest first).
+    if len(opens) > MAX_OPENS:
+        extras = sorted(opens, key=lambda p: p.notional)[: len(opens) - MAX_OPENS]
+        return [Action("close", p.coin, p.side, reason="slot_cap") for p in extras]
+
+    closes: List[Action] = []
+    for pos in opens:
         coin = by_coin.get(pos.coin)
         mid = coin.mid if coin else pos.peak_px
         if coin:
             mark(pos, coin)
             mid = coin.mid
-        if stop_hit(pos, mid):
-            return Action("close", pos.coin, pos.side, reason="stop")
-        if now - pos.opened_at >= TIME_STOP_S:
-            return Action("close", pos.coin, pos.side, reason="time_stop")
-        block = _blocked(book, now)
-        if block in ("retired", "loss_stop", "trade_cap", "fee_budget"):
-            book.cap = block if block != "cooldown" else book.cap
-            return Action("hold", reason=block or "capped")
+        reason = _exit_reason(runner, pos, coin, mid, book, now)
+        if reason:
+            closes.append(Action("close", pos.coin, pos.side, reason=reason))
+    if closes:
+        return closes
+
+    # Min-hold / missing quote: ride for now.
+    for pos in opens:
         if now - pos.opened_at < MIN_HOLD_S:
-            return Action("hold", reason="min_hold")
+            continue
+        coin = by_coin.get(pos.coin)
         if coin is None:
-            return Action("hold", reason="no_quote")
-
-        if runner == "mayhem":
-            if _against(pos, coin) or upl(pos, mid) < 0:
-                return Action("close", pos.coin, pos.side, reason="bail")
-            ranked = _mayhem(coins)
-            if ranked and ranked[0].coin != pos.coin:
-                nxt = ranked[0]
-                return Action("switch", nxt.coin, _side_for(runner, nxt), ENTRY_NOTIONAL, "rotate")
-        elif runner == "windward":
-            if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
-                return Action("close", pos.coin, pos.side, reason="trend_break")
-        elif runner == "orakelia":
-            if coin.ret1h < 0 or coin.vol_z < 0:
-                book.blacklist[pos.coin] = True
-                return Action("close", pos.coin, pos.side, reason="momentum_fade")
-        elif runner in ("peaksting", "peakstinger"):
-            if coin.ret1h > 0:
-                return Action("close", pos.coin, pos.side, reason="fade_weakened")
-
+            continue
+        mid = coin.mid
         if (
             not pos.added
             and upl(pos, mid) > 0
             and _run_atr(pos, coin) >= 1.5
-            and pos.notional + ADD_NOTIONAL <= MAX_NOTIONAL + 1e-6
+            and pos.notional + ADD_NOTIONAL <= MAX_SLOT_NOTIONAL + 1e-6
             and (runner != "orakelia" or coin.ret1h >= 0)
         ):
-            return Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")
-        return Action("hold", reason="ride")
+            return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")]
 
-    block = _blocked(book, now)
+    # Mayhem: free a slot for a stronger name when full.
+    if runner == "mayhem" and len(opens) >= MAX_OPENS:
+        ranked = _mayhem(coins)
+        held = {p.coin for p in opens}
+        if ranked and ranked[0].coin not in held:
+            worst = min(opens, key=lambda p: upl(p, by_coin[p.coin].mid if p.coin in by_coin else p.entry_px))
+            nxt = ranked[0]
+            return [
+                Action("close", worst.coin, worst.side, reason="rotate"),
+                Action("open", nxt.coin, _side_for(runner, nxt), ENTRY_NOTIONAL, "rotate"),
+            ]
+
     if block:
-        if block in ("retired", "loss_stop", "trade_cap", "fee_budget"):
+        if block in ("trade_cap", "fee_budget"):
             book.cap = block
-        return Action("hold", reason=block)
+        return [Action("hold", reason=block)]
+
+    if len(opens) >= MAX_OPENS:
+        return [Action("hold", reason="slots_full")]
+
     ranked = candidates(runner, coins, book)
-    if not ranked:
-        return Action("hold", reason="no_setup")
-    pick = ranked[0]
-    return Action("open", pick.coin, _side_for(runner, pick), ENTRY_NOTIONAL, "entry")
+    held = {p.coin for p in opens}
+    for pick in ranked:
+        if pick.coin in held:
+            continue
+        return [Action("open", pick.coin, _side_for(runner, pick), ENTRY_NOTIONAL, "entry")]
+    return [Action("hold", reason="no_setup" if not ranked else "all_held")]
+
+
+def decide(runner: str, book: Book, coins: List[Coin], now: float) -> Action:
+    """Backward-compatible single-action wrapper."""
+    actions = decide_actions(runner, book, coins, now)
+    return actions[0] if actions else Action("hold", reason="empty")
 
 
 def fee_usd(notional: float) -> float:
@@ -353,9 +415,6 @@ def fee_usd(notional: float) -> float:
 
 def apply_equity_mark(book: Book, mid: Optional[float]) -> None:
     realized = book.equity
-    if book.position and mid:
-        # equity field is cash; mark-to-market is reported separately by the loop.
-        pass
     if realized > book.peak_equity:
         book.peak_equity = realized
     if book.peak_equity > 0:

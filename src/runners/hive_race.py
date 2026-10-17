@@ -1,7 +1,8 @@
 """One loop, five OKX demo keys. Public market data is fetched once per tick.
 
-Each runner keeps its own $300 ledger. Orders are real demo orders at $30
-margin (10x isolated). The AYO agent key is never used here.
+Each runner keeps a $300 race ledger with up to 3 concurrent opens at $40
+margin (10x isolated), +$15 margin add when winning. Live OKX positions are
+reconciled every tick so the book cannot desync. AYO's key is never used here.
 """
 
 from __future__ import annotations
@@ -12,15 +13,18 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from src.config_loader import CONFIG
 from src.runners.rules import (
+    ADD_MARGIN,
     ADD_NOTIONAL,
+    ENTRY_MARGIN,
     ENTRY_NOTIONAL,
     LEVERAGE,
+    MAX_OPENS,
     RETIRE_EQUITY,
     RUNNER_LABELS,
     RUNNERS,
@@ -29,7 +33,7 @@ from src.runners.rules import (
     Book,
     Coin,
     Pos,
-    decide,
+    decide_actions,
     fee_usd,
     stop_pct,
     stop_price,
@@ -277,52 +281,77 @@ def build_coins() -> List[Coin]:
     return coins
 
 
+def _pos_from_dict(p: Dict[str, Any]) -> Pos:
+    return Pos(
+        coin=str(p["coin"]),
+        side=str(p["side"]),
+        entry_px=float(p["entry_px"]),
+        notional=float(p["notional"]),
+        coin_qty=float(p.get("coin_qty") or 0),
+        opened_at=float(p.get("opened_at") or time.time()),
+        stop_px=float(p.get("stop_px") or p["entry_px"]),
+        peak_px=float(p.get("peak_px") or p["entry_px"]),
+        added=bool(p.get("added")),
+        risk_usd=float(p.get("risk_usd") or 0),
+    )
+
+
+def _pos_to_dict(p: Pos, live_upl: Optional[float] = None) -> dict:
+    row = {
+        "coin": p.coin,
+        "side": p.side,
+        "entry_px": p.entry_px,
+        "notional": p.notional,
+        "coin_qty": p.coin_qty,
+        "opened_at": p.opened_at,
+        "stop_px": p.stop_px,
+        "peak_px": p.peak_px,
+        "added": p.added,
+        "risk_usd": p.risk_usd,
+    }
+    if live_upl is not None:
+        row["upl"] = round(float(live_upl), 4)
+    return row
+
+
 def _book_from(raw: Dict[str, Any]) -> Book:
-    pos = None
-    if raw.get("position"):
-        p = raw["position"]
-        pos = Pos(
-            coin=p["coin"],
-            side=p["side"],
-            entry_px=float(p["entry_px"]),
-            notional=float(p["notional"]),
-            coin_qty=float(p.get("coin_qty") or 0),
-            opened_at=float(p["opened_at"]),
-            stop_px=float(p["stop_px"]),
-            peak_px=float(p.get("peak_px") or p["entry_px"]),
-            added=bool(p.get("added")),
-            risk_usd=float(p.get("risk_usd") or 0),
-        )
-    return Book(
+    positions: List[Pos] = []
+    raw_positions = raw.get("positions")
+    if isinstance(raw_positions, list) and raw_positions:
+        for p in raw_positions:
+            if isinstance(p, dict) and p.get("coin"):
+                positions.append(_pos_from_dict(p))
+    elif raw.get("position"):
+        positions.append(_pos_from_dict(raw["position"]))
+    book = Book(
         equity=float(raw.get("equity") or START_EQUITY),
         day_start_equity=float(raw.get("day_start_equity") or START_EQUITY),
         trades_today=int(raw.get("trades_today") or 0),
         fees_today=float(raw.get("fees_today") or 0),
         last_order_at=float(raw.get("last_order_at") or 0),
         cap=raw.get("cap"),
-        position=pos,
+        positions=positions,
         blacklist={k: True for k in (raw.get("blacklist") or [])},
         peak_equity=float(raw.get("peak_equity") or START_EQUITY),
         max_dd_pct=float(raw.get("max_dd_pct") or 0),
     )
+    book.sync_primary()
+    return book
 
 
-def _book_to(book: Book, trades: List[dict], configured: bool, error: Optional[str]) -> dict:
-    pos = None
-    if book.position:
-        p = book.position
-        pos = {
-            "coin": p.coin,
-            "side": p.side,
-            "entry_px": p.entry_px,
-            "notional": p.notional,
-            "coin_qty": p.coin_qty,
-            "opened_at": p.opened_at,
-            "stop_px": p.stop_px,
-            "peak_px": p.peak_px,
-            "added": p.added,
-            "risk_usd": p.risk_usd,
-        }
+def _book_to(
+    book: Book,
+    trades: List[dict],
+    configured: bool,
+    error: Optional[str],
+    upl_by_coin: Optional[Dict[str, float]] = None,
+) -> dict:
+    book.sync_primary()
+    upl_by_coin = upl_by_coin or {}
+    positions = [_pos_to_dict(p, upl_by_coin.get(p.coin)) for p in book.positions]
+    pos = positions[0] if positions else None
+    if book.position and not pos:
+        pos = _pos_to_dict(book.position, upl_by_coin.get(book.position.coin))
     return {
         "equity": round(book.equity, 4),
         "day_start_equity": book.day_start_equity,
@@ -331,6 +360,8 @@ def _book_to(book: Book, trades: List[dict], configured: bool, error: Optional[s
         "last_order_at": book.last_order_at,
         "cap": book.cap,
         "position": pos,
+        "positions": positions,
+        "open_count": len(positions),
         "blacklist": list(book.blacklist),
         "peak_equity": book.peak_equity,
         "max_dd_pct": round(book.max_dd_pct, 4),
@@ -416,8 +447,18 @@ def _persist_trade(runner: str, row: dict) -> None:
             _PERSIST_LOGGED = True
 
 
-async def _order(client: Any, side: str, coin: str, notional: float, price: float, reduce_only: bool) -> float:
-    qty = notional / price if price else 0
+async def _order(
+    client: Any,
+    side: str,
+    coin: str,
+    notional: float,
+    price: float,
+    reduce_only: bool,
+    coin_qty: Optional[float] = None,
+) -> float:
+    qty = abs(float(coin_qty)) if coin_qty and coin_qty > 0 else (notional / price if price else 0)
+    if qty <= 0:
+        return 0.0
     if side == "long":
         fn = client.place_sell_order if reduce_only else client.place_buy_order
     else:
@@ -444,21 +485,103 @@ def _open_pos(coin: Coin, side: str, notional: float, qty: float, now: float) ->
     )
 
 
+def _find_pos(book: Book, coin: Optional[str]) -> Optional[Pos]:
+    if not coin:
+        return book.position
+    for p in book.positions:
+        if p.coin == coin:
+            return p
+    if book.position and book.position.coin == coin:
+        return book.position
+    return None
+
+
+async def _reconcile_okx(
+    book: Book, client: Any, coins: List[Coin], now: float
+) -> Tuple[Dict[str, float], float]:
+    """Overwrite book.positions from live OKX opens; return per-coin UPL and total."""
+    from src.runners.rules import mark as ratchet_stop
+
+    state = await client.get_user_state()
+    by_coin = {c.coin: c for c in coins}
+    prev = {p.coin: p for p in book.positions}
+    if book.position and book.position.coin not in prev:
+        prev[book.position.coin] = book.position
+
+    upl_by_coin: Dict[str, float] = {}
+    positions: List[Pos] = []
+    for p in state.get("positions") or []:
+        try:
+            sz = float(p.get("quantity") or p.get("szi") or 0)
+        except (TypeError, ValueError):
+            sz = 0.0
+        if abs(sz) <= 0:
+            continue
+        coin = str(p.get("coin") or p.get("symbol") or "").upper()
+        coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "")
+        if not coin:
+            continue
+        side = "long" if sz > 0 else "short"
+        entry = float(p.get("entryPrice") or p.get("entry_price") or p.get("entryPx") or 0)
+        mark_px = float(p.get("markPrice") or p.get("current_price") or entry)
+        notional = abs(float(p.get("notional") or (abs(sz) * (mark_px or entry or 0))))
+        live_upl = float(p.get("pnl") or p.get("unrealized_pnl") or 0)
+        upl_by_coin[coin] = live_upl
+        old = prev.get(coin)
+        quote = by_coin.get(coin)
+        if old:
+            stop = old.stop_px
+            peak = old.peak_px
+            opened_at = old.opened_at
+            added = old.added or notional > ENTRY_NOTIONAL * 1.15
+            risk = old.risk_usd
+        else:
+            pct = stop_pct(quote) if quote else None
+            stop = stop_price(side, entry, pct or 8.0) if entry else entry
+            peak = mark_px or entry
+            opened_at = now
+            added = notional > ENTRY_NOTIONAL * 1.15
+            risk = abs(entry - stop) / entry * notional if entry else 0.0
+        row = Pos(
+            coin=coin,
+            side=side,
+            entry_px=entry or (quote.mid if quote else 0),
+            notional=notional or ENTRY_NOTIONAL,
+            coin_qty=abs(sz),
+            opened_at=opened_at,
+            stop_px=stop,
+            peak_px=peak,
+            added=added,
+            risk_usd=risk,
+        )
+        if quote:
+            ratchet_stop(row, quote)
+        positions.append(row)
+
+    positions.sort(key=lambda r: r.notional, reverse=True)
+    book.positions = positions
+    book.sync_primary()
+    return upl_by_coin, float(sum(upl_by_coin.values()))
+
+
 async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: Action, trades: List[dict], now: float) -> None:
     by_coin = {c.coin: c for c in coins}
     if action.kind == "hold":
         return
-    if action.kind == "close" and book.position:
-        pos = book.position
+    if action.kind == "close":
+        pos = _find_pos(book, action.coin)
+        if not pos:
+            return
         coin = by_coin.get(pos.coin)
         mid = coin.mid if coin else pos.entry_px
-        qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True)
+        qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
         pnl = upl(pos, mid)
         fee = fee_usd(pos.notional)
         book.equity += pnl - fee
         book.fees_today += fee
         book.last_order_at = now
-        book.position = None
+        book.positions = [p for p in book.positions if p.coin != pos.coin]
+        book.sync_primary()
         row = {
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "coin": pos.coin,
@@ -474,19 +597,27 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         _persist_trade(runner, row)
         return
     if action.kind == "open":
+        if len(book.positions) >= MAX_OPENS:
+            return
         coin = by_coin.get(action.coin or "")
         if not coin or not action.side:
             return
-        qty = await _order(client, action.side, coin.coin, action.notional or ENTRY_NOTIONAL, coin.mid, False)
-        fee = fee_usd(action.notional or ENTRY_NOTIONAL)
+        if any(p.coin == coin.coin for p in book.positions):
+            return
+        notional = action.notional or ENTRY_NOTIONAL
+        qty = await _order(client, action.side, coin.coin, notional, coin.mid, False)
+        fee = fee_usd(notional)
         book.equity -= fee
         book.fees_today += fee
         book.trades_today += 1
         book.last_order_at = now
-        book.position = _open_pos(coin, action.side, action.notional or ENTRY_NOTIONAL, qty, now)
+        book.positions.append(_open_pos(coin, action.side, notional, qty, now))
+        book.sync_primary()
         return
-    if action.kind == "add" and book.position:
-        pos = book.position
+    if action.kind == "add":
+        pos = _find_pos(book, action.coin)
+        if not pos:
+            return
         coin = by_coin.get(pos.coin)
         if not coin:
             return
@@ -502,18 +633,16 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         pos.added = True
         pct = stop_pct(coin)
         if pct:
-            # Keep the stop at least at the new average so the add is not left unprotected.
             fresh = stop_price(pos.side, pos.entry_px, pct)
             if pos.side == "long":
                 pos.stop_px = max(pos.stop_px, min(fresh, pos.entry_px))
             else:
                 pos.stop_px = min(pos.stop_px, max(fresh, pos.entry_px))
+        book.sync_primary()
         return
-    if action.kind == "switch" and book.position:
-        closing = Action("close", book.position.coin, book.position.side, reason="rotate")
-        await _act(runner, client, book, coins, closing, trades, now)
-        opening = Action("open", action.coin, action.side, ENTRY_NOTIONAL, "rotate")
-        await _act(runner, client, book, coins, opening, trades, now)
+    if action.kind == "switch":
+        # Handled as close+open action lists from decide_actions.
+        return
 
 
 async def _refresh_ayo() -> None:
@@ -592,12 +721,13 @@ async def _refresh_ayo() -> None:
         logger.warning("hive ayo refresh failed: %s", exc)
 
 
-async def _tick() -> None:
-    coins = await asyncio.to_thread(build_coins)
+async def _tick(decide: bool = True) -> None:
+    coins = await asyncio.to_thread(build_coins) if decide else []
     now = time.time()
     await _refresh_ayo()
     async with _LOCK:
-        _STATE["market_coins"] = len(coins)
+        if decide:
+            _STATE["market_coins"] = len(coins)
         _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
         _STATE["last_error"] = None
         for runner, client in list(_CLIENTS.items()):
@@ -608,27 +738,40 @@ async def _tick() -> None:
             book.day_key = raw.get("day_key")  # type: ignore[attr-defined]
             trades = list(raw.get("trades") or [])
             error = None
+            upl_by_coin: Dict[str, float] = {}
+            live_upl = 0.0
             try:
-                _roll_day(book, now)
-                raw_day = time.strftime("%Y-%m-%d", time.gmtime(now))
-                book.day_key = raw_day  # type: ignore[attr-defined]
-                action = decide(runner, book, coins, now)
-                await _act(runner, client, book, coins, action, trades, now)
+                if not coins:
+                    coins = await asyncio.to_thread(build_coins)
+                    _STATE["market_coins"] = len(coins)
+                upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)
+                if decide:
+                    _roll_day(book, now)
+                    book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
+                    actions = decide_actions(runner, book, coins, now)
+                    for action in actions:
+                        await _act(runner, client, book, coins, action, trades, now)
+                    # Re-read exchange after orders so cards show fresh UPL/size.
+                    upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)
                 if book.equity <= RETIRE_EQUITY:
                     book.cap = "retired"
             except Exception as exc:
                 error = str(exc)
                 logger.warning("hive %s tick failed: %s", runner, exc)
-            mid = None
-            if book.position:
-                match = next((c for c in coins if c.coin == book.position.coin), None)
-                mid = match.mid if match else book.position.entry_px
-            mtm = book.equity + (upl(book.position, mid) if book.position and mid else 0)
+            # Prefer live OKX UPL; fall back to mid mark if reconcile failed.
+            if not upl_by_coin and book.positions:
+                for pos in book.positions:
+                    match = next((c for c in coins if c.coin == pos.coin), None)
+                    mid = match.mid if match else pos.entry_px
+                    upl_by_coin[pos.coin] = upl(pos, mid)
+                live_upl = float(sum(upl_by_coin.values()))
+            mtm = book.equity + live_upl
             _note_dd(book, mtm)
-            stored = _book_to(book, trades, True, error)
+            stored = _book_to(book, trades, True, error, upl_by_coin)
             stored["day_key"] = time.strftime("%Y-%m-%d", time.gmtime(now))
             stored["mtm"] = round(mtm, 4)
-            stored["upl"] = round(mtm - book.equity, 4)
+            stored["upl"] = round(live_upl, 4)
+            stored["note"] = f"{len(book.positions)}/{MAX_OPENS} open · ${ENTRY_MARGIN:.0f}+${ADD_MARGIN:.0f} margin"
             _STATE["runners"][runner] = stored
         _save()
 
@@ -644,18 +787,20 @@ def snapshot() -> dict:
             pct = (float(mtm) - START_EQUITY) / START_EQUITY * 100
         pos = raw.get("position")
         upl_val = raw.get("upl")
-        # Stamp live UPL onto the open so cards/detail panels don't show static 0.
-        if isinstance(pos, dict) and isinstance(upl_val, (int, float)):
-            pos = {**pos, "upl": round(float(upl_val), 4)}
-        positions = raw.get("positions") or ([pos] if pos else [])
+        positions = list(raw.get("positions") or [])
+        if not positions and isinstance(pos, dict):
+            positions = [pos]
+        # Ensure each open carries live UPL for cards when only book-level UPL exists.
         if (
-            isinstance(positions, list)
+            positions
             and len(positions) == 1
             and isinstance(positions[0], dict)
-            and isinstance(upl_val, (int, float))
             and positions[0].get("upl") is None
+            and isinstance(upl_val, (int, float))
         ):
             positions = [{**positions[0], "upl": round(float(upl_val), 4)}]
+        if isinstance(pos, dict) and pos.get("upl") is None and positions:
+            pos = positions[0]
         rows.append(
             {
                 "id": runner,
@@ -686,8 +831,9 @@ def snapshot() -> dict:
         "market_coins": _STATE.get("market_coins") or 0,
         "last_error": _STATE.get("last_error"),
         "start_equity": START_EQUITY,
-        "margin_entry": 30,
-        "margin_added": 45,
+        "margin_entry": ENTRY_MARGIN,
+        "margin_added": ADD_MARGIN,
+        "max_opens": MAX_OPENS,
         "leverage": LEVERAGE,
         "runners": rows,
     }
@@ -749,10 +895,13 @@ async def start_hive_race() -> None:
     if not _CLIENTS:
         logger.info("hive race idle: no demo keys yet")
         return
+    # Fast mark loop keeps Open PnL live; decide every 4th cycle (~60s).
+    mark_n = 0
     while True:
         try:
-            await _tick()
+            mark_n += 1
+            await _tick(decide=(mark_n % 4 == 1))
         except Exception as exc:
             _STATE["last_error"] = str(exc)
             logger.warning("hive race tick failed: %s", exc)
-        await asyncio.sleep(60)
+        await asyncio.sleep(15)
