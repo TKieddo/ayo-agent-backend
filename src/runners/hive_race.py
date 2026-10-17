@@ -529,6 +529,7 @@ async def _refresh_ayo() -> None:
         start = float(_STATE.get("ayo_start_equity") or equity or START_EQUITY)
         positions = state.get("positions") or []
         pos = None
+        open_positions: List[Dict[str, Any]] = []
         best_notional = -1.0
         upl_total = 0.0
         open_count = 0
@@ -548,16 +549,20 @@ async def _refresh_ayo() -> None:
             notional = abs(float(p.get("notionalUsd") or p.get("notional") or (abs(sz) * (mark or entry or 0))))
             upl = float(p.get("pnl") or p.get("unrealized_pnl") or p.get("upl") or p.get("unrealizedPnl") or 0)
             upl_total += upl
+            row = {
+                "coin": coin or "?",
+                "side": side,
+                "notional": round(notional, 2),
+                "entry_px": entry,
+                "stop_px": float(p.get("stop_px") or p.get("liquidation_price") or p.get("liquidationPx") or 0),
+                "upl": round(upl, 4),
+                "added": False,
+            }
+            open_positions.append(row)
             if notional >= best_notional:
                 best_notional = notional
-                pos = {
-                    "coin": coin or "?",
-                    "side": side,
-                    "notional": round(notional, 2),
-                    "entry_px": entry,
-                    "stop_px": float(p.get("stop_px") or p.get("liquidation_price") or p.get("liquidationPx") or 0),
-                    "added": False,
-                }
+                pos = row
+        open_positions.sort(key=lambda r: float(r.get("notional") or 0), reverse=True)
         # Show the real OKX book on the race board (not the $300 race ledger).
         pct = ((equity - start) / start * 100) if start else 0.0
         _STATE["runners"]["ayo"] = {
@@ -569,6 +574,7 @@ async def _refresh_ayo() -> None:
             "pct": round(pct, 2),
             "upl": round(upl_total, 4),
             "position": pos,
+            "positions": open_positions,
             "open_count": open_count,
             "trades_today": 0,
             "fees_today": 0,
@@ -646,6 +652,7 @@ def snapshot() -> dict:
                 "pct": None if pct is None else round(float(pct), 2),
                 "upl": raw.get("upl"),
                 "position": pos,
+                "positions": raw.get("positions") or ([pos] if pos else []),
                 "open_count": raw.get("open_count"),
                 "account_equity": raw.get("account_equity"),
                 "ayo_start_equity": raw.get("ayo_start_equity"),
