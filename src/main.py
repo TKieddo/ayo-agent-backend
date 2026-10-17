@@ -269,13 +269,22 @@ def main():
         exchange_for_universe = (CONFIG.get("exchange") or "aster").lower()
         multi_flag = str(CONFIG.get("MULTI_EXCHANGE_MODE", "false")).lower() == "true"
         merged = []
+        _fx_on = str(CONFIG.get("ENABLE_FOREX", CONFIG.get("enable_forex", "false"))).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         if multi_flag:
             for key in ("crypto_assets", "stock_assets", "assets"):
                 merged.extend(_split_assets(CONFIG.get(key) or ""))
+            if _fx_on:
+                merged.extend(_split_assets(CONFIG.get("forex_assets") or ""))
         elif exchange_for_universe in ("alpaca",):
             merged.extend(_split_assets(CONFIG.get("stock_assets") or ""))
         elif exchange_for_universe in ("ig", "ig.com", "igmarkets"):
-            merged.extend(_split_assets(CONFIG.get("forex_assets") or ""))
+            if _fx_on:
+                merged.extend(_split_assets(CONFIG.get("forex_assets") or ""))
         else:
             # Crypto venues (okx / binance / aster): CRYPTO_ASSETS + legacy ASSETS only
             merged.extend(_split_assets(CONFIG.get("crypto_assets") or ""))
@@ -302,6 +311,12 @@ def main():
     
     # Multi-exchange: explicit flag, or auto when a second venue (IG/Alpaca) is configured
     use_multi_exchange = str(CONFIG.get("MULTI_EXCHANGE_MODE", "false")).lower() == "true"
+    _enable_forex = str(CONFIG.get("ENABLE_FOREX", CONFIG.get("enable_forex", "false"))).lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     if not use_multi_exchange:
         _has_ig = bool(CONFIG.get("ig_api_key") and CONFIG.get("ig_username") and CONFIG.get("ig_password"))
         _has_crypto = bool(
@@ -312,7 +327,7 @@ def main():
         _has_fx = bool(str(CONFIG.get("forex_assets") or "").strip())
         _has_alpaca = bool(CONFIG.get("alpaca_api_key") and CONFIG.get("alpaca_api_secret"))
         _has_stocks = bool(str(CONFIG.get("stock_assets") or "").strip())
-        if _has_ig and _has_crypto and _has_fx:
+        if _enable_forex and _has_ig and _has_crypto and _has_fx:
             use_multi_exchange = True
             logging.info("🌐 Auto-enabled multi-exchange (crypto venue + IG forex credentials detected)")
         elif _has_alpaca and _has_crypto and _has_stocks:
@@ -1026,7 +1041,7 @@ def main():
         """Return the mapped venue for this asset. No cross-venue fallback."""
         if use_multi_exchange and exchange_manager:
             return exchange_manager.get_exchange_for_asset(asset)
-        if _looks_like_forex(asset) and str(CONFIG.get("ENABLE_FOREX", "true")).lower() not in ("1", "true", "yes", "on"):
+        if _looks_like_forex(asset) and str(CONFIG.get("ENABLE_FOREX", "false")).lower() not in ("1", "true", "yes", "on"):
             return None
         # Single-exchange: only trade the class that matches this process
         if exchange_name in ("alpaca",) and _looks_like_forex(asset):
@@ -2640,7 +2655,7 @@ def main():
             raw_fx = CONFIG.get("forex_assets") or ""
             if raw_fx:
                 forex_assets = [a.strip().upper() for a in str(raw_fx).replace(",", " ").split() if a.strip()]
-            enable_forex = str(CONFIG.get("ENABLE_FOREX", CONFIG.get("enable_forex", "true"))).lower() in (
+            enable_forex = str(CONFIG.get("ENABLE_FOREX", CONFIG.get("enable_forex", "false"))).lower() in (
                 "1", "true", "yes", "on"
             )
             ig_ready = bool(

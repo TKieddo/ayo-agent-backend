@@ -74,11 +74,18 @@ class MultiExchangeManager:
             except Exception as e:
                 logging.error(f"❌ Failed to initialize Alpaca: {e}")
 
-        # Check for IG Markets (forex / CFDs)
+        # IG Markets (forex / CFDs) — only when explicitly enabled.
+        # Leaving keys in .env must not spin up a session if ENABLE_FOREX=false.
+        enable_forex = str(CONFIG.get("ENABLE_FOREX", CONFIG.get("enable_forex", "false"))).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         ig_key = CONFIG.get("ig_api_key")
         ig_user = CONFIG.get("ig_username")
         ig_pass = CONFIG.get("ig_password")
-        if ig_key and ig_user and ig_pass:
+        if enable_forex and ig_key and ig_user and ig_pass:
             try:
                 from src.trading.ig_api import IGAPI
                 self.exchanges["ig"] = IGAPI()
@@ -91,6 +98,8 @@ class MultiExchangeManager:
                 logging.info(f"✅ Initialized IG Markets ({'demo' if demo else 'live'}) for forex/CFDs")
             except Exception as e:
                 logging.error(f"❌ Failed to initialize IG: {e}")
+        elif ig_key and ig_user and ig_pass and not enable_forex:
+            logging.info("💱 IG Markets skipped (ENABLE_FOREX=false) — keys kept for later")
 
         # Check for OKX (crypto SWAP)
         okx_key = CONFIG.get("okx_api_key")
