@@ -643,6 +643,19 @@ def snapshot() -> dict:
         if pct is None and isinstance(mtm, (int, float)):
             pct = (float(mtm) - START_EQUITY) / START_EQUITY * 100
         pos = raw.get("position")
+        upl_val = raw.get("upl")
+        # Stamp live UPL onto the open so cards/detail panels don't show static 0.
+        if isinstance(pos, dict) and isinstance(upl_val, (int, float)):
+            pos = {**pos, "upl": round(float(upl_val), 4)}
+        positions = raw.get("positions") or ([pos] if pos else [])
+        if (
+            isinstance(positions, list)
+            and len(positions) == 1
+            and isinstance(positions[0], dict)
+            and isinstance(upl_val, (int, float))
+            and positions[0].get("upl") is None
+        ):
+            positions = [{**positions[0], "upl": round(float(upl_val), 4)}]
         rows.append(
             {
                 "id": runner,
@@ -650,10 +663,10 @@ def snapshot() -> dict:
                 "configured": bool(raw.get("configured")) if runner == "ayo" else configured,
                 "equity": mtm,
                 "pct": None if pct is None else round(float(pct), 2),
-                "upl": raw.get("upl"),
+                "upl": upl_val,
                 "position": pos,
-                "positions": raw.get("positions") or ([pos] if pos else []),
-                "open_count": raw.get("open_count"),
+                "positions": positions,
+                "open_count": raw.get("open_count") if raw.get("open_count") is not None else len(positions or []),
                 "account_equity": raw.get("account_equity"),
                 "ayo_start_equity": raw.get("ayo_start_equity"),
                 "trades_today": raw.get("trades_today", 0),
