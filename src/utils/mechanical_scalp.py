@@ -2,7 +2,7 @@
 
 Three playbooks share the same OKX candle stack:
 
-* ``session_impulse`` — London/NY windows, BTC/ETH only, trend pullback continuation.
+* ``session_impulse`` — BTC/ETH trend pullback when 15m ADX and EMAs agree. No clock window.
 * ``range_mr`` — low 15m ADX chop: fade Bollinger tags only at RSI extremes, target 1.5R.
 * ``breakout_retest`` — level break + retest; target 1.5R from ATR-floored stop.
 
@@ -33,7 +33,7 @@ MECHANICAL_MODE = "mechanical"
 # Defaults for every knob, overridable from trading_settings (DB) or CONFIG.
 DEFAULTS: Dict[str, Any] = {
     "mech_cycle_seconds": 60,
-    "mech_max_positions": 2,
+    "mech_max_positions": 3,
     "mech_leverage": 10,
     "mech_margin_usd": 40.0,
     "mech_take_profit_usd": 3.0,
@@ -56,9 +56,9 @@ DEFAULTS: Dict[str, Any] = {
     "mech_oi_rising_pct": 2.0,
     "mech_oi_window_minutes": 30,
     # Global weekday gate (range + breakout). Impulse adds London/NY below.
-    "mech_session_start_utc": 7,
-    "mech_session_end_utc": 21,
-    "mech_trade_weekends": False,
+    "mech_session_start_utc": 0,
+    "mech_session_end_utc": 24,
+    "mech_trade_weekends": True,
     "mech_london_start_utc": 7.0,
     "mech_london_end_utc": 11.0,
     "mech_ny_start_utc": 13.0,
@@ -662,10 +662,7 @@ def _try_session_impulse(
 ) -> ScalpSignal | ScalpSkip:
     if not setup_allows_asset("session_impulse", asset, cfg):
         return ScalpSkip(asset, "session_impulse: not in BTC/ETH universe", metrics)
-    ok, sess = in_liquidity_session(now, cfg)
-    if not ok:
-        return ScalpSkip(asset, f"session_impulse: {sess}", metrics)
-    metrics["liquidity_session"] = sess
+    metrics["liquidity_session"] = "data"
 
     confirm_i = len(x5) - 1
     band_c = bands[confirm_i]
