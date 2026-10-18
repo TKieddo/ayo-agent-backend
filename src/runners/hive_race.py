@@ -12,6 +12,9 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -413,38 +416,160 @@ def _note_dd(book: Book, mtm: float) -> None:
             book.max_dd_pct = dd
 
 
-def _persist_trade(runner: str, row: dict) -> None:
-    global _PERSIST_LOGGED
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+def _supabase_rest() -> Optional[tuple]:
+    url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    key = (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY") or "").strip()
     if not url or not key:
-        return
-    try:
-        from supabase import create_client
+        return None
+    return url, key
 
-        client = create_client(url, key)
-        payload = {
-            "symbol": row["coin"],
-            "side": "sell" if row["side"] == "short" else "buy",
-            "size": row.get("coin_qty") or 0.001,
-            "price": row["price"],
-            "fee": row["fee"],
-            "pnl": row["pnl"],
-            "executed_at": row["at"],
-            "order_id": f"hive-{runner}-{int(time.time())}",
-            "book": "crypto",
-            "venue": "okx",
-            "runner": runner,
-        }
-        try:
-            client.table("trades").insert(payload).execute()
-        except Exception:
-            payload.pop("runner", None)
-            client.table("trades").insert(payload).execute()
-    except Exception as exc:
+
+def _persist_trade(runner: str, row: dict) -> None:
+    """Durable hive close → Supabase. Do not set order_id (FK to orders); tag runner."""
+    global _PERSIST_LOGGED
+    creds = _supabase_rest()
+    if not creds:
         if not _PERSIST_LOGGED:
-            logger.info("hive trade persist skipped: %s", exc)
+            logger.warning("hive trade persist skipped: SUPABASE_URL/KEY missing")
             _PERSIST_LOGGED = True
+        return
+    url, key = creds
+    action = str(row.get("action") or "close").replace("|", "-")[:48]
+    payload = {
+        "symbol": row["coin"],
+        # DB side is buy/sell; map position side so hydrate can reverse it.
+        "side": "sell" if row["side"] == "short" else "buy",
+        "size": float(row.get("coin_qty") or row.get("notional") or 0.001) or 0.001,
+        "price": float(row["price"]),
+        "fee": float(row.get("fee") or 0),
+        "pnl": float(row.get("pnl") or 0),
+        "executed_at": row["at"],
+        "book": "crypto",
+        "venue": f"okx|{action}",
+        "runner": runner,
+    }
+    try:
+        req = urllib.request.Request(
+            f"{url}/rest/v1/trades",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status not in (200, 201, 204):
+                raise RuntimeError(f"supabase status {resp.status}")
+    except Exception as exc:
+        body = ""
+        if isinstance(exc, urllib.error.HTTPError):
+            try:
+                body = exc.read().decode()[:300]
+            except Exception:
+                body = str(exc)
+        logger.warning("hive trade persist failed for %s %s: %s %s", runner, row.get("coin"), exc, body)
+        _PERSIST_LOGGED = True
+
+
+def _db_row_to_hive_trade(row: dict) -> dict:
+    side_raw = str(row.get("side") or "buy").lower()
+    side = "short" if side_raw == "sell" else "long"
+    venue = str(row.get("venue") or "okx")
+    action = "close"
+    if "|" in venue:
+        action = venue.split("|", 1)[1] or "close"
+    at = str(row.get("executed_at") or "")
+    if at.endswith("+00:00"):
+        at = at[:-6] + "Z"
+    elif at and not at.endswith("Z") and "T" in at:
+        at = at.split(".")[0] + "Z"
+    return {
+        "at": at,
+        "coin": str(row.get("symbol") or "").upper(),
+        "side": side,
+        "action": action,
+        "price": float(row.get("price") or 0),
+        "notional": abs(float(row.get("size") or 0) * float(row.get("price") or 0)),
+        "pnl": float(row.get("pnl") or 0),
+        "fee": float(row.get("fee") or 0),
+        "coin_qty": float(row.get("size") or 0),
+    }
+
+
+def _fetch_runner_trades(runner: str, limit: int = 200) -> List[dict]:
+    creds = _supabase_rest()
+    if not creds:
+        return []
+    url, key = creds
+    qs = urllib.parse.urlencode(
+        {
+            "select": "symbol,side,size,price,fee,pnl,executed_at,venue,runner",
+            "runner": f"eq.{runner}",
+            "order": "executed_at.asc",
+            "limit": str(limit),
+        }
+    )
+    try:
+        req = urllib.request.Request(
+            f"{url}/rest/v1/trades?{qs}",
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            rows = json.loads(resp.read().decode() or "[]")
+        return [_db_row_to_hive_trade(r) for r in rows if isinstance(r, dict)]
+    except Exception as exc:
+        logger.warning("hive trade hydrate fetch failed for %s: %s", runner, exc)
+        return []
+
+
+def _trade_key(t: dict) -> tuple:
+    return (str(t.get("at") or ""), str(t.get("coin") or ""), round(float(t.get("pnl") or 0), 4))
+
+
+def _hydrate_from_supabase() -> None:
+    """Merge durable Supabase hive closes into in-memory/file state after Coolify wipes."""
+    earliest: Optional[str] = None
+    for runner in RUNNERS:
+        db_trades = _fetch_runner_trades(runner)
+        if not db_trades:
+            continue
+        raw = dict(_STATE["runners"].get(runner) or {})
+        file_trades = list(raw.get("trades") or [])
+        by_key = {_trade_key(t): t for t in file_trades}
+        for t in db_trades:
+            by_key.setdefault(_trade_key(t), t)
+        merged = sorted(by_key.values(), key=lambda t: str(t.get("at") or ""))
+        raw["trades"] = merged[-80:]
+        realized = sum(float(t.get("pnl") or 0) for t in merged)
+        # If container state lost the closes, rebuild race equity from START + closed PnL.
+        if not file_trades and merged:
+            raw["equity"] = round(START_EQUITY + realized, 4)
+            if raw.get("mtm") is None or abs(float(raw.get("mtm") or 0) - START_EQUITY) < 1e-6:
+                raw["mtm"] = raw["equity"]
+            raw["configured"] = True
+            logger.info(
+                "hive hydrate %s: restored %d closes from Supabase, equity≈%.2f",
+                runner,
+                len(merged),
+                float(raw["equity"]),
+            )
+        elif len(merged) > len(file_trades):
+            raw["trades"] = merged[-80:]
+            logger.info("hive hydrate %s: merged %d Supabase closes into file state", runner, len(merged) - len(file_trades))
+        _STATE["runners"][runner] = raw
+        for t in merged:
+            at = str(t.get("at") or "")
+            if at and (earliest is None or at < earliest):
+                earliest = at
+    if earliest and _STATE.get("started_at"):
+        # Keep the older race start if we rebuilt history that predates this container boot.
+        if earliest < str(_STATE["started_at"]):
+            _STATE["started_at"] = earliest
+    elif earliest and not _STATE.get("started_at"):
+        _STATE["started_at"] = earliest
 
 
 async def _order(
@@ -845,6 +970,7 @@ async def start_hive_race() -> None:
         logger.info("hive race off (HIVE_RACE=false)")
         return
     _load()
+    _hydrate_from_supabase()
     if not _STATE.get("started_at"):
         _STATE["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     from src.trading.okx_api import OKXAPI
