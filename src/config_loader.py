@@ -187,6 +187,8 @@ CONFIG = {
     "risk_per_trade_pct": _get_float("RISK_PER_TRADE_PCT", 0.5),  # Fallback % of equity when USD not set
     "max_notional_per_position": _get_float("MAX_NOTIONAL_PER_POSITION"),  # Optional hard cap on notional exposure
     "min_notional_per_position": _get_float("MIN_NOTIONAL_PER_POSITION", 50.0),  # Floor so risk sizing never emits a sub-minimum order
+    # Leftover reduce-only dust (e.g. ~$5) still counts as an open and blocks max_positions.
+    "position_dust_notional_usd": _get_float("POSITION_DUST_NOTIONAL_USD", 8.0),
     "stop_loss_usd": _get_float("STOP_LOSS_USD", -6.0),  # Hard $ close = risk; keep in sync with RISK_PER_TRADE_USD
     # LLM via DeepSeek API (replaces OpenRouter)
     "deepseek_api_key": _get_env("DEEPSEEK_API_KEY", required=True),

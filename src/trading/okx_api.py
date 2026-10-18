@@ -288,8 +288,22 @@ class OKXAPI:
             return bool(info.get("instId"))
         return base in bases
 
-    def _contracts_from_coins(self, asset: str, coin_qty: float) -> str:
-        """Convert coin quantity to OKX contract size string."""
+    def _format_contract_sz(self, contracts: float) -> str:
+        """Format a contract count for OKX without changing its magnitude."""
+        contracts = abs(float(contracts or 0))
+        if contracts <= 0:
+            return "0"
+        if contracts >= 1 and abs(contracts - int(contracts)) < 1e-9:
+            return str(int(contracts))
+        if contracts >= 1:
+            return f"{contracts:.4f}".rstrip("0").rstrip(".")
+        return f"{contracts:.8f}".rstrip("0").rstrip(".")
+
+    def _contracts_from_coins(self, asset: str, coin_qty: float, *, round_up: bool = False) -> str:
+        """Convert coin quantity to OKX contract size string.
+
+        Entries floor to lot size. Reduce-only closes ceil so leftover dust is not stranded.
+        """
         inst_id = self._to_inst_id(asset)
         info = self._get_instrument(inst_id)
         ct_val = float(info.get("ctVal") or 1) or 1.0
@@ -298,15 +312,90 @@ class OKXAPI:
         lot_sz = float(info.get("lotSz") or 1)
         min_sz = float(info.get("minSz") or lot_sz)
         contracts = abs(float(coin_qty or 0)) / ct_eff
-        # Round down to lot size
         if lot_sz > 0:
-            contracts = (contracts // lot_sz) * lot_sz
-        if contracts < min_sz:
+            if round_up:
+                contracts = math.ceil(contracts / lot_sz - 1e-12) * lot_sz
+            else:
+                contracts = (contracts // lot_sz) * lot_sz
+        if contracts > 0 and contracts < min_sz:
             contracts = min_sz
-        # Format cleanly
-        if contracts >= 1:
-            return str(int(contracts)) if abs(contracts - int(contracts)) < 1e-9 else f"{contracts:.4f}".rstrip("0").rstrip(".")
-        return f"{contracts:.8f}".rstrip("0").rstrip(".")
+        return self._format_contract_sz(contracts)
+
+    async def get_swap_position(self, asset: str) -> Optional[Dict[str, Any]]:
+        """Live SWAP row for one asset (contract ``pos``, side, notional). None if flat."""
+        inst_id = self._to_inst_id(asset)
+        try:
+            data = await self._retry(
+                lambda: self._request(
+                    "GET",
+                    "/api/v5/account/positions",
+                    params={"instType": "SWAP", "instId": inst_id},
+                )
+            )
+        except Exception as e:
+            logger.warning(f"OKX get_swap_position {asset}: {e}")
+            return None
+        for pos in data if isinstance(data, list) else []:
+            try:
+                pos_sz = float(pos.get("pos") or 0)
+            except (TypeError, ValueError):
+                pos_sz = 0.0
+            if abs(pos_sz) <= 0:
+                continue
+            side = (pos.get("posSide") or "").lower()
+            if side in ("", "net"):
+                side = "long" if pos_sz > 0 else "short"
+            return {
+                "inst_id": inst_id,
+                "pos": pos_sz,
+                "contracts": abs(pos_sz),
+                "side": side,
+                "mgn_mode": (pos.get("mgnMode") or self.td_mode),
+                "avg_px": float(pos.get("avgPx") or 0),
+                "mark_px": float(pos.get("markPx") or 0),
+                "upl": float(pos.get("upl") or 0),
+                "notional": abs(float(pos.get("notionalUsd") or 0))
+                or abs(pos_sz)
+                * float(self.get_instrument_specs(asset)["ct_val"])
+                * float(pos.get("markPx") or pos.get("avgPx") or 0),
+            }
+        return None
+
+    async def close_position_market(self, asset: str) -> Dict[str, Any]:
+        """Flatten using the exchange contract size (avoids floor-rounding dust leftovers)."""
+        live = await self.get_swap_position(asset)
+        if not live:
+            return {"already_flat": True, "asset": asset}
+        contracts = float(live["contracts"])
+        sz = self._format_contract_sz(contracts)
+        if float(sz or 0) <= 0:
+            return {"already_flat": True, "asset": asset}
+        # Cover short with buy, long with sell.
+        side = "buy" if live["side"] == "short" or float(live["pos"]) < 0 else "sell"
+        mode = (live.get("mgn_mode") or self.td_mode or "isolated").lower()
+        body: Dict[str, Any] = {
+            "instId": live["inst_id"],
+            "tdMode": mode,
+            "side": side,
+            "ordType": "market",
+            "sz": sz,
+            "reduceOnly": True,
+        }
+        pos_side = self._pos_side_for(side, reduce_only=True)
+        if pos_side:
+            body["posSide"] = pos_side
+        result = await self._retry(
+            lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
+        )
+        row = result[0] if isinstance(result, list) and result else (result or {})
+        logger.info(
+            f"OKX CLOSE {asset} {side.upper()} sz={sz} contracts={contracts} "
+            f"tdMode={mode} ordId={(row or {}).get('ordId')}"
+        )
+        out = row if isinstance(row, dict) else {"raw": result}
+        out["closed_contracts"] = contracts
+        out["closed_side"] = live["side"]
+        return out
 
     def _extract_usdt_equity(self, balance_data: Any) -> float:
         rows = balance_data if isinstance(balance_data, list) else []
@@ -469,7 +558,13 @@ class OKXAPI:
         td_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         inst_id = self._to_inst_id(asset)
-        sz = self._contracts_from_coins(asset, amount)
+        # Reduce-only: ceil coin→contracts so partial lot rounding cannot leave orphans.
+        sz = self._contracts_from_coins(asset, amount, round_up=bool(reduce_only))
+        if reduce_only:
+            live = await self.get_swap_position(asset)
+            if live and float(live.get("contracts") or 0) > 0:
+                # Prefer exact exchange size when available (true flat).
+                sz = self._format_contract_sz(live["contracts"])
         mode = await self._resolve_td_mode(asset, td_mode, reduce_only)
         body: Dict[str, Any] = {
             "instId": inst_id,

@@ -1236,20 +1236,35 @@ def main():
         """Flatten a position with a reduce-only market order. Returns True on success."""
         nonlocal active_trades
         size = abs(float(position_size or 0))
-        if size <= 0:
-            add_event(f"⚠️  Skip close for {asset}: zero size ({reason})")
-            return False
         try:
             ex = _ex_for(asset)
             if ex is None:
                 add_event(f"⚠️  Skip close for {asset}: no mapped venue ({reason})")
                 return False
-            close_action = "sell" if is_long else "buy"
-            if is_long:
-                await ex.place_sell_order(asset, size, reduce_only=True)
+            # OKX: close the exact live contract size so lot flooring cannot leave ~$5 dust.
+            if hasattr(ex, "close_position_market"):
+                result = await ex.close_position_market(asset)
+                if result.get("already_flat"):
+                    add_event(f"✅ {asset} already flat ({reason})")
+                    for tr in active_trades[:]:
+                        if tr.get("asset") == asset:
+                            active_trades.remove(tr)
+                    return True
+                close_action = "sell" if result.get("closed_side") != "short" else "buy"
+                add_event(
+                    f"✅ Closed {asset} ({reason}) via {close_action} reduce-only | "
+                    f"contracts={result.get('closed_contracts')}"
+                )
             else:
-                await ex.place_buy_order(asset, size, reduce_only=True)
-            add_event(f"✅ Closed {asset} ({reason}) via {close_action} reduce-only | size={size}")
+                if size <= 0:
+                    add_event(f"⚠️  Skip close for {asset}: zero size ({reason})")
+                    return False
+                close_action = "sell" if is_long else "buy"
+                if is_long:
+                    await ex.place_sell_order(asset, size, reduce_only=True)
+                else:
+                    await ex.place_buy_order(asset, size, reduce_only=True)
+                add_event(f"✅ Closed {asset} ({reason}) via {close_action} reduce-only | size={size}")
             try:
                 await ex.cancel_all_orders(asset)
                 add_event(f"🧹 Cancelled all open orders for {asset} (post-close {reason})")
@@ -1427,6 +1442,47 @@ def main():
                 closed_n += 1
         return closed_n
 
+    async def _sweep_dust_positions(max_notional: float = None) -> int:
+        """Flatten leftover OKX stubs (~$5) that still count as open slots."""
+        if max_notional is None:
+            max_notional = float(CONFIG.get("position_dust_notional_usd") or 8.0)
+        swept = 0
+        try:
+            if use_multi_exchange and exchange_manager:
+                st = await exchange_manager.get_merged_user_state()
+            else:
+                st = await hyperliquid.get_user_state()
+        except Exception as e:
+            logging.warning(f"Dust sweep state failed: {e}")
+            return 0
+        for pos in st.get("positions") or []:
+            asset = str(pos.get("symbol") or pos.get("coin") or "").upper()
+            qty = abs(_safe_float(pos.get("quantity") or pos.get("szi"), 0))
+            if not asset or qty <= 0:
+                continue
+            notional = abs(_safe_float(pos.get("notional") or pos.get("notionalUsd"), 0))
+            if notional <= 0:
+                mark = _safe_float(pos.get("markPrice") or pos.get("current_price") or pos.get("entryPrice"), 0)
+                notional = qty * mark
+            if notional <= 0 or notional > max_notional:
+                continue
+            signed = _safe_float(pos.get("quantity") or pos.get("szi"), 0)
+            is_long = signed > 0
+            add_event(f"🧹 Dust sweep {asset}: notional ${notional:.2f} ≤ ${max_notional:.0f} — flattening orphan")
+            ok = await _close_position_reduce_only(
+                asset,
+                is_long,
+                qty,
+                f"dust orphan ${notional:.2f}",
+                entry_price=_safe_float(pos.get("entryPrice") or pos.get("entry_price"), None),
+                current_price=_safe_float(pos.get("markPrice") or pos.get("current_price"), None),
+                pnl_usd=_safe_float(pos.get("pnl") or pos.get("unrealized_pnl"), 0),
+                diary_action="close_dust",
+            )
+            if ok:
+                swept += 1
+        return swept
+
     async def _exit_watcher_loop():
         """Always-on TP/SL poll — runs even while the LLM cycle is blocked."""
         add_event("⚡ Exit watcher started (TP/SL independent of LLM cycle)")
@@ -1446,8 +1502,9 @@ def main():
                 )
                 exit_check_s = max(5.0, exit_check_s)
                 n_closed = await _mechanical_exit_sweep(settings)
-                if n_closed:
-                    add_event(f"⚡ Exit watcher closed {n_closed} position(s)")
+                n_dust = await _sweep_dust_positions()
+                if n_closed or n_dust:
+                    add_event(f"⚡ Exit watcher closed {n_closed} position(s), swept {n_dust} dust stub(s)")
                 await asyncio.sleep(exit_check_s)
             except asyncio.CancelledError:
                 raise
@@ -1731,10 +1788,21 @@ def main():
         leverage = int(cfg["mech_leverage"])
         td_mode = "isolated"
 
+        dust_cap = float(CONFIG.get("position_dust_notional_usd") or 8.0)
+        await _sweep_dust_positions(dust_cap)
+
+        def _pos_notional(p: dict) -> float:
+            raw = abs(_safe_float(p.get("notional") or p.get("notionalUsd"), 0))
+            if raw > 0:
+                return raw
+            qty_abs = abs(_safe_float(p.get("quantity") or p.get("szi"), 0))
+            mark = _safe_float(p.get("markPrice") or p.get("current_price") or p.get("entryPrice"), 0)
+            return qty_abs * mark
+
         open_assets = {
             str(p.get("symbol") or p.get("coin") or "").upper()
             for p in positions
-            if abs(_safe_float(p.get("quantity"), 0)) > 0
+            if abs(_safe_float(p.get("quantity") or p.get("szi"), 0)) > 0 and _pos_notional(p) > dust_cap
         }
         await _mech_reconcile_closed(open_assets)
 
