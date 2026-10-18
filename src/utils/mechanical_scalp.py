@@ -3,7 +3,7 @@
 Three playbooks share the same OKX candle stack:
 
 * ``session_impulse`` — London/NY windows, BTC/ETH only, trend pullback continuation.
-* ``range_mr`` — low 15m ADX chop: fade Bollinger band tags back to basis.
+* ``range_mr`` — low 15m ADX chop: fade Bollinger tags only at RSI extremes, target 1.5R.
 * ``breakout_retest`` — level break + retest; target 1.5R from ATR-floored stop.
 
 Universe is a fixed liquid allowlist (not Pair Hunter). Spread/ATR gates always apply.
@@ -46,7 +46,7 @@ DEFAULTS: Dict[str, Any] = {
     "mech_ema_min_separation_pct": 0.05,
     "mech_atr_min_pct": 0.30,
     "mech_atr_max_pct": 2.0,
-    "mech_atr_stop_mult": 1.0,
+    "mech_atr_stop_mult": 1.5,
     "mech_breakout_rr": 1.5,
     "mech_rsi_max_long": 72.0,
     "mech_rsi_min_short": 28.0,
@@ -790,9 +790,10 @@ def _try_range_mr(
     rsi14 = rsi(x5[-60:], 14)
     metrics["rsi_5m"] = None if rsi14 is None else round(rsi14, 1)
     if rsi14 is not None:
-        if side == "buy" and rsi14 > 55:
+        # Extremes only. RSI 45/55 admitted mid-range fades (e.g. short at 63) that are noise, not exhaustion.
+        if side == "buy" and rsi14 > 35:
             return ScalpSkip(asset, f"range_mr: RSI {rsi14:.0f} not oversold enough", metrics)
-        if side == "sell" and rsi14 < 45:
+        if side == "sell" and rsi14 < 65:
             return ScalpSkip(asset, f"range_mr: RSI {rsi14:.0f} not overbought enough", metrics)
 
     size_factor, skip = _rvol_ok(asset, v5, confirm_i, cfg, metrics)
@@ -810,7 +811,7 @@ def _try_range_mr(
     return _finalize_geometry(
         asset, side, confirm_close, structure_stop, atr5, cfg, metrics,
         setup="range_mr", exit_style="book", size_factor=size_factor,
-        signal_ts=signal_ts, confirm_ts=confirm_ts, rr=1.0,
+        signal_ts=signal_ts, confirm_ts=confirm_ts, rr=1.5,
     )
 
 
@@ -1094,20 +1095,34 @@ def size_position(
 
         tp = abs(float(take_profit_usd if take_profit_usd is not None else cfg.get("mech_take_profit_usd") or 2.0))
         sl = abs(float(stop_loss_usd if stop_loss_usd is not None else cfg.get("mech_stop_loss_usd") or tp))
-        dist_tp = tp / coin_qty
-        dist_sl_book = sl / coin_qty
-        # Never pin SL inside the ATR/structure floor from evaluate().
+        # Price stop is the wider of the $ book and the ATR/structure floor.
+        # If that floor is wider than the $ stop, shrink size so dollar risk stays at `sl`
+        # instead of parking the stop inside normal noise.
         dist_sl_struct = abs(entry - float(signal.stop_price))
-        dist_sl = max(dist_sl_book, dist_sl_struct)
+        dist_sl = dist_sl_struct if dist_sl_struct > 0 else (sl / coin_qty if coin_qty else 0)
+        if dist_sl <= 0:
+            return ScalpSkip(signal.asset, "degenerate stop distance")
+        coin_for_risk = sl / dist_sl
+        if coin_for_risk + 1e-12 < coin_qty:
+            contracts = math.floor((coin_for_risk / ct_val) / lot_sz) * lot_sz
+            if contracts < min_sz:
+                actual_risk = min_sz * ct_val * dist_sl
+                tolerance = float(cfg["mech_min_size_risk_tolerance"])
+                if actual_risk > sl * tolerance + 1e-9:
+                    return ScalpSkip(
+                        signal.asset,
+                        f"ATR stop would risk ${actual_risk:.2f} at min size (> ${sl:.2f}); skip",
+                    )
+                contracts = min_sz
+            coin_qty = contracts * ct_val
+            notional = coin_qty * entry
+            margin = notional / lev
+        rr = float(getattr(signal, "metrics", {}).get("rr") or 1.0)
+        if getattr(signal, "setup", "") == "range_mr":
+            rr = max(rr, 1.5)
+        reward = sl * rr
+        dist_tp = reward / coin_qty if coin_qty else 0
         actual_sl = dist_sl * coin_qty
-        # Skip asymmetric book trades: capped TP with a wider structure stop
-        # produces "many small wins, one big loss". Prefer quiet over bleed.
-        if actual_sl > tp + 1e-9:
-            return ScalpSkip(
-                signal.asset,
-                f"book skip: structure risk ${actual_sl:.2f} > TP ${tp:.2f} "
-                f"(need 1:1; setup={getattr(signal, 'setup', '?')})",
-            )
         if signal.side == "buy":
             signal.stop_price = entry - dist_sl
             signal.target_price = entry + dist_tp
@@ -1121,7 +1136,7 @@ def size_position(
             notional_usd=notional,
             margin_usd=margin,
             risk_usd=actual_sl,
-            reward_usd=tp,
+            reward_usd=reward,
         )
 
     # Legacy: contracts so the wick stop loses ``risk_usd``.
