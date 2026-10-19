@@ -362,39 +362,103 @@ class OKXAPI:
         return None
 
     async def close_position_market(self, asset: str) -> Dict[str, Any]:
-        """Flatten using the exchange contract size (avoids floor-rounding dust leftovers)."""
+        """Fully flatten one SWAP. Prefer OKX close-position (no sz), then reduce-only market.
+
+        Tiny leftover margins ($0.01–$0.50) come from older coin→lot floors / partial
+        ladder fills. close-position closes the whole row; we verify flat afterward.
+        """
         live = await self.get_swap_position(asset)
         if not live:
             return {"already_flat": True, "asset": asset}
         contracts = float(live["contracts"])
-        sz = self._format_contract_sz(contracts)
-        if float(sz or 0) <= 0:
-            return {"already_flat": True, "asset": asset}
-        # Cover short with buy, long with sell.
-        side = "buy" if live["side"] == "short" or float(live["pos"]) < 0 else "sell"
         mode = (live.get("mgn_mode") or self.td_mode or "isolated").lower()
-        body: Dict[str, Any] = {
+        side = "buy" if live["side"] == "short" or float(live["pos"]) < 0 else "sell"
+        pos_side = self._pos_side_for(side, reduce_only=True) or (
+            "long" if live["side"] == "long" else "short"
+        )
+
+        # 1) Official full close — no contract size, so lot flooring cannot leave stubs.
+        close_body: Dict[str, Any] = {
             "instId": live["inst_id"],
-            "tdMode": mode,
-            "side": side,
-            "ordType": "market",
-            "sz": sz,
-            "reduceOnly": True,
+            "mgnMode": mode,
+            "posSide": pos_side,
+            "autoCxl": True,
         }
-        pos_side = self._pos_side_for(side, reduce_only=True)
-        if pos_side:
-            body["posSide"] = pos_side
-        result = await self._retry(
-            lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
-        )
-        row = result[0] if isinstance(result, list) and result else (result or {})
-        logger.info(
-            f"OKX CLOSE {asset} {side.upper()} sz={sz} contracts={contracts} "
-            f"tdMode={mode} ordId={(row or {}).get('ordId')}"
-        )
-        out = row if isinstance(row, dict) else {"raw": result}
+        close_err: Optional[str] = None
+        try:
+            result = await self._retry(
+                lambda: self._request("POST", "/api/v5/trade/close-position", json_body=close_body)
+            )
+            row = result[0] if isinstance(result, list) and result else (result or {})
+            logger.info(
+                "OKX CLOSE-POSITION %s posSide=%s mgnMode=%s contracts=%.8f → %s",
+                asset,
+                pos_side,
+                mode,
+                contracts,
+                row,
+            )
+        except Exception as exc:
+            close_err = str(exc)
+            logger.warning("OKX close-position %s failed (%s); falling back to reduce-only market", asset, exc)
+            row = {}
+
+        # 2) Fallback: reduce-only market for exact live contract size.
+        still = await self.get_swap_position(asset)
+        if still and float(still.get("contracts") or 0) > 0:
+            sz = self._format_contract_sz(float(still["contracts"]))
+            if float(sz or 0) > 0:
+                body: Dict[str, Any] = {
+                    "instId": still["inst_id"],
+                    "tdMode": (still.get("mgn_mode") or mode).lower(),
+                    "side": "buy" if still["side"] == "short" or float(still["pos"]) < 0 else "sell",
+                    "ordType": "market",
+                    "sz": sz,
+                    "reduceOnly": True,
+                }
+                fallback_side = body["side"]
+                ps = self._pos_side_for(fallback_side, reduce_only=True)
+                if ps:
+                    body["posSide"] = ps
+                try:
+                    result = await self._retry(
+                        lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
+                    )
+                    row = result[0] if isinstance(result, list) and result else (result or {})
+                    logger.info(
+                        "OKX CLOSE-FALLBACK %s %s sz=%s contracts=%s ordId=%s",
+                        asset,
+                        fallback_side.upper(),
+                        sz,
+                        still["contracts"],
+                        (row or {}).get("ordId") if isinstance(row, dict) else None,
+                    )
+                except Exception as exc:
+                    logger.warning("OKX close fallback %s failed: %s", asset, exc)
+                    if close_err:
+                        raise RuntimeError(f"close-position: {close_err}; market: {exc}") from exc
+                    raise
+
+        still = await self.get_swap_position(asset)
+        if still and float(still.get("contracts") or 0) > 0:
+            leftover = float(still["contracts"])
+            logger.warning(
+                "OKX CLOSE %s still open after flatten attempts (%.8f contracts, notional≈%.4f)",
+                asset,
+                leftover,
+                float(still.get("notional") or 0),
+            )
+            out = row if isinstance(row, dict) else {"raw": row}
+            out["closed_contracts"] = contracts
+            out["closed_side"] = live["side"]
+            out["still_open"] = True
+            out["leftover_contracts"] = leftover
+            return out
+
+        out = row if isinstance(row, dict) else {"raw": row}
         out["closed_contracts"] = contracts
         out["closed_side"] = live["side"]
+        out["already_flat"] = False
         return out
 
     def _extract_usdt_equity(self, balance_data: Any) -> float:

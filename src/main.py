@@ -1258,7 +1258,7 @@ def main():
             if ex is None:
                 add_event(f"⚠️  Skip close for {asset}: no mapped venue ({reason})")
                 return False
-            # OKX: close the exact live contract size so lot flooring cannot leave ~$5 dust.
+            # OKX: full close-position (+ market fallback). Reject "success" if a stub remains.
             if hasattr(ex, "close_position_market"):
                 result = await ex.close_position_market(asset)
                 if result.get("already_flat"):
@@ -1267,6 +1267,12 @@ def main():
                         if tr.get("asset") == asset:
                             active_trades.remove(tr)
                     return True
+                if result.get("still_open"):
+                    add_event(
+                        f"⚠️  {asset} still open after flatten ({reason}) — "
+                        f"leftover={result.get('leftover_contracts')} contracts"
+                    )
+                    return False
                 close_action = "sell" if result.get("closed_side") != "short" else "buy"
                 add_event(
                     f"✅ Closed {asset} ({reason}) via {close_action} reduce-only | "
@@ -1492,8 +1498,6 @@ def main():
             signed = _safe_float(pos.get("quantity") or pos.get("szi"), 0)
             is_long = signed > 0
             add_event(f"🧹 Dust sweep {asset}: notional ${notional:.2f} ≤ ${max_notional:.0f} — flattening orphan")
-            # Always cool down after an attempt so a stuck stub cannot spam closes/logs.
-            _DUST_SWEEP_UNTIL[asset] = now_ts + _DUST_SWEEP_COOLDOWN_S
             ok = await _close_position_reduce_only(
                 asset,
                 is_long,
@@ -1504,6 +1508,9 @@ def main():
                 pnl_usd=_safe_float(pos.get("pnl") or pos.get("unrealized_pnl"), 0),
                 diary_action="close_dust",
             )
+            # Success → long cool-down. Still open → short cool-down so the new
+            # close-position path can retry without spamming every 20s.
+            _DUST_SWEEP_UNTIL[asset] = now_ts + (_DUST_SWEEP_COOLDOWN_S if ok else 5 * 60)
             if ok:
                 swept += 1
         return swept
