@@ -137,6 +137,11 @@ _STOCK_STATE: dict = {
 _MECH_OI = mech.OIHistory()
 _MECH_STATS = mech.ScalpStats()
 
+# Dust flatten cooldown: asset -> unix ts when another sweep is allowed.
+# Prevents AVAX/LINK/NEAR/DOGE stubs from logging a $0 "mechanical" close every poll.
+_DUST_SWEEP_UNTIL: dict[str, float] = {}
+_DUST_SWEEP_COOLDOWN_S = 45 * 60
+
 # Store original stdout/stderr BEFORE creating handlers (Railway logging fix)
 # This ensures handlers write to the original streams, not redirected ones
 original_stdout = sys.stdout
@@ -754,7 +759,12 @@ def main():
         except Exception:
             pnl_percent = 0.0
 
-        if mech.is_mechanical_mode(_LIVE_SETTINGS) or mech_rec:
+        # Dust / no-op flattens must not spam the race closed list as $0 "mechanical" rows.
+        reason_l = str(close_reason or "").lower()
+        is_dust_close = "dust" in reason_l
+        skip_trade_row = is_dust_close or (abs(pnl_usd) < 0.01 and not mech_rec)
+
+        if (mech.is_mechanical_mode(_LIVE_SETTINGS) or mech_rec) and not skip_trade_row:
             try:
                 sb = globals().get("supabase") or None
                 if sb is None and os.getenv("SUPABASE_URL") and (os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")):
@@ -790,6 +800,13 @@ def main():
                     })
             except Exception as e:
                 logging.warning(f"Mechanical trade close insert failed for {key}: {e}")
+        elif skip_trade_row:
+            logging.info(
+                "Skip race trade log for %s (dust/noop close pnl=$%.4f reason=%s)",
+                key,
+                pnl_usd,
+                close_reason,
+            )
 
         stats = pair_hunter_stats.get(key, {})
         # Every non-zero close counts. A few cents still changes the account.
@@ -1299,16 +1316,18 @@ def main():
             except Exception as e:
                 logging.warning(f"Could not write close diary for {asset}: {e}")
 
-            try:
-                await _record_pair_hunter_outcome(
-                    asset,
-                    float(pnl_usd or 0),
-                    float(pnl_percent or 0),
-                    action_name,
-                    was_long=is_long,
-                )
-            except Exception:
-                pass
+            # Dust stubs already spam OKX; do not record them as AYO race closes.
+            if "dust" not in str(action_name or "").lower() and "dust" not in str(reason or "").lower():
+                try:
+                    await _record_pair_hunter_outcome(
+                        asset,
+                        float(pnl_usd or 0),
+                        float(pnl_percent or 0),
+                        action_name,
+                        was_long=is_long,
+                    )
+                except Exception:
+                    pass
             return True
         except Exception as e:
             add_event(f"❌ Failed to close {asset} ({reason}): {e}")
@@ -1447,6 +1466,7 @@ def main():
         if max_notional is None:
             max_notional = float(CONFIG.get("position_dust_notional_usd") or 8.0)
         swept = 0
+        now_ts = time.time()
         try:
             if use_multi_exchange and exchange_manager:
                 st = await exchange_manager.get_merged_user_state()
@@ -1466,9 +1486,14 @@ def main():
                 notional = qty * mark
             if notional <= 0 or notional > max_notional:
                 continue
+            until = float(_DUST_SWEEP_UNTIL.get(asset) or 0)
+            if until > now_ts:
+                continue
             signed = _safe_float(pos.get("quantity") or pos.get("szi"), 0)
             is_long = signed > 0
             add_event(f"🧹 Dust sweep {asset}: notional ${notional:.2f} ≤ ${max_notional:.0f} — flattening orphan")
+            # Always cool down after an attempt so a stuck stub cannot spam closes/logs.
+            _DUST_SWEEP_UNTIL[asset] = now_ts + _DUST_SWEEP_COOLDOWN_S
             ok = await _close_position_reduce_only(
                 asset,
                 is_long,

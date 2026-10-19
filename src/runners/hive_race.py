@@ -772,11 +772,22 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
 
 def _ayo_closed_trades(limit: int = 80) -> List[dict]:
     """AYO closes logged by the mechanical book. The live OKX snapshot has opens only."""
-    rows = _fetch_runner_trades("ayo", limit=limit)
+    # Fetch extra then drop dust/$0 spam so the race board stays readable.
+    rows = _fetch_runner_trades("ayo", limit=min(max(limit * 5, 200), 500))
     started = str(_STATE.get("started_at") or "")
     if started:
         rows = [t for t in rows if str(t.get("at") or "") >= started]
-    return rows[-limit:]
+    cleaned: List[dict] = []
+    for t in rows:
+        action = str(t.get("action") or "").lower()
+        pnl = abs(float(t.get("pnl") or 0))
+        if "dust" in action:
+            continue
+        # Dust sweep used to log empty mech closes as action=mechanical pnl=$0.
+        if pnl < 0.01 and action in ("mechanical", "close", ""):
+            continue
+        cleaned.append(t)
+    return cleaned[-limit:]
 
 
 async def _refresh_ayo() -> None:
