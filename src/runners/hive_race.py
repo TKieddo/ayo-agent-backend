@@ -770,6 +770,15 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         return
 
 
+def _ayo_closed_trades(limit: int = 80) -> List[dict]:
+    """AYO closes logged by the mechanical book. The live OKX snapshot has opens only."""
+    rows = _fetch_runner_trades("ayo", limit=limit)
+    started = str(_STATE.get("started_at") or "")
+    if started:
+        rows = [t for t in rows if str(t.get("at") or "") >= started]
+    return rows[-limit:]
+
+
 async def _refresh_ayo() -> None:
     """Pull the main AYO OKX book so the leaderboard can compare it with runners."""
     global _AYO_CLIENT
@@ -835,7 +844,7 @@ async def _refresh_ayo() -> None:
             "max_dd_pct": 0,
             "cap": None,
             "error": None,
-            "trades": [],
+            "trades": _ayo_closed_trades(),
             "note": f"Live OKX book · {open_count} open · race start ${start:,.0f}",
         }
     except Exception as exc:

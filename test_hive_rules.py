@@ -76,7 +76,8 @@ def test_peakstinger_skips_fresh_buying():
     assert action.kind == "hold"
 
 
-def test_trade_cap_blocks_a_new_entry():
-    book = Book(trades_today=3)
+def test_entry_count_does_not_block_a_valid_setup():
+    book = Book(trades_today=12, fees_today=9.0, cap="trade_cap")
     action = decide("mayhem", book, [coin()], now=1_000_000)
-    assert action.kind == "hold" and action.reason == "trade_cap"
+    assert action.kind == "open"
+    assert book.cap is None

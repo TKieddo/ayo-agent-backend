@@ -26,8 +26,8 @@ MAX_STOP_PCT = 8.0
 MIN_HOLD_S = 30 * 60
 TIME_STOP_S = 12 * 3600
 COOLDOWN_S = 10 * 60
-MAX_TRADES = 6
-FEE_BUDGET = 4.0
+# Entry count and fee spend do not gate new trades. A setup that passes the
+# runner filters is taken. Daily loss and the $120 retire floor still stop a book.
 DAILY_LOSS_PCT = 0.08
 RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
@@ -286,10 +286,8 @@ def _blocked(book: Book, now: float) -> Optional[str]:
         return "loss_stop"
     if book.equity <= book.day_start_equity * (1 - DAILY_LOSS_PCT):
         return "loss_stop"
-    if book.trades_today >= MAX_TRADES:
-        return "trade_cap"
-    if book.fees_today >= FEE_BUDGET:
-        return "fee_budget"
+    if book.cap in ("trade_cap", "fee_budget"):
+        book.cap = None
     if book.last_order_at and now - book.last_order_at < COOLDOWN_S:
         return "cooldown"
     return None
@@ -387,8 +385,6 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             ]
 
     if block:
-        if block in ("trade_cap", "fee_budget"):
-            book.cap = block
         return [Action("hold", reason=block)]
 
     if len(opens) >= MAX_OPENS:

@@ -774,9 +774,9 @@ def main():
                         "fee": 0.0,
                         "pnl": pnl_usd,
                         "executed_at": datetime.now(timezone.utc).isoformat(),
-                        "order_id": f"mech-{setup_tag}-{key}-{int(datetime.now(timezone.utc).timestamp())}",
                         "book": "crypto",
-                        "venue": "okx",
+                        "venue": f"okx|{setup_tag}"[:64],
+                        "runner": "ayo",
                     }
                     sb.table("trades").insert(row).execute()
                     add_event(f"💾 Mechanical close logged to trades: {key} [{setup_tag}] pnl=${pnl_usd:.2f} ({close_reason})")
