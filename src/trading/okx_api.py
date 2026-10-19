@@ -342,7 +342,8 @@ class OKXAPI:
                 pos_sz = 0.0
             if abs(pos_sz) <= 0:
                 continue
-            side = (pos.get("posSide") or "").lower()
+            raw_pos_side = (pos.get("posSide") or "").lower()
+            side = raw_pos_side
             if side in ("", "net"):
                 side = "long" if pos_sz > 0 else "short"
             return {
@@ -350,6 +351,7 @@ class OKXAPI:
                 "pos": pos_sz,
                 "contracts": abs(pos_sz),
                 "side": side,
+                "pos_side": raw_pos_side if raw_pos_side in ("long", "short", "net") else "net",
                 "mgn_mode": (pos.get("mgnMode") or self.td_mode),
                 "avg_px": float(pos.get("avgPx") or 0),
                 "mark_px": float(pos.get("markPx") or 0),
@@ -373,9 +375,11 @@ class OKXAPI:
         contracts = float(live["contracts"])
         mode = (live.get("mgn_mode") or self.td_mode or "isolated").lower()
         side = "buy" if live["side"] == "short" or float(live["pos"]) < 0 else "sell"
-        pos_side = self._pos_side_for(side, reduce_only=True) or (
-            "long" if live["side"] == "long" else "short"
-        )
+        # Use the exchange row's posSide. Config defaults to net and was rejecting
+        # long/short-mode stubs, so close-position never flattened them.
+        pos_side = str(live.get("pos_side") or "").lower()
+        if pos_side not in ("long", "short", "net"):
+            pos_side = self._pos_side_for(side, reduce_only=True) or "net"
 
         # 1) Official full close — no contract size, so lot flooring cannot leave stubs.
         close_body: Dict[str, Any] = {
@@ -390,6 +394,8 @@ class OKXAPI:
                 lambda: self._request("POST", "/api/v5/trade/close-position", json_body=close_body)
             )
             row = result[0] if isinstance(result, list) and result else (result or {})
+            if isinstance(row, dict) and str(row.get("sCode") or "0") not in ("0", ""):
+                raise RuntimeError(f"sCode={row.get('sCode')} {row.get('sMsg') or row}")
             logger.info(
                 "OKX CLOSE-POSITION %s posSide=%s mgnMode=%s contracts=%.8f → %s",
                 asset,
@@ -403,10 +409,36 @@ class OKXAPI:
             logger.warning("OKX close-position %s failed (%s); falling back to reduce-only market", asset, exc)
             row = {}
 
-        # 2) Fallback: reduce-only market for exact live contract size.
-        still = await self.get_swap_position(asset)
+        # close-position is async — wait before deciding a stub is still there.
+        still = live
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            still = await self.get_swap_position(asset)
+            if not still or float(still.get("contracts") or 0) <= 0:
+                still = None
+                break
+
+        # 2) Fallback only when the leftover is a legal order size. Sub-lot scraps
+        # cannot be closed with a normal market order.
         if still and float(still.get("contracts") or 0) > 0:
-            sz = self._format_contract_sz(float(still["contracts"]))
+            specs = self.get_instrument_specs(asset)
+            min_sz = float(specs.get("min_sz") or specs.get("lot_sz") or 0)
+            leftover_contracts = float(still["contracts"])
+            if min_sz > 0 and leftover_contracts + 1e-12 < min_sz:
+                logger.warning(
+                    "OKX CLOSE %s leftover %.8f contracts is below min size %.8f; close-position err=%s",
+                    asset,
+                    leftover_contracts,
+                    min_sz,
+                    close_err,
+                )
+                out = row if isinstance(row, dict) else {"raw": row}
+                out["closed_contracts"] = contracts
+                out["closed_side"] = live["side"]
+                out["still_open"] = True
+                out["leftover_contracts"] = leftover_contracts
+                return out
+            sz = self._format_contract_sz(leftover_contracts)
             if float(sz or 0) > 0:
                 body: Dict[str, Any] = {
                     "instId": still["inst_id"],
@@ -417,9 +449,10 @@ class OKXAPI:
                     "reduceOnly": True,
                 }
                 fallback_side = body["side"]
-                ps = self._pos_side_for(fallback_side, reduce_only=True)
-                if ps:
-                    body["posSide"] = ps
+                ps = str(still.get("pos_side") or pos_side or "").lower()
+                if ps not in ("long", "short", "net"):
+                    ps = self._pos_side_for(fallback_side, reduce_only=True) or "net"
+                body["posSide"] = ps
                 try:
                     result = await self._retry(
                         lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
