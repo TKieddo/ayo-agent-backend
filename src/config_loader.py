@@ -102,8 +102,13 @@ CONFIG = {
     "binance_testnet": _get_bool("BINANCE_TESTNET", False),
     "binance_leverage": _get_int("BINANCE_LEVERAGE", 10),
     # Alpaca Trading API (stocks + crypto paper/live)
-    "alpaca_api_key": _get_env("ALPACA_API_KEY"),
-    "alpaca_api_secret": _get_env("ALPACA_API_SECRET"),
+    # Accept both our names and Alpaca's dashboard export names (APCA_*).
+    "alpaca_api_key": (
+        (_get_env("ALPACA_API_KEY") or _get_env("APCA_API_KEY_ID") or "").strip() or None
+    ),
+    "alpaca_api_secret": (
+        (_get_env("ALPACA_API_SECRET") or _get_env("APCA_API_SECRET_KEY") or "").strip() or None
+    ),
     "alpaca_paper": _get_bool("ALPACA_PAPER", True),  # True = paper-api.alpaca.markets
     "alpaca_leverage": _get_int("ALPACA_LEVERAGE", 1),  # Hint only — Alpaca is not futures leverage
     "alpaca_paper_url": _get_env("ALPACA_PAPER_URL", "https://paper-api.alpaca.markets"),

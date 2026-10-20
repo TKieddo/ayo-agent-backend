@@ -133,7 +133,10 @@ _STOCK_STATE: dict = {
     "skips": {},
     "last_cycle_at": None,
     "scanner_rows": [],
+    "ready": False,
+    "block_reason": None,     # why the stock book is idle (no alpaca / no pool / session)
 }
+_STOCK_SKIP_LOGGED = False
 _MECH_OI = mech.OIHistory()
 _MECH_STATS = mech.ScalpStats()
 
@@ -2162,11 +2165,33 @@ def main():
 
     async def _stock_book_cycle(trading_settings: dict) -> None:
         """Alpaca-only stock cycle: scanner → trend/pullback → ATR SL / 1.5R TP + scale-out."""
+        global _STOCK_SKIP_LOGGED
         alpaca = _alpaca_client()
         if not alpaca:
+            has_key = bool(CONFIG.get("alpaca_api_key") and CONFIG.get("alpaca_api_secret"))
+            has_pool = bool(stock_universe())
+            if not has_key:
+                reason = "ALPACA_API_KEY/SECRET missing in Coolify env (or wrong names)"
+            elif not has_pool:
+                reason = "STOCK_ASSETS empty"
+            elif not use_multi_exchange and exchange_name != "alpaca":
+                reason = "Alpaca keys set but multi-exchange did not start (init failed?)"
+            else:
+                reason = "Alpaca client not initialized (check Coolify boot logs for Alpaca errors)"
+            _STOCK_STATE["ready"] = False
+            _STOCK_STATE["block_reason"] = reason
+            if not _STOCK_SKIP_LOGGED:
+                add_event(f"📕 Stock book OFF: {reason}")
+                logging.warning("Stock book OFF: %s", reason)
+                _STOCK_SKIP_LOGGED = True
             return
         pool = stock_universe()
         if not pool:
+            _STOCK_STATE["ready"] = False
+            _STOCK_STATE["block_reason"] = "STOCK_ASSETS empty"
+            if not _STOCK_SKIP_LOGGED:
+                add_event("📕 Stock book OFF: STOCK_ASSETS empty")
+                _STOCK_SKIP_LOGGED = True
             return
         if str(CONFIG.get("enable_stock_scanner", True)).lower() in ("0", "false", "no", "off"):
             # Still allow trading the full curated pool when scanner is off
@@ -2174,6 +2199,7 @@ def main():
 
         cfg = stock_strat.resolve_stock_config(trading_settings)
         now = datetime.now(timezone.utc)
+        _STOCK_STATE["ready"] = True
         _STOCK_STATE["last_cycle_at"] = now.isoformat()
 
         # Refresh scanner on a clock
@@ -2289,8 +2315,10 @@ def main():
         )
         _STOCK_STATE["session"] = {"open": open_ok, "reason": sess, "at": now.isoformat()}
         if not open_ok:
+            _STOCK_STATE["block_reason"] = f"session_closed:{sess}"
             add_event(f"📊 Stocks session CLOSED ({sess}) — exits only, no new entries")
             return
+        _STOCK_STATE["block_reason"] = None
 
         max_pos = int(cfg["max_positions"])
         if len(open_map) >= max_pos:
@@ -5632,12 +5660,23 @@ def main():
                 })
             
             network, network_label = _venue_network()
+            alpaca_ready = _alpaca_client() is not None
+            stock_skips = {
+                k: (v.get("reason") if isinstance(v, dict) else v)
+                for k, v in list((_STOCK_STATE.get("skips") or {}).items())[:12]
+            }
             return web.json_response({
                 "connected": True,
                 "status": "online",
                 "network": network,
                 "network_label": network_label,
                 "exchange": exchange_name,
+                "multi_exchange": bool(use_multi_exchange),
+                "exchanges": (
+                    list(exchange_manager.list_exchanges())
+                    if use_multi_exchange and exchange_manager
+                    else [exchange_name]
+                ),
                 "decision_mode": "mechanical" if mech.is_mechanical_mode(_LIVE_SETTINGS) else "ai",
                 "balance": round(state.get('balance', 0), 2),
                 "account_value": round(state.get('total_value', 0), 2),
@@ -5645,6 +5684,20 @@ def main():
                 # Surfaced so the dashboard can explain why no new trades are opening.
                 "risk_governor": risk_governor.status(),
                 "reentry_cooldowns": reentry_guard.active_cooldowns(),
+                "stock_book": {
+                    "ready": bool(alpaca_ready and _STOCK_STATE.get("ready")),
+                    "alpaca_client": bool(alpaca_ready),
+                    "alpaca_keys_present": bool(
+                        CONFIG.get("alpaca_api_key") and CONFIG.get("alpaca_api_secret")
+                    ),
+                    "stock_assets_count": len(stock_universe()),
+                    "block_reason": _STOCK_STATE.get("block_reason"),
+                    "session": _STOCK_STATE.get("session"),
+                    "last_cycle_at": _STOCK_STATE.get("last_cycle_at"),
+                    "active_set": list(_STOCK_STATE.get("active_set") or [])[:8],
+                    "open_count": len(_STOCK_STATE.get("managed_assets") or []),
+                    "skips": stock_skips,
+                },
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
         except Exception as e:
