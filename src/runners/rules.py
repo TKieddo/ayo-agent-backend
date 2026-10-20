@@ -312,6 +312,9 @@ def _open_slots(book: Book) -> List[Pos]:
 
 
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
+    # Oppo Mayhem only exits when Mayhem does (pair sync / queue) — no solo stops.
+    if runner == "oppo_mayhem":
+        return None
     if stop_hit(pos, mid):
         return "stop"
     if now - pos.opened_at >= TIME_STOP_S:
@@ -320,14 +323,6 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         return None
     if runner == "mayhem":
         if _against(pos, coin) or upl(pos, mid) < 0:
-            return "bail"
-    elif runner == "oppo_mayhem":
-        # Bank winners at ~1.5R so avg win can outrun losses if the fade works.
-        risk = float(pos.risk_usd or 0)
-        u = upl(pos, mid)
-        if risk > 0 and u >= 1.5 * risk:
-            return "fade_target"
-        if _against(pos, coin) or u < 0:
             return "bail"
     elif runner == "windward":
         if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:

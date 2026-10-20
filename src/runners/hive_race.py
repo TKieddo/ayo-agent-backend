@@ -404,16 +404,58 @@ def _queue_oppo_pair(action: Action) -> None:
                 "oppo_pair_open",
             )
         )
+    elif action.kind == "add" and action.coin and action.side:
+        _OPPO_PAIR_Q.append(
+            Action(
+                "add",
+                action.coin,
+                flip_side(action.side),
+                action.notional or ADD_NOTIONAL,
+                "oppo_pair_add",
+            )
+        )
+
+
+def _oppo_sync_actions(mayhem_book: Book, oppo_book: Book) -> List[Action]:
+    """Every tick: Oppo must hold the exact Mayhem coins on the flipped side."""
+    m_by = {p.coin: p for p in mayhem_book.positions}
+    o_by = {p.coin: p for p in oppo_book.positions}
+    out: List[Action] = []
+    for coin, pos in o_by.items():
+        mpos = m_by.get(coin)
+        if mpos is None:
+            out.append(Action("close", coin, pos.side, reason="oppo_pair_close"))
+        elif pos.side != flip_side(mpos.side):
+            out.append(Action("close", coin, pos.side, reason="oppo_pair_flip"))
+    for coin, mpos in m_by.items():
+        want = flip_side(mpos.side)
+        opos = o_by.get(coin)
+        if opos is None or opos.side != want:
+            out.append(
+                Action(
+                    "open",
+                    coin,
+                    want,
+                    float(mpos.notional or ENTRY_NOTIONAL),
+                    "oppo_pair_open",
+                )
+            )
+    return out
 
 
 def _dedupe_actions(actions: List[Action]) -> List[Action]:
     seen_close: set = set()
+    seen_open: set = set()
     out: List[Action] = []
     for a in actions:
         if a.kind == "close":
             if a.coin in seen_close:
                 continue
             seen_close.add(a.coin)
+        elif a.kind == "open":
+            if a.coin in seen_open:
+                continue
+            seen_open.add(a.coin)
         out.append(a)
     return out
 
@@ -815,13 +857,17 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         coin = by_coin.get(pos.coin)
         if not coin:
             return
-        qty = await _order(client, pos.side, pos.coin, ADD_NOTIONAL, coin.mid, False)
-        fee = fee_usd(ADD_NOTIONAL)
+        # Oppo pair add must stay on the flipped side already held.
+        if runner == "oppo_mayhem" and action.side and action.side != pos.side:
+            return
+        add_n = float(action.notional or ADD_NOTIONAL)
+        qty = await _order(client, pos.side, pos.coin, add_n, coin.mid, False)
+        fee = fee_usd(add_n)
         book.equity -= fee
         book.fees_today += fee
         book.last_order_at = now
-        filled = pos.notional + ADD_NOTIONAL
-        pos.entry_px = (pos.entry_px * pos.notional + coin.mid * ADD_NOTIONAL) / filled
+        filled = pos.notional + add_n
+        pos.entry_px = (pos.entry_px * pos.notional + coin.mid * add_n) / filled
         pos.notional = filled
         pos.coin_qty += qty
         pos.added = True
@@ -833,6 +879,8 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
             else:
                 pos.stop_px = min(pos.stop_px, max(fresh, pos.entry_px))
         book.sync_primary()
+        if runner == "mayhem":
+            _queue_oppo_pair(Action("add", pos.coin, pos.side, add_n, action.reason or "pyramid"))
         return
     if action.kind == "switch":
         # Handled as close+open action lists from decide_actions.
@@ -977,9 +1025,19 @@ async def _tick(decide: bool = True) -> None:
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
                     actions: List[Action] = []
                     if runner == "oppo_mayhem":
+                        mayhem_raw = _STATE["runners"].get("mayhem") or {}
+                        mayhem_book = _book_from(mayhem_raw)
+                        # Catch-up every tick so Oppo always matches Mayhem 1:1
+                        # (covers bails, restarts, and missed queue events).
+                        actions.extend(_oppo_sync_actions(mayhem_book, book))
                         actions.extend(_OPPO_PAIR_Q)
                         _OPPO_PAIR_Q.clear()
-                    actions.extend(decide_actions(runner, book, coins, now))
+                        # Only hard caps (retired / loss_stop) from decide — no solo exits.
+                        for a in decide_actions(runner, book, coins, now):
+                            if a.kind == "close" and a.reason in ("retired", "loss_stop"):
+                                actions.append(a)
+                    else:
+                        actions.extend(decide_actions(runner, book, coins, now))
                     for action in _dedupe_actions(actions):
                         await _act(runner, client, book, coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.
