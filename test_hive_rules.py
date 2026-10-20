@@ -69,11 +69,11 @@ def test_peaksting_shorts_the_fade():
     assert action.kind == "open" and action.side == "short" and action.coin == "PEPE"
 
 
-def test_peakstinger_skips_fresh_buying():
+def test_mayhem_inv_flips_impulse_side():
     book = Book()
-    fresh = coin(coin="WIF", ret24h=9, ret1h=-1, vol_z=-0.5, rsi14=75, oi_chg_1h=2, high24h=100, mid=96)
-    action = decide("peakstinger", book, [fresh], now=1_000_000)
-    assert action.kind == "hold"
+    pumped = coin(coin="SOL", ret1h=4, ret24h=3, oi_chg_1h=1, rsi14=55)
+    action = decide("mayhem_inv", book, [pumped], now=1_000_000)
+    assert action.kind == "open" and action.side == "short" and action.coin == "SOL"
 
 
 def test_entry_count_does_not_block_a_valid_setup():

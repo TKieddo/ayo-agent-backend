@@ -65,7 +65,8 @@ ENV_PREFIX = {
     "windward": "WINDWARD",
     "orakelia": "ORAKELIA",
     "peaksting": "PEAKSTING",
-    "peakstinger": "PEAKSTINGER",
+    # Reuse Peak Stinger demo keys for the Mayhem inverse A/B slot.
+    "mayhem_inv": "PEAKSTINGER",
 }
 
 
