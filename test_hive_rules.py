@@ -69,11 +69,19 @@ def test_peaksting_shorts_the_fade():
     assert action.kind == "open" and action.side == "short" and action.coin == "PEPE"
 
 
-def test_mayhem_inv_flips_impulse_side():
+def test_oppo_mayhem_does_not_open_solo():
+    """Oppo Mayhem only enters via the 1:1 Mayhem pair queue in hive_race."""
     book = Book()
     pumped = coin(coin="SOL", ret1h=4, ret24h=3, oi_chg_1h=1, rsi14=55)
-    action = decide("mayhem_inv", book, [pumped], now=1_000_000)
-    assert action.kind == "open" and action.side == "short" and action.coin == "SOL"
+    action = decide("oppo_mayhem", book, [pumped], now=1_000_000)
+    assert action.kind == "hold"
+
+
+def test_flip_side_opposite():
+    from src.runners.rules import flip_side
+
+    assert flip_side("long") == "short"
+    assert flip_side("short") == "long"
 
 
 def test_entry_count_does_not_block_a_valid_setup():

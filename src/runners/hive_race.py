@@ -38,6 +38,7 @@ from src.runners.rules import (
     Pos,
     decide_actions,
     fee_usd,
+    flip_side,
     stop_pct,
     stop_price,
     upl,
@@ -65,9 +66,12 @@ ENV_PREFIX = {
     "windward": "WINDWARD",
     "orakelia": "ORAKELIA",
     "peaksting": "PEAKSTING",
-    # Reuse Peak Stinger demo keys for the Mayhem inverse A/B slot.
-    "mayhem_inv": "PEAKSTINGER",
+    # Oppo Mayhem 1:1 pair — reuses Peak Stinger demo keys (PEAKSTINGER_*).
+    "oppo_mayhem": "PEAKSTINGER",
 }
+
+# Mayhem open/close → Oppo Mayhem opposite open/close (drained on Oppo's tick).
+_OPPO_PAIR_Q: List[Action] = []
 
 
 def _path() -> Path:
@@ -375,6 +379,45 @@ def _book_to(
     }
 
 
+def _migrate_runner_ids(runners: Dict[str, Any]) -> Dict[str, Any]:
+    """Rename legacy mayhem_inv → oppo_mayhem so state/UI stay readable."""
+    if not isinstance(runners, dict):
+        return {}
+    out = dict(runners)
+    legacy = out.pop("mayhem_inv", None)
+    if legacy is not None and "oppo_mayhem" not in out:
+        out["oppo_mayhem"] = legacy
+    return out
+
+
+def _queue_oppo_pair(action: Action) -> None:
+    """After Mayhem fills, queue the opposite 1:1 for Oppo Mayhem."""
+    if action.kind == "close" and action.coin:
+        _OPPO_PAIR_Q.append(Action("close", action.coin, reason="oppo_pair_close"))
+    elif action.kind == "open" and action.coin and action.side:
+        _OPPO_PAIR_Q.append(
+            Action(
+                "open",
+                action.coin,
+                flip_side(action.side),
+                action.notional or ENTRY_NOTIONAL,
+                "oppo_pair_open",
+            )
+        )
+
+
+def _dedupe_actions(actions: List[Action]) -> List[Action]:
+    seen_close: set = set()
+    out: List[Action] = []
+    for a in actions:
+        if a.kind == "close":
+            if a.coin in seen_close:
+                continue
+            seen_close.add(a.coin)
+        out.append(a)
+    return out
+
+
 def _load() -> None:
     path = _path()
     if not path.exists():
@@ -382,7 +425,7 @@ def _load() -> None:
     try:
         saved = json.loads(path.read_text())
         _STATE["started_at"] = saved.get("started_at")
-        _STATE["runners"] = saved.get("runners") or {}
+        _STATE["runners"] = _migrate_runner_ids(saved.get("runners") or {})
     except Exception as exc:
         logger.warning("hive race state unreadable: %s", exc)
 
@@ -535,6 +578,9 @@ def _hydrate_from_supabase() -> None:
     earliest: Optional[str] = None
     for runner in RUNNERS:
         db_trades = _fetch_runner_trades(runner)
+        # Legacy id from the short-lived Mayhem Inv A/B slot.
+        if runner == "oppo_mayhem":
+            db_trades = db_trades + _fetch_runner_trades("mayhem_inv")
         if not db_trades:
             continue
         raw = dict(_STATE["runners"].get(runner) or {})
@@ -721,8 +767,28 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         }
         trades.append(row)
         _persist_trade(runner, row)
+        if runner == "mayhem":
+            _queue_oppo_pair(Action("close", pos.coin, pos.side, reason=action.reason or "close"))
         return
     if action.kind == "open":
+        # Oppo Mayhem must mirror Mayhem even when already full — free the worst slot.
+        if len(book.positions) >= MAX_OPENS:
+            if runner == "oppo_mayhem" and action.reason == "oppo_pair_open" and book.positions:
+                worst = min(
+                    book.positions,
+                    key=lambda p: upl(p, by_coin[p.coin].mid if p.coin in by_coin else p.entry_px),
+                )
+                await _act(
+                    runner,
+                    client,
+                    book,
+                    coins,
+                    Action("close", worst.coin, worst.side, reason="oppo_slot"),
+                    trades,
+                    now,
+                )
+            else:
+                return
         if len(book.positions) >= MAX_OPENS:
             return
         coin = by_coin.get(action.coin or "")
@@ -739,6 +805,8 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         book.last_order_at = now
         book.positions.append(_open_pos(coin, action.side, notional, qty, now))
         book.sync_primary()
+        if runner == "mayhem":
+            _queue_oppo_pair(Action("open", coin.coin, action.side, notional, action.reason or "entry"))
         return
     if action.kind == "add":
         pos = _find_pos(book, action.coin)
@@ -876,8 +944,10 @@ async def _tick(decide: bool = True) -> None:
             _STATE["market_coins"] = len(coins)
         _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
         _STATE["last_error"] = None
-        for runner, client in list(_CLIENTS.items()):
-            if runner not in RUNNERS:
+        # RUNNERS order: Mayhem before Oppo Mayhem so the pair queue is filled first.
+        for runner in RUNNERS:
+            client = _CLIENTS.get(runner)
+            if not client:
                 continue
             raw = _STATE["runners"].get(runner) or {}
             book = _book_from(raw)
@@ -894,8 +964,12 @@ async def _tick(decide: bool = True) -> None:
                 if decide:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
-                    actions = decide_actions(runner, book, coins, now)
-                    for action in actions:
+                    actions: List[Action] = []
+                    if runner == "oppo_mayhem":
+                        actions.extend(_OPPO_PAIR_Q)
+                        _OPPO_PAIR_Q.clear()
+                    actions.extend(decide_actions(runner, book, coins, now))
+                    for action in _dedupe_actions(actions):
                         await _act(runner, client, book, coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.
                     upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)

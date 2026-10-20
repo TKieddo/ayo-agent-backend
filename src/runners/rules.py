@@ -33,15 +33,15 @@ RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# mayhem_inv = same Mayhem impulse setups, opposite side + 1.5R target (A/B vs Mayhem).
-# Reuses the old Peak Stinger demo-key slot (PEAKSTINGER_* env) so Coolify needs no new keys.
-RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "mayhem_inv")
+# Oppo Mayhem: 1:1 mirror of Mayhem entries on the opposite side (wired in hive_race).
+# Reuses PEAKSTINGER_* demo keys. Own exits bank ~1.5R; no solo entries.
+RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem",
     "windward": "Windward",
     "orakelia": "Orakelia",
     "peaksting": "PeakSting",
-    "mayhem_inv": "Mayhem Inv",
+    "oppo_mayhem": "Oppo Mayhem",
     "ayo": "AYO",
 }
 
@@ -258,8 +258,11 @@ def _peakstinger(coins: List[Coin]) -> List[Coin]:
 
 
 def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
-    if runner in ("mayhem", "mayhem_inv"):
+    if runner == "mayhem":
         return _mayhem(coins)
+    if runner == "oppo_mayhem":
+        # Entries only arrive via 1:1 Mayhem pair queue in hive_race.
+        return []
     if runner == "windward":
         return _windward(coins)
     if runner == "orakelia":
@@ -269,19 +272,18 @@ def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
     return []
 
 
+def flip_side(side: str) -> str:
+    """Opposite of a long/short position side (Oppo Mayhem 1:1 pair)."""
+    return "short" if side == "long" else "long"
+
+
 def _side_for(runner: str, coin: Coin) -> str:
     if runner == "peaksting":
         return "short"
     if runner == "orakelia":
         return "long"
-    if runner == "mayhem_inv":
-        # Exact opposite of Mayhem's impulse side.
-        side = impulse(coin)
-        if side == "long":
-            return "short"
-        if side == "short":
-            return "long"
-        return "short"
+    if runner == "oppo_mayhem":
+        return flip_side(impulse(coin) or "long")
     return impulse(coin) or "long"
 
 
@@ -319,7 +321,7 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
     if runner == "mayhem":
         if _against(pos, coin) or upl(pos, mid) < 0:
             return "bail"
-    elif runner == "mayhem_inv":
+    elif runner == "oppo_mayhem":
         # Bank winners at ~1.5R so avg win can outrun losses if the fade works.
         risk = float(pos.risk_usd or 0)
         u = upl(pos, mid)
@@ -380,7 +382,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             continue
         mid = coin.mid
         if (
-            runner != "mayhem_inv"  # fading: no pyramid
+            runner != "oppo_mayhem"  # paired fade: no pyramid
             and not pos.added
             and upl(pos, mid) > 0
             and _run_atr(pos, coin) >= 1.5
@@ -389,8 +391,8 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
         ):
             return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")]
 
-    # Mayhem / Mayhem Inv: free a slot for a stronger name when full.
-    if runner in ("mayhem", "mayhem_inv") and len(opens) >= MAX_OPENS:
+    # Mayhem: free a slot for a stronger name when full (Oppo mirrors via pair queue).
+    if runner == "mayhem" and len(opens) >= MAX_OPENS:
         ranked = _mayhem(coins)
         held = {p.coin for p in opens}
         if ranked and ranked[0].coin not in held:
