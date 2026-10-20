@@ -336,13 +336,29 @@ class AlpacaAPI:
         interval: str = "15m",
         limit: int = 100,
     ) -> List[List[Any]]:
-        """OHLCV bars as [ts_ms, open, high, low, close, volume] for equities."""
+        """OHLCV bars as [ts_ms, open, high, low, close, volume] for equities.
+
+        Always pass an explicit ``start`` window. Without it Alpaca often returns
+        only the current RTH session (~20–26×15m bars), which is below the
+        strategy's ~39-bar minimum and blocks every entry.
+        """
+        from datetime import datetime as _dt, timedelta, timezone as _tz
+
         symbol = self._to_symbol(asset)
         if self.is_crypto(asset):
             # Stock scanner/strategy should never request crypto pairs here
             logger.warning(f"get_stock_bars called for crypto-like {asset}; skipping")
             return []
         tf = self._bar_timeframe(interval)
+        want = min(int(limit or 100), 1000)
+        # ~26 fifteen-minute bars per RTH day; pad calendar days for weekends.
+        days_back = 10 if tf in ("15Min", "5Min", "1Min", "30Min") else 30
+        if tf in ("1Hour", "4Hour"):
+            days_back = 40
+        if tf == "1Day":
+            days_back = 120
+        start = (_dt.now(_tz.utc) - timedelta(days=days_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        feed = str(CONFIG.get("alpaca_data_feed") or "iex").strip().lower() or "iex"
         try:
             data = await self._retry(
                 lambda: self._request(
@@ -351,15 +367,20 @@ class AlpacaAPI:
                     params={
                         "symbols": symbol,
                         "timeframe": tf,
-                        "limit": str(min(int(limit or 100), 1000)),
+                        "start": start,
+                        "limit": str(want),
                         "adjustment": "split",
-                        "feed": str(CONFIG.get("alpaca_data_feed") or "iex"),
+                        "feed": feed,
+                        "sort": "asc",
                     },
                     base=self.data_base,
                 )
             )
             bars_map = (data or {}).get("bars") or {}
             raw = bars_map.get(symbol) or []
+            # Single-symbol responses sometimes return a bare list.
+            if not raw and isinstance(data, dict) and isinstance(data.get("bars"), list):
+                raw = data.get("bars") or []
             if not isinstance(raw, list):
                 return []
             out: List[List[Any]] = []
@@ -367,8 +388,6 @@ class AlpacaAPI:
                 ts = b.get("t") or b.get("timestamp")
                 try:
                     if isinstance(ts, str):
-                        # 2024-01-02T14:30:00Z
-                        from datetime import datetime as _dt
                         ts_ms = int(_dt.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
                     else:
                         ts_ms = int(ts or 0)
@@ -382,6 +401,15 @@ class AlpacaAPI:
                     float(b.get("c") or 0),
                     float(b.get("v") or 0),
                 ])
+            if len(out) < want // 3:
+                logger.warning(
+                    "Alpaca bars thin for %s feed=%s: got %d (wanted %d, start=%s)",
+                    symbol,
+                    feed,
+                    len(out),
+                    want,
+                    start,
+                )
             return out
         except Exception as e:
             logger.error(f"Alpaca bars error for {asset}: {e}")

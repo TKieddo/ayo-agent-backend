@@ -2325,6 +2325,13 @@ def main():
             return
 
         candidates = [s for s in (_STOCK_STATE.get("active_set") or []) if s not in open_map]
+        # If the scanner collapsed to one illiquid name, still walk liquid majors.
+        if len(candidates) < 3:
+            fallback = [s for s in pool if s not in open_map and s not in candidates]
+            # Prefer megacaps first so IEX bar coverage is denser.
+            preferred = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "SPY", "QQQ", "TSLA", "AMD"]
+            ordered = [s for s in preferred if s in fallback] + [s for s in fallback if s not in preferred]
+            candidates = candidates + ordered[: max(0, 5 - len(candidates))]
         for sym in candidates:
             if len(open_map) + len([a for a in _STOCK_STATE["managed_assets"] if a not in open_map]) >= max_pos:
                 break

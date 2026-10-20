@@ -180,6 +180,16 @@ async def scan_stocks(
     scored.sort(key=lambda s: s.score, reverse=True)
     top = scored[:top_n]
     active = [s.symbol for s in top]
+    # Never return a 0–1 name set when the pool is large — pad with liquid majors
+    # so a thin IEX response on one ticker cannot stall the whole stock book.
+    if len(active) < min(top_n, 3) and pool:
+        preferred = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "SPY", "QQQ", "TSLA", "AMD"]
+        for sym in preferred + pool:
+            u = sym.upper()
+            if u not in active and u in {p.upper() for p in pool}:
+                active.append(u)
+            if len(active) >= top_n:
+                break
     now = datetime.now(timezone.utc).isoformat()
     rows = [
         {
