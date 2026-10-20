@@ -616,8 +616,11 @@ def calculate_risk_based_allocation(
 
     risk_usd = trading_settings.get("risk_per_trade_usd")
     if risk_usd is None:
+        from src.utils.practice_bankroll import risk_equity
+
         risk_pct = float(trading_settings.get("risk_per_trade_pct") or CONFIG.get("risk_per_trade_pct", 0.5) or 0.5)
-        risk_usd = available_balance * (risk_pct / 100.0)
+        # % of the $300 practice book — never the fat OKX demo wallet.
+        risk_usd = risk_equity(available_balance) * (risk_pct / 100.0)
     risk_usd = max(float(risk_usd), 0.0)
     # Never let sizing exceed the hard USD stop ceiling when both are set.
     try:

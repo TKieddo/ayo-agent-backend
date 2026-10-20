@@ -2856,7 +2856,13 @@ def main():
             trading_settings = await get_trading_settings()
             _LIVE_SETTINGS.clear()
             _LIVE_SETTINGS.update(trading_settings)
-            _LAST_KNOWN_EQUITY["value"] = float(account_value or 0.0) or _LAST_KNOWN_EQUITY.get("value")
+            # Risk breakers use the $300 practice bankroll, never the fat demo wallet.
+            try:
+                from src.utils.practice_bankroll import risk_equity
+
+                _LAST_KNOWN_EQUITY["value"] = risk_equity(float(account_value or 0.0) or None)
+            except Exception:
+                _LAST_KNOWN_EQUITY["value"] = float(account_value or 0.0) or _LAST_KNOWN_EQUITY.get("value")
             default_leverage = trading_settings["leverage"]
 
             # ═════════════════════════════════════════════════════════════════

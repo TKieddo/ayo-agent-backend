@@ -860,16 +860,24 @@ def _ayo_closed_trades(limit: int = 80) -> List[dict]:
 
 
 async def _refresh_ayo() -> None:
-    """Pull the main AYO OKX book so the leaderboard can compare it with runners."""
+    """AYO on the race board = $300 practice ledger (same start as hive runners).
+
+    Opens/UPL still come from the live OKX book; wallet size is ignored for equity/%.
+    """
     global _AYO_CLIENT
     if _AYO_CLIENT is None:
         return
     try:
+        from src.utils.practice_bankroll import practice_bankroll_usd
+
         state = await _AYO_CLIENT.get_user_state()
-        equity = float(state.get("total_value") or state.get("balance") or 0)
-        if _STATE.get("ayo_start_equity") is None and equity > 0:
-            _STATE["ayo_start_equity"] = equity
-        start = float(_STATE.get("ayo_start_equity") or equity or START_EQUITY)
+        wallet = float(state.get("total_value") or state.get("balance") or 0)
+        start = float(practice_bankroll_usd() or START_EQUITY)
+        # Force practice start — never lock onto a fat demo wallet snapshot.
+        _STATE["ayo_start_equity"] = start
+        closed = _ayo_closed_trades()
+        realized = sum(float(t.get("pnl") or 0) for t in closed)
+        equity = start + realized
         positions = state.get("positions") or []
         pos = None
         open_positions: List[Dict[str, Any]] = []
@@ -906,13 +914,13 @@ async def _refresh_ayo() -> None:
                 best_notional = notional
                 pos = row
         open_positions.sort(key=lambda r: float(r.get("notional") or 0), reverse=True)
-        # Show the real OKX book on the race board (not the $300 race ledger).
-        pct = ((equity - start) / start * 100) if start else 0.0
+        mtm = equity + upl_total
+        pct = ((mtm - start) / start * 100) if start else 0.0
         _STATE["runners"]["ayo"] = {
             "configured": True,
-            "equity": round(equity, 4),
-            "mtm": round(equity, 4),
-            "account_equity": round(equity, 2),
+            "equity": round(mtm, 4),
+            "mtm": round(mtm, 4),
+            "account_equity": round(wallet, 2),  # real OKX wallet — display only, not race math
             "ayo_start_equity": round(start, 2),
             "pct": round(pct, 2),
             "upl": round(upl_total, 4),
@@ -924,8 +932,11 @@ async def _refresh_ayo() -> None:
             "max_dd_pct": 0,
             "cap": None,
             "error": None,
-            "trades": _ayo_closed_trades(),
-            "note": f"Live OKX book · {open_count} open · race start ${start:,.0f}",
+            "trades": closed,
+            "note": (
+                f"Practice ${start:,.0f} book · {open_count} open · "
+                f"OKX wallet ${wallet:,.0f} ignored for race %"
+            ),
         }
     except Exception as exc:
         raw = _STATE["runners"].get("ayo") or {}

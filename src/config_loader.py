@@ -189,7 +189,9 @@ CONFIG = {
     "position_sizing_mode": _get_env("POSITION_SIZING_MODE", "risk"),  # risk for choppy pairs (wide ATR stop, size shrinks); margin = fixed $
     # Risk knobs: in risk mode these size the trade from the stop; always used as $ loss target.
     "risk_per_trade_usd": _get_float("RISK_PER_TRADE_USD", 6.0),  # Max $ loss if ATR stop is hit
-    "risk_per_trade_pct": _get_float("RISK_PER_TRADE_PCT", 0.5),  # Fallback % of equity when USD not set
+    "risk_per_trade_pct": _get_float("RISK_PER_TRADE_PCT", 0.5),  # Fallback % of practice bankroll when USD not set
+    # Pretend bankroll for risk/%/race board — ignore fat OKX demo wallet (e.g. $5k).
+    "practice_bankroll_usd": _get_float("PRACTICE_BANKROLL_USD", 300.0),
     "max_notional_per_position": _get_float("MAX_NOTIONAL_PER_POSITION"),  # Optional hard cap on notional exposure
     "min_notional_per_position": _get_float("MIN_NOTIONAL_PER_POSITION", 50.0),  # Floor so risk sizing never emits a sub-minimum order
     # Leftover reduce-only dust (e.g. ~$5) still counts as an open and blocks max_positions.

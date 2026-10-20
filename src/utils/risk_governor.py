@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.config_loader import CONFIG
+from src.utils.practice_bankroll import risk_equity
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +115,8 @@ def _resolve_daily_loss_limit(
     trading_settings: Optional[Dict[str, Any]],
     equity: Optional[float],
 ) -> Optional[float]:
-    # A 3% cap on a ~$5k account is about $150, so a $20 losing day never stopped
-    # entries. Default session stop is 3× the per-trade risk ($18 at a $6 risk).
-    # An explicit max_daily_loss_usd still wins. A percent cap can only tighten this.
+    # Default session stop is 3× per-trade risk. Explicit max_daily_loss_usd wins
+    # unless practice-bankroll % is tighter (always size % off $300, not the demo wallet).
     risk = abs(float(_setting(trading_settings, "risk_per_trade_usd", 6) or 6))
     cap = max(risk, 1.0) * 3.0
     explicit = None
@@ -131,8 +131,9 @@ def _resolve_daily_loss_limit(
         pass
 
     limit_pct = _setting(trading_settings, "max_daily_loss_pct", 0.0)
-    if limit_pct and equity and equity > 0:
-        cap = min(cap, abs(float(equity) * (float(limit_pct) / 100.0)))
+    bank = risk_equity(equity)
+    if limit_pct and bank > 0:
+        cap = min(cap, abs(float(bank) * (float(limit_pct) / 100.0)))
     return cap
 
 
