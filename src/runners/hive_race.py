@@ -391,10 +391,8 @@ def _migrate_runner_ids(runners: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _queue_oppo_pair(action: Action) -> None:
-    """After Mayhem fills, queue the opposite 1:1 for Oppo Mayhem."""
-    if action.kind == "close" and action.coin:
-        _OPPO_PAIR_Q.append(Action("close", action.coin, reason="oppo_pair_close"))
-    elif action.kind == "open" and action.coin and action.side:
+    """Queue Oppo entries/adds only — never clone Mayhem closes (Oppo exits alone)."""
+    if action.kind == "open" and action.coin and action.side:
         _OPPO_PAIR_Q.append(
             Action(
                 "open",
@@ -417,20 +415,26 @@ def _queue_oppo_pair(action: Action) -> None:
 
 
 def _oppo_sync_actions(mayhem_book: Book, oppo_book: Book) -> List[Action]:
-    """Every tick: Oppo must hold the exact Mayhem coins on the flipped side."""
+    """Open missing flipped Mayhem legs. Do not close when Mayhem flats (own exits)."""
     m_by = {p.coin: p for p in mayhem_book.positions}
     o_by = {p.coin: p for p in oppo_book.positions}
     out: List[Action] = []
-    for coin, pos in o_by.items():
-        mpos = m_by.get(coin)
-        if mpos is None:
-            out.append(Action("close", coin, pos.side, reason="oppo_pair_close"))
-        elif pos.side != flip_side(mpos.side):
-            out.append(Action("close", coin, pos.side, reason="oppo_pair_flip"))
     for coin, mpos in m_by.items():
         want = flip_side(mpos.side)
         opos = o_by.get(coin)
-        if opos is None or opos.side != want:
+        if opos is not None and opos.side != want:
+            # Wrong way vs Mayhem — flip once, then Oppo manages the fade.
+            out.append(Action("close", coin, opos.side, reason="oppo_pair_flip"))
+            out.append(
+                Action(
+                    "open",
+                    coin,
+                    want,
+                    float(mpos.notional or ENTRY_NOTIONAL),
+                    "oppo_pair_open",
+                )
+            )
+        elif opos is None:
             out.append(
                 Action(
                     "open",
@@ -809,8 +813,7 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         }
         trades.append(row)
         _persist_trade(runner, row)
-        if runner == "mayhem":
-            _queue_oppo_pair(Action("close", pos.coin, pos.side, reason=action.reason or "close"))
+        # Mayhem closes are NOT mirrored — Oppo keeps the fade until its own exit.
         return
     if action.kind == "open":
         # Oppo Mayhem must mirror Mayhem even when already full — free the worst slot.
@@ -1027,15 +1030,11 @@ async def _tick(decide: bool = True) -> None:
                     if runner == "oppo_mayhem":
                         mayhem_raw = _STATE["runners"].get("mayhem") or {}
                         mayhem_book = _book_from(mayhem_raw)
-                        # Catch-up every tick so Oppo always matches Mayhem 1:1
-                        # (covers bails, restarts, and missed queue events).
+                        # Pair opens/adds with Mayhem; exits come from decide (1.5R / stop / time).
                         actions.extend(_oppo_sync_actions(mayhem_book, book))
                         actions.extend(_OPPO_PAIR_Q)
                         _OPPO_PAIR_Q.clear()
-                        # Only hard caps (retired / loss_stop) from decide — no solo exits.
-                        for a in decide_actions(runner, book, coins, now):
-                            if a.kind == "close" and a.reason in ("retired", "loss_stop"):
-                                actions.append(a)
+                        actions.extend(decide_actions(runner, book, coins, now))
                     else:
                         actions.extend(decide_actions(runner, book, coins, now))
                     for action in _dedupe_actions(actions):

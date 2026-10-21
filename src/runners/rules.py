@@ -33,15 +33,15 @@ RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo Mayhem: 1:1 mirror of Mayhem entries on the opposite side (wired in hive_race).
-# Reuses PEAKSTINGER_* demo keys. Own exits bank ~1.5R; no solo entries.
+# Oppo Mayhem: 1:1 opposite *entries* when Mayhem opens (hive_race). Own exits
+# (stop / 1.5R fade / time) — does NOT clone Mayhem bails. PEAKSTINGER_* keys.
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem",
     "windward": "Windward",
     "orakelia": "Orakelia",
     "peaksting": "PeakSting",
-    "oppo_mayhem": "Oppo Mayhem",
+    "oppo_mayhem": "Oppo Mayhem",  # enter opposite Mayhem; exit on own 1.5R/stop
     "ayo": "AYO",
 }
 
@@ -319,9 +319,6 @@ def _open_slots(book: Book) -> List[Pos]:
 
 
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
-    # Oppo Mayhem only exits when Mayhem does (pair sync / queue) — no solo stops.
-    if runner == "oppo_mayhem":
-        return None
     if stop_hit(pos, mid):
         return "stop"
     if now - pos.opened_at >= TIME_STOP_S:
@@ -331,6 +328,12 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
     if runner == "mayhem":
         if _against(pos, coin) or upl(pos, mid) < 0:
             return "bail"
+    elif runner == "oppo_mayhem":
+        # Fade book: bank ~1.5R. Do not bail with Mayhem — that kills winners early.
+        risk = float(pos.risk_usd or 0)
+        u = upl(pos, mid)
+        if risk > 0 and u >= 1.5 * risk:
+            return "fade_target"
     elif runner == "windward":
         if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
             return "trend_break"
