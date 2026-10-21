@@ -2660,14 +2660,25 @@ def main():
             # 🔍 PAIR HUNTER: Build decision universe before market-data fetch
             # ═════════════════════════════════════════════════════════════════
             decision_assets = list(args.assets)
-            enable_pair_hunter = CONFIG.get("enable_pair_hunter", False)
+            enable_pair_hunter = CONFIG.get("enable_pair_hunter", True)
+            force_mech_hunt = str(CONFIG.get("mech_use_pair_hunter", True)).lower() not in (
+                "0", "false", "no", "off"
+            )
             pair_hunter_top_n = CONFIG.get("pair_hunter_top_n", 5)
             pair_hunter_refresh_interval = CONFIG.get("pair_hunter_refresh_interval", 5)  # Refresh every N loops
-            pair_hunter_min_volatility = CONFIG.get("pair_hunter_min_volatility", 2.0)
+            # Prefer live trading_settings band when present (middle-ground defaults in CONFIG).
+            _ph_settings = _LIVE_SETTINGS or {}
+            pair_hunter_min_volatility = float(
+                _ph_settings.get("pair_hunter_min_volatility")
+                or CONFIG.get("pair_hunter_min_volatility", 0.7)
+                or 0.7
+            )
             pair_hunter_max_analyze_assets = CONFIG.get("pair_hunter_max_analyze_assets", 8)
+            hunted_assets: list = list(getattr(run_loop, "_last_hunted_assets", []) or [])
 
-            mechanical_universe_mode = mech.is_mechanical_mode(_LIVE_SETTINGS)
-            if enable_pair_hunter and not mechanical_universe_mode:
+            # Mechanical used to skip the hunter and sit on a static allowlist — always hunt
+            # when mech_use_pair_hunter is on so AYO gets middle-vol dynamic pairs.
+            if enable_pair_hunter or force_mech_hunt:
                 # Initialize pair hunter tracking
                 if not hasattr(run_loop, '_pair_hunter_counter'):
                     run_loop._pair_hunter_counter = 0
@@ -2680,9 +2691,7 @@ def main():
                     run_loop._pair_hunter_counter >= pair_hunter_refresh_interval
                     or len(run_loop._last_hunted_assets) == 0
                 )
-                # Rescan on a clock (default 15m), not every ~60s mechanical cycle.
-                # Do not gate this on is_mechanical_mode(_LIVE_SETTINGS): settings are
-                # loaded later in the loop, so that check was skipping the throttle.
+                # Rescan on a clock (default ~10–15m), not every ~60s mechanical cycle.
                 if should_refresh and run_loop._last_hunted_assets:
                     last_refresh = _MECH_STATE.get("last_pair_refresh_at")
                     refresh_min = float(
@@ -2882,19 +2891,7 @@ def main():
             # runs every ~60s so a 5m setup is taken on the next candle.
             # ═════════════════════════════════════════════════════════════════
             if mech.is_mechanical_mode(trading_settings):
-                mech_cfg = mech.resolve_config(trading_settings, CONFIG)
-                if not getattr(run_loop, "_mech_announced", False):
-                    network_now, label_now = _venue_network()
-                    univ = ", ".join(mech.liquid_universe(mech_cfg)[:8])
-                    add_event(
-                        f"🤖 MECHANICAL multi-setup on {label_now}: AI parked. "
-                        f"{mech.resolve_exit_targets(trading_settings, mech_cfg)['label']}, "
-                        f"${float(mech_cfg['mech_margin_usd']):.0f} margin ×{int(mech_cfg['mech_max_positions'])} max, "
-                        f"{int(mech_cfg['mech_leverage'])}x isolated, cycle {int(mech_cfg['mech_cycle_seconds'])}s. "
-                        f"Setups: session_impulse / range_mr / breakout_retest. Universe: {univ}…"
-                    )
-                    run_loop._mech_announced = True
-                # Mechanical is crypto/OKX-only — never pull Alpaca stocks or IG forex into the loop
+                # Prefer live pair-hunter names (middle ATR band). Static list is fallback only.
                 _mech_stock_set = {
                     p.strip().upper()
                     for p in str(CONFIG.get("stock_assets") or "").replace(",", " ").split()
@@ -2911,6 +2908,35 @@ def main():
                         if mapped and mapped not in _CRYPTO_VENUES:
                             return False
                     return True
+
+                trading_settings = dict(trading_settings or {})
+                hunted_now = [
+                    str(a).upper()
+                    for a in (hunted_assets or getattr(run_loop, "_last_hunted_assets", None) or [])
+                    if _mech_allowed(str(a))
+                ]
+                use_hunter = str(
+                    trading_settings.get("mech_use_pair_hunter", CONFIG.get("mech_use_pair_hunter", True))
+                ).lower() not in ("0", "false", "no", "off")
+                if use_hunter and hunted_now:
+                    trading_settings["mech_active_universe"] = " ".join(hunted_now)
+                else:
+                    trading_settings.pop("mech_active_universe", None)
+
+                mech_cfg = mech.resolve_config(trading_settings, CONFIG)
+                if not getattr(run_loop, "_mech_announced", False):
+                    network_now, label_now = _venue_network()
+                    univ = ", ".join(mech.liquid_universe(mech_cfg)[:8])
+                    src = "hunter" if (use_hunter and hunted_now) else "static"
+                    add_event(
+                        f"🤖 MECHANICAL multi-setup on {label_now}: AI parked. "
+                        f"{mech.resolve_exit_targets(trading_settings, mech_cfg)['label']}, "
+                        f"${float(mech_cfg['mech_margin_usd']):.0f} margin ×{int(mech_cfg['mech_max_positions'])} max, "
+                        f"{int(mech_cfg['mech_leverage'])}x isolated, cycle {int(mech_cfg['mech_cycle_seconds'])}s. "
+                        f"Setups: session_impulse / range_mr / breakout_retest. "
+                        f"Universe ({src}): {univ}…"
+                    )
+                    run_loop._mech_announced = True
 
                 candidates = [a for a in mech.liquid_universe(mech_cfg) if _mech_allowed(a)]
                 for pos in positions:

@@ -6,7 +6,8 @@ Three playbooks share the same OKX candle stack:
 * ``range_mr`` — low 15m ADX chop: fade Bollinger tags only at RSI extremes, target 1.5R.
 * ``breakout_retest`` — level break + retest; target 1.5R from ATR-floored stop.
 
-Universe is a fixed liquid allowlist (not Pair Hunter). Spread/ATR gates always apply.
+Universe: live Pair Hunter (middle ATR band) with static allowlist fallback.
+Spread/ATR gates always apply.
 Exits: ATR-floored SL; impulse/range use the dashboard TP/SL book (skip if
 structure risk $ > book TP $ so losers cannot dwarf winners); breakout uses 1.5R.
 
@@ -44,8 +45,9 @@ DEFAULTS: Dict[str, Any] = {
     "mech_adx_min": 20.0,
     "mech_adx_range_max": 18.0,
     "mech_ema_min_separation_pct": 0.05,
-    "mech_atr_min_pct": 0.30,
-    "mech_atr_max_pct": 2.0,
+    # Middle-ground ATR band (15m %): enough move for ROI targets, not meme chaos.
+    "mech_atr_min_pct": 0.45,
+    "mech_atr_max_pct": 2.5,
     "mech_atr_stop_mult": 1.5,
     "mech_breakout_rr": 1.5,
     "mech_rsi_max_long": 72.0,
@@ -65,6 +67,9 @@ DEFAULTS: Dict[str, Any] = {
     "mech_ny_end_utc": 17.0,
     "mech_universe": "BTC ETH SOL XRP BNB DOGE ADA LINK AVAX DOT LTC NEAR",
     "mech_impulse_universe": "BTC ETH",
+    # When set (by the live pair hunter), this replaces the static allowlist for the cycle.
+    "mech_active_universe": "",
+    "mech_use_pair_hunter": True,
     "mech_stop_buffer_pct": 0.05,
     "mech_min_stop_pct": 0.15,
     "mech_max_stop_pct": 2.0,
@@ -431,7 +436,10 @@ def _parse_universe(raw: Any) -> List[str]:
 
 
 def liquid_universe(cfg: Dict[str, Any]) -> List[str]:
-    """Fixed liquid allowlist for mechanical scans (Pair Hunter is bypassed)."""
+    """Live hunter list when present; otherwise static fallback allowlist."""
+    active = _parse_universe(cfg.get("mech_active_universe") or "")
+    if active:
+        return active
     bases = _parse_universe(cfg.get("mech_universe") or DEFAULTS["mech_universe"])
     return bases or _parse_universe(DEFAULTS["mech_universe"])
 

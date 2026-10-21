@@ -271,12 +271,14 @@ CONFIG = {
     "loss_protection_min_hours": _get_float("LOSS_PROTECTION_MIN_HOURS", 1.0),  # Minimum hours open before loss-protection can close
     "loss_protection_confirm_cycles": _get_int("LOSS_PROTECTION_CONFIRM_CYCLES", 2),  # Require N consecutive loss checks before closing
     # Pair Hunter - Dynamic pair discovery (ASSETS remains fallback if hunter fails)
-    "enable_pair_hunter": _get_bool("ENABLE_PAIR_HUNTER", False),  # Enable automatic pair discovery
+    "enable_pair_hunter": _get_bool("ENABLE_PAIR_HUNTER", True),  # Middle-ground dynamic discovery (mech + LLM)
+    "mech_use_pair_hunter": _get_bool("MECH_USE_PAIR_HUNTER", True),  # Mechanical book hunts; static list is fallback only
     "pair_hunter_top_n": _get_int("PAIR_HUNTER_TOP_N", 5),  # Number of top pairs to hunt
     "pair_hunter_refresh_interval": _get_int("PAIR_HUNTER_REFRESH_INTERVAL", 5),  # Refresh hunt every N loops
-    "pair_hunter_min_volatility": _get_float("PAIR_HUNTER_MIN_VOLATILITY", 1.0),  # Minimum ATR% (too quiet = skip)
-    "pair_hunter_max_volatility": _get_float("PAIR_HUNTER_MAX_VOLATILITY", 3.5),  # Cap hyper-volatile meme-style names
-    "pair_hunter_ideal_volatility": _get_float("PAIR_HUNTER_IDEAL_VOLATILITY", 2.0),  # Sweet-spot ATR% for scoring
+    # Middle-ground hunter band: enough move for ROI targets, not meme chaos.
+    "pair_hunter_min_volatility": _get_float("PAIR_HUNTER_MIN_VOLATILITY", 0.7),  # Minimum ATR% (too quiet = skip)
+    "pair_hunter_max_volatility": _get_float("PAIR_HUNTER_MAX_VOLATILITY", 3.0),  # Cap hyper-volatile meme-style names
+    "pair_hunter_ideal_volatility": _get_float("PAIR_HUNTER_IDEAL_VOLATILITY", 1.6),  # Sweet-spot ATR% for scoring
     "pair_hunter_min_volume_24h": _get_float("PAIR_HUNTER_MIN_VOLUME_24H", 50_000_000.0),  # Liquidity floor (USD)
     "pair_hunter_min_trend_strength": _get_float("PAIR_HUNTER_MIN_TREND_STRENGTH", 25.0),  # Reject chop below this
     "pair_hunter_min_price": _get_float("PAIR_HUNTER_MIN_PRICE", 0.01),  # Avoid sub-penny tick-size noise
