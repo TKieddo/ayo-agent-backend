@@ -33,15 +33,15 @@ RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo Mayhem: 1:1 opposite *entries* when Mayhem opens (hive_race). Own exits:
-# ATR stop / time / ~1.5R fade_target — not Mayhem bail (that scratched Oppo out).
+# Oppo Mayhem: 1:1 opposite *entries*; own 1.5R/stop/time exits.
+# PeakSting: hard 1:1 opposite Mayhem (open+close) — A/B clone of original Oppo sync.
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem",
     "windward": "Windward",
     "orakelia": "Orakelia",
-    "peaksting": "PeakSting",
-    "oppo_mayhem": "Oppo Mayhem",  # enter opposite Mayhem; exit on own 1.5R/stop
+    "peaksting": "Peak · Mayhem 1:1",
+    "oppo_mayhem": "Oppo Mayhem",
     "ayo": "AYO",
 }
 
@@ -268,28 +268,27 @@ def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
     if runner == "orakelia":
         return _orakelia(coins, book.blacklist)
     if runner == "peaksting":
-        return _peaksting(coins)
+        # Entries only via hard 1:1 Mayhem pair sync in hive_race.
+        return []
     return []
 
 
 def flip_side(side: str) -> str:
-    """Opposite of a long/short position side (Oppo Mayhem 1:1 pair)."""
+    """Opposite of a long/short position side (Mayhem mirrors)."""
     return "short" if side == "long" else "long"
 
 
 def _side_for(runner: str, coin: Coin) -> str:
-    if runner == "peaksting":
-        return "short"
     if runner == "orakelia":
         return "long"
-    if runner == "oppo_mayhem":
+    if runner in ("oppo_mayhem", "peaksting"):
         return flip_side(impulse(coin) or "long")
     return impulse(coin) or "long"
 
 
 def _blocked(book: Book, now: float, runner: str = "") -> Optional[str]:
-    # Mayhem must keep entering so Oppo Mayhem can 1:1 mirror — no retire / daily loss freeze.
-    if runner == "mayhem":
+    # Mayhem + Peak 1:1 must stay live so mirrors keep tracking — no retire / daily loss freeze.
+    if runner in ("mayhem", "peaksting"):
         if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
             book.cap = None
         if book.last_order_at and now - book.last_order_at < COOLDOWN_S:
@@ -319,6 +318,9 @@ def _open_slots(book: Book) -> List[Pos]:
 
 
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
+    # PeakSting is a hard Mayhem clone — only pair sync closes (no solo stop/bail).
+    if runner == "peaksting":
+        return None
     if stop_hit(pos, mid):
         return "stop"
     if now - pos.opened_at >= TIME_STOP_S:
@@ -341,9 +343,6 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         if coin.ret1h < 0 or coin.vol_z < 0:
             book.blacklist[pos.coin] = True
             return "momentum_fade"
-    elif runner == "peaksting":
-        if coin.ret1h > 0:
-            return "fade_weakened"
     return None
 
 
@@ -387,7 +386,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             continue
         mid = coin.mid
         if (
-            runner != "oppo_mayhem"  # paired fade: no pyramid
+            runner not in ("oppo_mayhem", "peaksting")  # mirrors: adds only via Mayhem pair
             and not pos.added
             and upl(pos, mid) > 0
             and _run_atr(pos, coin) >= 1.5
