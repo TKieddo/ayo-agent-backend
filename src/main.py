@@ -3914,7 +3914,17 @@ def main():
                 # ========================================================================
                 
                 # 1. MAXIMUM HOLD TIME CHECK
-                max_hold_hours = CONFIG.get('max_position_hold_hours', 24.0) if agent_manage_exits else 0
+                max_hold_hours = (
+                    float(
+                        trading_settings.get(
+                            "max_position_hold_hours",
+                            CONFIG.get("max_position_hold_hours", 24.0),
+                        )
+                        or 0
+                    )
+                    if agent_manage_exits
+                    else 0
+                )
                 if opened_at_str and max_hold_hours > 0:
                     try:
                         if 'T' in opened_at_str:
@@ -3965,10 +3975,41 @@ def main():
                         logging.warning(f"Could not parse opened_at for {asset} max hold check: {e}")
                 
                 # 2. DRAWDOWN PROTECTION: Close if profit drops significantly from peak
-                enable_drawdown = CONFIG.get('enable_drawdown_protection', True) if agent_manage_exits else False
-                max_drawdown_pct = CONFIG.get('max_drawdown_from_peak_pct', 5.0)
-                drawdown_min_peak_profit_pct = CONFIG.get('drawdown_min_peak_profit_pct', 3.0)
-                drawdown_confirm_cycles = max(1, int(CONFIG.get('drawdown_confirm_cycles', 2) or 2))
+                # Prefer live trading_settings (mechanical overrides set these) over static CONFIG.
+                enable_drawdown = (
+                    bool(
+                        trading_settings.get(
+                            "enable_drawdown_protection",
+                            CONFIG.get("enable_drawdown_protection", True),
+                        )
+                    )
+                    if agent_manage_exits
+                    else False
+                )
+                max_drawdown_pct = float(
+                    trading_settings.get(
+                        "max_drawdown_from_peak_pct",
+                        CONFIG.get("max_drawdown_from_peak_pct", 5.0),
+                    )
+                    or 5.0
+                )
+                drawdown_min_peak_profit_pct = float(
+                    trading_settings.get(
+                        "drawdown_min_peak_profit_pct",
+                        CONFIG.get("drawdown_min_peak_profit_pct", 3.0),
+                    )
+                    or 3.0
+                )
+                drawdown_confirm_cycles = max(
+                    1,
+                    int(
+                        trading_settings.get(
+                            "drawdown_confirm_cycles",
+                            CONFIG.get("drawdown_confirm_cycles", 2),
+                        )
+                        or 2
+                    ),
+                )
                 drawdown_should_close = False
                 drawdown_reason = ""
                 if enable_drawdown and peak_profit_pct is not None and peak_profit_pct >= drawdown_min_peak_profit_pct:

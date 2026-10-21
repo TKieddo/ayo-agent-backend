@@ -33,8 +33,12 @@ RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo Mayhem: 1:1 opposite *entries*; own 1.5R/stop/time exits.
+# Oppo Mayhem: 1:1 opposite *entries*; bank ~1R / giveback / 4h — not a marathon hold.
 # PeakSting: hard 1:1 opposite Mayhem (open+close) — A/B clone of original Oppo sync.
+OPPO_FADE_R = 1.0          # full take-profit once UPL >= 1R
+OPPO_GIVEBACK_ARM_R = 0.5  # arm giveback after peak UPL hits 0.5R
+OPPO_GIVEBACK_KEEP = 0.4   # close if open UPL falls below 40% of peak
+OPPO_TIME_STOP_S = 4 * 3600
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem",
@@ -323,7 +327,8 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         return None
     if stop_hit(pos, mid):
         return "stop"
-    if now - pos.opened_at >= TIME_STOP_S:
+    hold_s = OPPO_TIME_STOP_S if runner == "oppo_mayhem" else TIME_STOP_S
+    if now - pos.opened_at >= hold_s:
         return "time_stop"
     if coin is None:
         return None
@@ -331,11 +336,16 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         if _against(pos, coin) or upl(pos, mid) < 0:
             return "bail"
     elif runner == "oppo_mayhem":
-        # Bank ~1.5R; no hair-trigger bail (UPL<0 / 1h wiggle was cutting winners early).
+        # Bank ~1R; if it ran 0.5R+ and gave most of it back, scratch — don't wait 12h.
         risk = float(pos.risk_usd or 0)
         u = upl(pos, mid)
-        if risk > 0 and u >= 1.5 * risk:
+        peak_u = upl(pos, pos.peak_px)
+        if risk > 0 and u >= OPPO_FADE_R * risk:
             return "fade_target"
+        if risk > 0 and peak_u >= OPPO_GIVEBACK_ARM_R * risk:
+            floor = max(OPPO_GIVEBACK_KEEP * peak_u, 0.15 * risk)
+            if u < floor:
+                return "fade_giveback"
     elif runner == "windward":
         if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
             return "trend_break"

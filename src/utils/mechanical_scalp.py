@@ -37,10 +37,10 @@ DEFAULTS: Dict[str, Any] = {
     "mech_max_positions": 3,
     "mech_leverage": 10,
     "mech_margin_usd": 40.0,
-    "mech_take_profit_usd": 3.0,
+    "mech_take_profit_usd": 2.0,
     "mech_stop_loss_usd": 2.0,
     "mech_tp_mode": "roi_percent",
-    "mech_take_profit_percent": 7.5,
+    "mech_take_profit_percent": 5.0,
     "mech_stop_loss_percent": 5.0,
     "mech_adx_min": 20.0,
     "mech_adx_range_max": 18.0,
@@ -81,6 +81,10 @@ DEFAULTS: Dict[str, Any] = {
     "mech_loss_cooldown_minutes": 45,
     "mech_pair_refresh_minutes": 10,
     "mech_min_size_risk_tolerance": 1.25,
+    # Bank sooner: lower TP + giveback after a small green peak + 8h hard flat.
+    "mech_max_hold_hours": 8.0,
+    "mech_giveback_arm_pct": 2.0,
+    "mech_giveback_pct": 2.5,
     "max_daily_loss_usd": 15.0,
 }
 
@@ -261,10 +265,14 @@ def apply_mechanical_overrides(settings: Dict[str, Any]) -> Dict[str, Any]:
     settings["agent_manage_exits"] = True
     settings["enable_stop_loss_orders"] = True
     settings["take_profit_strict_enforcement"] = True
+    # Keep book TP/SL as primary exits, but don't let winners reverse for hours.
     settings["enable_profit_ladder"] = False
-    settings["enable_breakeven_stop"] = False
+    settings["enable_breakeven_stop"] = True
     settings["enable_trailing_stop"] = False
-    settings["enable_drawdown_protection"] = False
+    settings["enable_drawdown_protection"] = True
+    settings["max_drawdown_from_peak_pct"] = float(cfg.get("mech_giveback_pct") or 2.5)
+    settings["drawdown_min_peak_profit_pct"] = float(cfg.get("mech_giveback_arm_pct") or 2.0)
+    settings["max_position_hold_hours"] = float(cfg.get("mech_max_hold_hours") or 8.0)
     settings["reentry_cooldown_minutes"] = float(cfg["mech_win_cooldown_minutes"])
     settings["loss_reentry_cooldown_minutes"] = float(cfg["mech_loss_cooldown_minutes"])
     settings["block_direction_flip"] = True
