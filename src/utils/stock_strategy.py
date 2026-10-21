@@ -1,15 +1,18 @@
-"""Equity trend + pullback strategy for the Alpaca stock book.
+"""Orakelia-style momentum for the Alpaca stock book.
 
-Distinct from crypto mechanical scalp:
+Port of the best hive runner (Orakelia) onto equities:
 - Session: US regular hours (unless STOCK_ALLOW_OVERNIGHT)
-- Size: fixed notional ($50 default), leverage 1x, effective equity ~$200
+- Entry: long only when ret24h > 0 and vol_z > 0 (soft HTF: 1h close above EMA20)
+- Size: fixed notional ($50 default), leverage 1x
 - Stop: ATR × STOCK_SL_ATR_MULT, clamped by min/max % and $ risk cap
 - TP: atr_rr at STOCK_TP_RR_RATIO (default 1.5R) with optional 50% scale-out at 1R
+- Exit (book cycle): momentum_fade when ret1h < 0 or vol_z < 0
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -21,10 +24,16 @@ logger = logging.getLogger(__name__)
 
 Candle = Sequence[Any]
 
+# 15m bars ≈ one US cash session (~6.5h) and one clock hour.
+_BARS_1H_15M = 4
+_BARS_1D_15M = 26
+_VOL_Z_LOOKBACK = 20
+
 
 def resolve_stock_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Merge env CONFIG with optional DB trading_settings stock_* overrides."""
     s = settings or {}
+
     def g(key: str, default: Any = None) -> Any:
         if s.get(key) is not None and s.get(key) != "":
             return s.get(key)
@@ -48,10 +57,9 @@ def resolve_stock_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str,
         "entry_cutoff_minutes": int(g("stock_entry_cutoff_minutes", 10) or 10),
         "interval": str(g("stock_interval", "15m") or "15m"),
         "htf_interval": str(g("stock_htf_interval", "1h") or "1h"),
-        # Wider window so RTH actually produces entries (was 5 → often zero all day).
-        "pullback_lookback": int(g("stock_pullback_lookback", 12) or 12),
         "ema_fast": 20,
         "ema_slow": 50,
+        "require_htf_above_ema": bool(g("stock_require_htf_above_ema", True)),
     }
 
 
@@ -77,6 +85,98 @@ def _atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float],
     return sum(trs[-period:]) / period
 
 
+def _ret_pct(closes: Sequence[float], bars_back: int) -> Optional[float]:
+    if not closes or bars_back <= 0 or len(closes) <= bars_back:
+        return None
+    base = float(closes[-(bars_back + 1)])
+    last = float(closes[-1])
+    if base <= 0:
+        return None
+    return (last - base) / base * 100.0
+
+
+def _vol_z(volumes: Sequence[float], lookback: int = _VOL_Z_LOOKBACK) -> Optional[float]:
+    if not volumes or len(volumes) < lookback + 1:
+        return None
+    window = [float(v or 0) for v in volumes[-(lookback + 1) : -1]]
+    cur = float(volumes[-1] or 0)
+    if not window:
+        return None
+    mean = sum(window) / len(window)
+    var = sum((v - mean) ** 2 for v in window) / len(window)
+    std = math.sqrt(var)
+    if std <= 1e-12:
+        return 0.0 if abs(cur - mean) < 1e-9 else (1.0 if cur > mean else -1.0)
+    return (cur - mean) / std
+
+
+@dataclass
+class MomentumSnapshot:
+    """Orakelia-style metrics from Alpaca bars (used for entry rank + fade exits)."""
+
+    ret1h: float
+    ret24h: float
+    vol_z: float
+    atr: float
+    entry: float
+    htf_above_ema: bool
+    strength: float  # rank key: ret24h + soft vol boost
+
+
+def momentum_from_bars(
+    bars_15m: List[Candle],
+    bars_1h: Optional[List[Candle]] = None,
+    *,
+    atr_period: int = 14,
+) -> Optional[MomentumSnapshot]:
+    """Compute ret1h / ret24h / vol_z / ATR from bar lists. None if not enough data."""
+    if not bars_15m or len(bars_15m) < max(atr_period + 5, _BARS_1D_15M + 2):
+        return None
+
+    h = [float(c[2]) for c in bars_15m]
+    l = [float(c[3]) for c in bars_15m]
+    x = [float(c[4]) for c in bars_15m]
+    v = [float(c[5] or 0) for c in bars_15m]
+
+    atr_val = _atr(h, l, x, atr_period)
+    if atr_val is None or atr_val <= 0:
+        return None
+
+    ret1h = _ret_pct(x, _BARS_1H_15M)
+    ret24h = _ret_pct(x, _BARS_1D_15M)
+    # Prefer true 1h bars for ret1h when available.
+    if bars_1h and len(bars_1h) >= 3:
+        htf_closes = [float(c[4]) for c in bars_1h]
+        r1 = _ret_pct(htf_closes, 1)
+        if r1 is not None:
+            ret1h = r1
+
+    vol_z = _vol_z(v)
+    if ret1h is None or ret24h is None or vol_z is None:
+        return None
+
+    htf = bars_1h if bars_1h and len(bars_1h) >= 25 else bars_15m
+    htf_x = [float(c[4]) for c in htf]
+    ema20 = _ema(htf_x, 20)
+    htf_above = bool(ema20 and htf_x[-1] >= ema20[-1] * 0.998)
+
+    strength = float(ret24h) + max(0.0, float(vol_z)) * 0.5
+    return MomentumSnapshot(
+        ret1h=float(ret1h),
+        ret24h=float(ret24h),
+        vol_z=float(vol_z),
+        atr=float(atr_val),
+        entry=float(x[-1]),
+        htf_above_ema=htf_above,
+        strength=strength,
+    )
+
+
+def should_momentum_fade(snap: MomentumSnapshot) -> bool:
+    """Orakelia exit: 1h turns down or volume z-score goes cold."""
+    return snap.ret1h < 0 or snap.vol_z < 0
+
+
 @dataclass
 class StockSignal:
     symbol: str
@@ -90,7 +190,7 @@ class StockSignal:
     atr: float
     stop_pct: float
     rr: float
-    setup: str = "trend_pullback"
+    setup: str = "orakelia_momentum"
     scale_out_at_r: float = 1.0
     scale_out_fraction: float = 0.5
     rationale: str = ""
@@ -133,17 +233,14 @@ def geometry(
     stop_pct = raw_stop_dist / entry if entry > 0 else min_pct
     stop_pct = max(min_pct, min(max_pct, stop_pct))
 
-    # Cap $ risk: if stop is wide, shrink effective risk reporting (qty still notional-based)
     qty = size_qty(entry, notional, int(cfg["leverage"]))
     risk_usd = qty * entry * stop_pct
     if risk_usd > risk_cap and qty > 0:
-        # Tighten stop to risk cap when still within min_pct
         capped_pct = risk_cap / (qty * entry) if qty * entry > 0 else stop_pct
         if capped_pct >= min_pct:
             stop_pct = min(stop_pct, capped_pct)
             risk_usd = qty * entry * stop_pct
         else:
-            # Stop already at floor — accept risk_cap as soft label; size stays $50
             risk_usd = min(risk_usd, risk_cap)
 
     if side == "buy":
@@ -164,9 +261,10 @@ def evaluate(
     settings: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> StockSignal | StockSkip:
+    """Orakelia momentum: long only when day is green and volume is elevated."""
     cfg = resolve_stock_config(settings)
     now = now or datetime.now(timezone.utc)
-    metrics: Dict[str, Any] = {"book": "stocks", "venue": "alpaca"}
+    metrics: Dict[str, Any] = {"book": "stocks", "venue": "alpaca", "setup": "orakelia_momentum"}
 
     open_ok, sess = us_regular_session_open(
         now,
@@ -177,76 +275,44 @@ def evaluate(
     if not open_ok:
         return StockSkip(symbol, f"session closed ({sess})", metrics)
 
-    if not bars_15m or len(bars_15m) < cfg["atr_period"] + 25:
-        return StockSkip(symbol, "insufficient 15m bars", metrics)
+    snap = momentum_from_bars(bars_15m, bars_1h, atr_period=int(cfg["atr_period"]))
+    if snap is None:
+        return StockSkip(symbol, "insufficient bars for momentum", metrics)
 
-    o = [float(c[1]) for c in bars_15m]
-    h = [float(c[2]) for c in bars_15m]
-    l = [float(c[3]) for c in bars_15m]
-    x = [float(c[4]) for c in bars_15m]
-    atr_val = _atr(h, l, x, int(cfg["atr_period"]))
-    if atr_val is None or atr_val <= 0:
-        return StockSkip(symbol, "ATR unavailable", metrics)
+    metrics.update(
+        {
+            "ret1h": round(snap.ret1h, 3),
+            "ret24h": round(snap.ret24h, 3),
+            "vol_z": round(snap.vol_z, 3),
+            "strength": round(snap.strength, 3),
+            "htf_above_ema": snap.htf_above_ema,
+            "atr": round(snap.atr, 4),
+        }
+    )
 
-    htf = bars_1h if bars_1h and len(bars_1h) >= 55 else bars_15m
-    htf_x = [float(c[4]) for c in htf]
-    fast = _ema(htf_x, int(cfg["ema_fast"]))
-    slow = _ema(htf_x, int(cfg["ema_slow"]))
-    if not fast or not slow:
-        return StockSkip(symbol, "HTF EMA unavailable", metrics)
+    # Long-only Orakelia: green day + elevated volume.
+    if snap.ret24h <= 0:
+        return StockSkip(symbol, f"ret24h {snap.ret24h:.2f}% <= 0", metrics)
+    if snap.vol_z <= 0:
+        return StockSkip(symbol, f"vol_z {snap.vol_z:.2f} <= 0", metrics)
+    if cfg.get("require_htf_above_ema") and not snap.htf_above_ema:
+        return StockSkip(symbol, "HTF below EMA20", metrics)
 
-    if fast[-1] > slow[-1] * 1.001:
-        trend = "up"
-        side = "buy"
-    elif fast[-1] < slow[-1] * 0.999:
-        trend = "down"
-        side = "sell"
-    else:
-        return StockSkip(symbol, "HTF flat — no edge", metrics)
-    metrics["htf_trend"] = trend
-
-    # Intraday EMA pullback OR sitting on the EMA (continuation).
-    ema20 = _ema(x, 20)
-    i = len(x) - 1
-    entry = x[i]
-    lookback = int(cfg["pullback_lookback"])
-    pulled = False
-    for j in range(i, max(i - lookback, 20), -1):
-        if side == "buy" and l[j] <= ema20[j] * 1.002 and x[j] >= ema20[j] * 0.992:
-            pulled = True
-            break
-        if side == "sell" and h[j] >= ema20[j] * 0.998 and x[j] <= ema20[j] * 1.008:
-            pulled = True
-            break
-    # Also accept "riding the EMA" — price within 0.4% of EMA20 with trend.
-    if not pulled and ema20[i] > 0:
-        dist = abs(entry - ema20[i]) / ema20[i]
-        if dist <= 0.004:
-            if side == "buy" and entry >= ema20[i] * 0.996:
-                pulled = True
-            if side == "sell" and entry <= ema20[i] * 1.004:
-                pulled = True
-    if not pulled:
-        return StockSkip(symbol, "no pullback to EMA20", metrics)
-
-    # Soft confirm: close on the right side of EMA20 (candle color preferred, not required).
-    if side == "buy" and not (x[i] >= ema20[i] * 0.998):
-        return StockSkip(symbol, "no bullish confirm", metrics)
-    if side == "sell" and not (x[i] <= ema20[i] * 1.002):
-        return StockSkip(symbol, "no bearish confirm", metrics)
-
-    stop, tp, stop_pct, risk_usd = geometry(entry, atr_val, side, cfg)
+    side = "buy"
+    entry = snap.entry
+    stop, tp, stop_pct, risk_usd = geometry(entry, snap.atr, side, cfg)
     qty = size_qty(entry, float(cfg["notional"]), int(cfg["leverage"]))
     if qty <= 0:
         return StockSkip(symbol, "qty too small", metrics)
 
-    metrics.update({
-        "atr": round(atr_val, 4),
-        "stop_pct": round(stop_pct, 3),
-        "risk_usd": round(risk_usd, 2),
-        "notional": float(cfg["notional"]),
-        "rr": float(cfg["tp_rr"]),
-    })
+    metrics.update(
+        {
+            "stop_pct": round(stop_pct, 3),
+            "risk_usd": round(risk_usd, 2),
+            "notional": float(cfg["notional"]),
+            "rr": float(cfg["tp_rr"]),
+        }
+    )
 
     return StockSignal(
         symbol=symbol.upper(),
@@ -257,12 +323,16 @@ def evaluate(
         qty=qty,
         notional=float(cfg["notional"]),
         risk_usd=risk_usd,
-        atr=atr_val,
+        atr=snap.atr,
         stop_pct=stop_pct,
         rr=float(cfg["tp_rr"]),
+        setup="orakelia_momentum",
         scale_out_at_r=float(cfg["scale_out_at_r"]),
         scale_out_fraction=float(cfg["scale_out_fraction"]),
-        rationale=f"HTF {trend} pullback; ATR stop {stop_pct:.2f}%; TP {cfg['tp_rr']}R",
+        rationale=(
+            f"Orakelia long ret24h={snap.ret24h:.2f}% vol_z={snap.vol_z:.2f}; "
+            f"ATR stop {stop_pct:.2f}%; TP {cfg['tp_rr']}R"
+        ),
         metrics=metrics,
     )
 
