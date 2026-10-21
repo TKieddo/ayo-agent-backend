@@ -33,8 +33,8 @@ RETIRE_EQUITY = 120.0
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo Mayhem: 1:1 opposite *entries* when Mayhem opens (hive_race). Same exit
-# *rules* as Mayhem (stop / time / bail) but on Oppo's own side — not paired closes.
+# Oppo Mayhem: 1:1 opposite *entries* when Mayhem opens (hive_race). Own exits:
+# ATR stop / time / ~1.5R fade_target — not Mayhem bail (that scratched Oppo out).
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem",
@@ -325,11 +325,15 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         return "time_stop"
     if coin is None:
         return None
-    if runner in ("mayhem", "oppo_mayhem"):
-        # Same bail rule on *this* position's side. When Mayhem's long fades (1h down),
-        # Oppo's short is *with* the move and keeps riding until 1h turns against the short.
+    if runner == "mayhem":
         if _against(pos, coin) or upl(pos, mid) < 0:
             return "bail"
+    elif runner == "oppo_mayhem":
+        # Bank ~1.5R; no hair-trigger bail (UPL<0 / 1h wiggle was cutting winners early).
+        risk = float(pos.risk_usd or 0)
+        u = upl(pos, mid)
+        if risk > 0 and u >= 1.5 * risk:
+            return "fade_target"
     elif runner == "windward":
         if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
             return "trend_break"

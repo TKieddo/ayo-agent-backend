@@ -1030,7 +1030,7 @@ async def _tick(decide: bool = True) -> None:
                     if runner == "oppo_mayhem":
                         mayhem_raw = _STATE["runners"].get("mayhem") or {}
                         mayhem_book = _book_from(mayhem_raw)
-                        # Pair opens/adds with Mayhem; exits = Mayhem-style bail on Oppo's own side.
+                        # Pair opens/adds with Mayhem; exits = Oppo 1.5R / stop / time (no bail).
                         actions.extend(_oppo_sync_actions(mayhem_book, book))
                         actions.extend(_OPPO_PAIR_Q)
                         _OPPO_PAIR_Q.clear()
