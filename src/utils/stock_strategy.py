@@ -48,7 +48,8 @@ def resolve_stock_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str,
         "entry_cutoff_minutes": int(g("stock_entry_cutoff_minutes", 10) or 10),
         "interval": str(g("stock_interval", "15m") or "15m"),
         "htf_interval": str(g("stock_htf_interval", "1h") or "1h"),
-        "pullback_lookback": int(g("stock_pullback_lookback", 5) or 5),
+        # Wider window so RTH actually produces entries (was 5 → often zero all day).
+        "pullback_lookback": int(g("stock_pullback_lookback", 12) or 12),
         "ema_fast": 20,
         "ema_slow": 50,
     }
@@ -204,26 +205,34 @@ def evaluate(
         return StockSkip(symbol, "HTF flat — no edge", metrics)
     metrics["htf_trend"] = trend
 
-    # Intraday EMA pullback continuation
+    # Intraday EMA pullback OR sitting on the EMA (continuation).
     ema20 = _ema(x, 20)
     i = len(x) - 1
     entry = x[i]
     lookback = int(cfg["pullback_lookback"])
     pulled = False
-    for j in range(i - 1, max(i - 1 - lookback, 20), -1):
-        if side == "buy" and l[j] <= ema20[j] and x[j] >= ema20[j] * 0.995:
+    for j in range(i, max(i - lookback, 20), -1):
+        if side == "buy" and l[j] <= ema20[j] * 1.002 and x[j] >= ema20[j] * 0.992:
             pulled = True
             break
-        if side == "sell" and h[j] >= ema20[j] and x[j] <= ema20[j] * 1.005:
+        if side == "sell" and h[j] >= ema20[j] * 0.998 and x[j] <= ema20[j] * 1.008:
             pulled = True
             break
+    # Also accept "riding the EMA" — price within 0.4% of EMA20 with trend.
+    if not pulled and ema20[i] > 0:
+        dist = abs(entry - ema20[i]) / ema20[i]
+        if dist <= 0.004:
+            if side == "buy" and entry >= ema20[i] * 0.996:
+                pulled = True
+            if side == "sell" and entry <= ema20[i] * 1.004:
+                pulled = True
     if not pulled:
         return StockSkip(symbol, "no pullback to EMA20", metrics)
 
-    # Confirm candle with trend
-    if side == "buy" and not (x[i] > o[i] and x[i] >= ema20[i]):
+    # Soft confirm: close on the right side of EMA20 (candle color preferred, not required).
+    if side == "buy" and not (x[i] >= ema20[i] * 0.998):
         return StockSkip(symbol, "no bullish confirm", metrics)
-    if side == "sell" and not (x[i] < o[i] and x[i] <= ema20[i]):
+    if side == "sell" and not (x[i] <= ema20[i] * 1.002):
         return StockSkip(symbol, "no bearish confirm", metrics)
 
     stop, tp, stop_pct, risk_usd = geometry(entry, atr_val, side, cfg)
