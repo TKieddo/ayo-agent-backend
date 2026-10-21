@@ -287,7 +287,14 @@ def _side_for(runner: str, coin: Coin) -> str:
     return impulse(coin) or "long"
 
 
-def _blocked(book: Book, now: float) -> Optional[str]:
+def _blocked(book: Book, now: float, runner: str = "") -> Optional[str]:
+    # Mayhem must keep entering so Oppo Mayhem can 1:1 mirror — no retire / daily loss freeze.
+    if runner == "mayhem":
+        if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
+            book.cap = None
+        if book.last_order_at and now - book.last_order_at < COOLDOWN_S:
+            return "cooldown"
+        return None
     if book.cap == "retired":
         return "retired"
     if book.equity <= RETIRE_EQUITY:
@@ -344,8 +351,8 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
     book.positions = opens
     book.sync_primary()
 
-    # Hard caps: close everything if retired / daily loss.
-    block = _blocked(book, now)
+    # Hard caps: close everything if retired / daily loss (Mayhem exempt — Oppo pair needs it live).
+    block = _blocked(book, now, runner=runner)
     if block in ("retired", "loss_stop"):
         book.cap = block
         return [Action("close", p.coin, p.side, reason=block) for p in opens] or [Action("hold", reason=block)]

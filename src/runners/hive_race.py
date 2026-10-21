@@ -1042,8 +1042,11 @@ async def _tick(decide: bool = True) -> None:
                         await _act(runner, client, book, coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.
                     upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)
-                if book.equity <= RETIRE_EQUITY:
+                # Mayhem stays live for Oppo 1:1 even when the race ledger is deep red.
+                if runner != "mayhem" and book.equity <= RETIRE_EQUITY:
                     book.cap = "retired"
+                elif runner == "mayhem" and book.cap in ("retired", "loss_stop"):
+                    book.cap = None
             except Exception as exc:
                 error = str(exc)
                 logger.warning("hive %s tick failed: %s", runner, exc)
