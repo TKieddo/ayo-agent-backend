@@ -1372,8 +1372,9 @@ def main():
             else:
                 ui_sl = 1e9
             stop_usd = -abs(float(targets["sl_usd"]))
+            # Always keep the $ equivalent armed — DOGE +$7 must not wait on a bad ROI%.
             try:
-                tp_usd_f = float(targets["tp_usd"]) if tp_mode == "usd" else 0.0
+                tp_usd_f = abs(float(targets["tp_usd"] or 0))
             except (TypeError, ValueError):
                 tp_usd_f = 0.0
         else:
@@ -1410,11 +1411,17 @@ def main():
             roi = _compute_position_roi_percent(
                 pos, is_long=is_long, entry_price=entry, current_price=current
             )
-            # If exchange ROI is missing/zero but we have $ profit and margin, recompute.
+            # Prefer $ / margin ROI. If OKX omits margin, estimate notional / leverage.
             margin = _safe_float(
                 pos.get("initial_margin") or pos.get("initialMargin") or pos.get("positionInitialMargin"),
                 0.0,
             )
+            if margin <= 0 and entry > 0:
+                size = abs(_safe_float(pos.get("quantity") or pos.get("szi") or pos.get("positionAmt"), 0.0))
+                notional = size * entry
+                lev = max(int(float(settings.get("leverage") or CONFIG.get("leverage") or 10)), 1)
+                if notional > 0:
+                    margin = notional / lev
             if margin > 0 and upl != 0:
                 roi_from_usd = (upl / margin) * 100.0
                 # Use the larger profit / worse loss so we never miss a TP
@@ -1433,18 +1440,14 @@ def main():
                 reason = f"USD stop ${upl:.2f} <= ${stop_usd:.2f}"
             elif roi <= -ui_sl:
                 reason = f"ROI stop {roi:.2f}% <= -{ui_sl:g}%"
-            # Take profit: ROI% mode, OR hit absolute $ lock if configured (whichever fires first).
+            # Take profit: ROI% / price% / $ — mechanical always also honors $ lock.
             elif tp_mode == "roi_percent" and roi >= tp_pct:
                 reason = f"ROI TP {roi:.2f}% >= {tp_pct:g}%"
                 diary = "close_tp"
             elif tp_mode == "price_percent" and price_move is not None and price_move >= tp_pct:
                 reason = f"Price TP {price_move:.2f}% >= {tp_pct:g}%"
                 diary = "close_tp"
-            elif tp_mode == "usd" and tp_usd_f > 0 and upl >= tp_usd_f:
-                reason = f"USD TP ${upl:.2f} >= ${tp_usd_f:g}"
-                diary = "close_tp"
-            elif tp_mode != "roi_percent" and tp_usd_f > 0 and upl >= tp_usd_f:
-                # Non-ROI modes may still honor an absolute $ lock when set.
+            elif tp_usd_f > 0 and upl >= tp_usd_f:
                 reason = f"USD TP ${upl:.2f} >= ${tp_usd_f:g}"
                 diary = "close_tp"
 
@@ -4331,7 +4334,17 @@ def main():
                         else ((entry_price - current_price) / entry_price) * 100.0
                     )
 
-                if tp_mode == "usd" and take_profit_usd and take_profit_usd > 0 and unrealized_pnl >= take_profit_usd:
+                # Mechanical / $ lock: bank as soon as unrealized $ hits take_profit_usd,
+                # even when tp_mode is roi_percent (avoids missing TP when OKX ROI% is wrong).
+                if (
+                    take_profit_usd
+                    and take_profit_usd > 0
+                    and unrealized_pnl >= take_profit_usd
+                    and (
+                        tp_mode == "usd"
+                        or mech.is_mechanical_mode(trading_settings)
+                    )
+                ):
                     tp_hit = True
                     should_take_profit = True
                     profit_reason = f"Take Profit (USD): ${unrealized_pnl:.2f} >= ${take_profit_usd:g}"
