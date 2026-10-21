@@ -3754,9 +3754,13 @@ def main():
                             else ((entry_price - current_price) / entry_price) * 100.0
                         )
 
-                    if tp_mode == "usd" and take_profit_usd and take_profit_usd > 0:
-                        if unrealized_pnl >= take_profit_usd:
-                            tp_hit = True
+                    if (
+                        take_profit_usd
+                        and take_profit_usd > 0
+                        and unrealized_pnl >= take_profit_usd
+                        and (tp_mode == "usd" or mech.is_mechanical_mode(trading_settings))
+                    ):
+                        tp_hit = True
                     elif tp_mode == "price_percent" and price_move_pct is not None:
                         price_tp = float(
                             (tp_plan.target_price_pct if tp_plan and tp_plan.target_price_pct else 0)
@@ -3796,7 +3800,7 @@ def main():
                             pass
 
                     if tp_hit or sl_hit:
-                        if tp_hit and tp_mode == "usd" and take_profit_usd:
+                        if tp_hit and take_profit_usd and unrealized_pnl >= take_profit_usd:
                             reason = f"Take Profit (UI ${take_profit_usd:g})"
                         elif tp_hit:
                             reason = f"Take Profit (UI {effective_tp_percent:g}%)"
