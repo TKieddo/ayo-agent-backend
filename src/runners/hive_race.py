@@ -207,22 +207,103 @@ def _ichi_hull_signal(
     return None
 
 
+def _atr_rma_series(highs: List[float], lows: List[float], closes: List[float], period: int) -> List[float]:
+    """Wilder ATR (TradingView atr())."""
+    n = len(closes)
+    out = [float("nan")] * n
+    if n < period + 1:
+        return out
+    trs: List[float] = [highs[0] - lows[0]]
+    for i in range(1, n):
+        trs.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+        )
+    # First ATR = SMA of first `period` TRs
+    seed = sum(trs[1 : period + 1]) / period
+    out[period] = seed
+    for i in range(period + 1, n):
+        out[i] = (out[i - 1] * (period - 1) + trs[i]) / period
+    return out
+
+
+def _ut_bot_signal(
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+) -> Optional[str]:
+    """Pine UT Bot (Heikin Ashi off): ATR trail cross buy/sell on completed bars."""
+    from src.runners.rules import UT_ATR_LEN, UT_KEY
+
+    if len(closes) < UT_ATR_LEN + 5:
+        return None
+    atr = _atr_rma_series(highs, lows, closes, UT_ATR_LEN)
+    trail = [0.0] * len(closes)
+    for i in range(len(closes)):
+        if atr[i] != atr[i] or atr[i] <= 0:
+            trail[i] = trail[i - 1] if i else closes[i]
+            continue
+        n_loss = UT_KEY * atr[i]
+        src = closes[i]
+        prev = trail[i - 1] if i else 0.0
+        src_prev = closes[i - 1] if i else src
+        if src > prev and src_prev > prev:
+            trail[i] = max(prev, src - n_loss)
+        elif src < prev and src_prev < prev:
+            trail[i] = min(prev, src + n_loss)
+        elif src > prev:
+            trail[i] = src - n_loss
+        else:
+            trail[i] = src + n_loss
+    # ema(src, 1) == src; crossover(src, trail) / crossover(trail, src)
+    i = len(closes) - 1
+    if i < 1:
+        return None
+    src, src1 = closes[i], closes[i - 1]
+    t, t1 = trail[i], trail[i - 1]
+    above = src1 <= t1 and src > t
+    below = src1 >= t1 and src < t
+    buy = src > t and above
+    sell = src < t and below
+    if buy:
+        return "long"
+    if sell:
+        return "short"
+    return None
+
+
 def _super_scalper_signal(
     opens: List[float],
     highs: List[float],
     lows: List[float],
     closes: List[float],
-    atr15_pct: Optional[float],
+    atr15_pct: Optional[float] = None,
 ) -> Tuple[Optional[str], float]:
-    """Pine Super Scalper on completed 15m: open vs ATR band + RSI25 vs RSI100."""
-    from src.runners.rules import SS_BAND_MULT, SS_RSI_FAST, SS_RSI_SLOW
+    """Pine Super Scalper as-is: WMA(TR) bands + RSI25/100; no SL/TP in TV."""
+    from src.runners.rules import SS_ATR_LEN, SS_BAND_MULT, SS_RSI_FAST, SS_RSI_SLOW
 
-    if atr15_pct is None or atr15_pct <= 0 or len(closes) < SS_RSI_SLOW + 5:
+    del atr15_pct  # bands use WMA(TR), not SMA ATR
+    if len(closes) < max(SS_RSI_SLOW + 5, SS_ATR_LEN + 5):
+        return None, 0.0
+    trs: List[float] = [highs[0] - lows[0]]
+    for i in range(1, len(closes)):
+        trs.append(
+            max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+        )
+    wma_tr = _wma_series(trs, SS_ATR_LEN)
+    atr_abs = wma_tr[-1]
+    if atr_abs != atr_abs or atr_abs <= 0:
         return None, 0.0
     o, c = opens[-1], closes[-1]
     if c <= 0:
         return None, 0.0
-    atr_abs = c * atr15_pct / 100.0
     upper = c + atr_abs * SS_BAND_MULT
     lower = c - atr_abs * SS_BAND_MULT
     rsi_f = _rsi(closes, SS_RSI_FAST)
@@ -230,10 +311,10 @@ def _super_scalper_signal(
     if rsi_f is None or rsi_s is None:
         return None, 0.0
     if o < lower and rsi_f > rsi_s:
-        score = (lower - o) / atr_abs if atr_abs > 0 else 0.0
+        score = (lower - o) / atr_abs
         return "long", float(score)
     if o > upper and rsi_f < rsi_s:
-        score = (o - upper) / atr_abs if atr_abs > 0 else 0.0
+        score = (o - upper) / atr_abs
         return "short", float(score)
     return None, 0.0
 
@@ -383,8 +464,8 @@ def build_coins() -> List[Coin]:
         ss_side, ss_score = _super_scalper_signal(opens, highs, lows, closes, atr15)
         daily_done = daily[:-1] if len(daily) >= 3 else daily
         daily_opens = [_f(c[1]) for c in daily_done] if daily_done else []
-        # OKX daily candles are newest-last after reverse; need chronological opens.
         ichi_side = _ichi_hull_signal(opens, highs, lows, daily_opens)
+        ut_side = _ut_bot_signal(closes, highs, lows)
         oi_chg = 0.0
         try:
             oi_rows = _public("/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
@@ -422,6 +503,7 @@ def build_coins() -> List[Coin]:
                 ss_side=ss_side,
                 ss_score=ss_score,
                 ichi_side=ichi_side,
+                ut_side=ut_side,
             )
         )
     return coins
@@ -945,9 +1027,6 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         _persist_trade(runner, row)
         return
     if action.kind == "open":
-        # Oppo idle never opens. Peak + Mayhem run Super Scalper.
-        if runner == "oppo_mayhem":
-            return
         if len(book.positions) >= MAX_OPENS:
             return
         coin = by_coin.get(action.coin or "")
@@ -966,7 +1045,7 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         book.sync_primary()
         return
     if action.kind == "add":
-        # Super Scalper and Oppo idle: no pyramids.
+        # Pine flip books: no pyramids.
         if runner in ("oppo_mayhem", "mayhem", "peaksting"):
             return
         pos = _find_pos(book, action.coin)
@@ -1137,14 +1216,10 @@ async def _tick(decide: bool = True) -> None:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
                     actions: List[Action] = []
-                    if runner == "oppo_mayhem":
-                        # Idle: flatten leftovers; no Mayhem pair; no new entries.
-                        _OPPO_PAIR_Q.clear()
-                        actions.extend(_idle_flatten(book, "oppo_idle"))
-                    else:
-                        # Mayhem + Peak = Super Scalper; Windward / Orakelia unchanged.
-                        _PEAK_PAIR_Q.clear()
-                        actions.extend(decide_actions(runner, book, coins, now))
+                    # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward / Orakelia.
+                    _OPPO_PAIR_Q.clear()
+                    _PEAK_PAIR_Q.clear()
+                    actions.extend(decide_actions(runner, book, coins, now))
                     for action in _dedupe_actions(actions):
                         await _act(runner, client, book, coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.

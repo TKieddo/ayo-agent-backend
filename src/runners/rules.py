@@ -33,7 +33,7 @@ RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo: idle. Mayhem: Super Scalper. Peak: Ichimoku+Hull+MACD (Pine-faithful).
+# Mayhem: Super Scalper. Peak: Ichimoku+Hull. Oppo: UT Bot. All Pine-faithful flips.
 OPPO_FADE_R = 1.0
 OPPO_GIVEBACK_ARM_R = 0.5
 OPPO_GIVEBACK_KEEP = 0.4
@@ -41,20 +41,27 @@ OPPO_TIME_STOP_S = 0
 # Super Scalper — Mayhem only.
 SS_RUNNERS = frozenset({"mayhem"})
 SS_BAND_MULT = 1.0
-SS_STOP_ATR = 2.0
-SS_TP_R = 5.0
+SS_ATR_LEN = 14
 SS_RSI_FAST = 25
 SS_RSI_SLOW = 100
-# Peak Ichimoku blend — wide catastrophe stop only; exits = opposite signal flip.
+SS_STOP_PCT = 8.0
+# Peak Ichimoku blend.
 ICHI_RUNNERS = frozenset({"peaksting"})
-ICHI_STOP_PCT = 8.0  # disaster stop; Pine had no SL — flip is the real exit
+ICHI_STOP_PCT = 8.0
+# Oppo UT Bot (ATR trail flip; Heikin Ashi off).
+UT_RUNNERS = frozenset({"oppo_mayhem"})
+UT_KEY = 1.0
+UT_ATR_LEN = 10
+UT_STOP_PCT = 8.0
+# Pine-faithful flip books share disaster-stop + no trail.
+FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem · Super Scalper",
     "windward": "Windward",
     "orakelia": "Orakelia",
     "peaksting": "Peak · Ichimoku Hull",
-    "oppo_mayhem": "Oppo · idle",
+    "oppo_mayhem": "Oppo · UT Bot",
     "ayo": "AYO",
 }
 
@@ -80,6 +87,8 @@ class Coin:
     ss_score: float = 0.0
     # Peak Ichimoku+Hull+MACD — full opposite signal only (not "condition cleared")
     ichi_side: Optional[str] = None  # long | short
+    # Oppo UT Bot — buy/sell flip only
+    ut_side: Optional[str] = None  # long | short
 
 
 @dataclass
@@ -127,17 +136,16 @@ class Action:
 
 
 def stop_pct(coin: Coin, runner: str = "") -> Optional[float]:
-    if runner in ICHI_RUNNERS:
-        # Pine has no SL — keep a wide disaster stop so the book stays tradable.
-        return min(ICHI_STOP_PCT, MAX_STOP_PCT)
-    if runner in SS_RUNNERS:
-        if coin.atr15_pct is None or coin.atr15_pct <= 0:
-            return None
-        pct = SS_STOP_ATR * coin.atr15_pct
-    else:
-        if coin.atr1h_pct is None or coin.atr1h_pct <= 0:
-            return None
-        pct = STOP_ATR * coin.atr1h_pct
+    if runner in FLIP_RUNNERS:
+        # Pine flip books: no strategy.exit SL/TP — wide disaster stop only.
+        if runner in SS_RUNNERS:
+            return min(SS_STOP_PCT, MAX_STOP_PCT)
+        if runner in ICHI_RUNNERS:
+            return min(ICHI_STOP_PCT, MAX_STOP_PCT)
+        return min(UT_STOP_PCT, MAX_STOP_PCT)
+    if coin.atr1h_pct is None or coin.atr1h_pct <= 0:
+        return None
+    pct = STOP_ATR * coin.atr1h_pct
     if pct > MAX_STOP_PCT or pct <= 0:
         return None
     return pct
@@ -234,7 +242,12 @@ def _super_scalper(coins: List[Coin]) -> List[Coin]:
 def _ichi_hull(coins: List[Coin]) -> List[Coin]:
     """Pine Ichimoku + daily open + Hull MA + Hull-MACD — full signal only."""
     rows = [c for c in coins if _tradable(c, "peaksting") and c.ichi_side in ("long", "short")]
-    # Prefer stronger absolute 24h move when several fire (no Pine rank — tie-break only).
+    return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
+
+
+def _ut_bot(coins: List[Coin]) -> List[Coin]:
+    """Pine UT Bot — ATR trail cross buy/sell."""
+    rows = [c for c in coins if _tradable(c, "oppo_mayhem") and c.ut_side in ("long", "short")]
     return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
 
 
@@ -270,8 +283,8 @@ def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
         return _super_scalper(coins)
     if runner in ICHI_RUNNERS:
         return _ichi_hull(coins)
-    if runner == "oppo_mayhem":
-        return []  # idle — no Mayhem pair, no solo entries
+    if runner in UT_RUNNERS:
+        return _ut_bot(coins)
     if runner == "windward":
         return _windward(coins)
     if runner == "orakelia":
@@ -289,6 +302,8 @@ def _side_for(runner: str, coin: Coin) -> str:
         return coin.ss_side or "long"
     if runner in ICHI_RUNNERS:
         return coin.ichi_side or "long"
+    if runner in UT_RUNNERS:
+        return coin.ut_side or "long"
     if runner == "orakelia":
         return "long"
     return impulse(coin) or "long"
@@ -313,24 +328,24 @@ def _open_slots(book: Book) -> List[Pos]:
 
 
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
-    if runner == "oppo_mayhem":
-        return None  # idle — flatten only via hive_race oppo_idle
     if stop_hit(pos, mid):
         return "stop"
-    hold_s = OPPO_TIME_STOP_S if runner == "oppo_mayhem" else TIME_STOP_S
+    hold_s = TIME_STOP_S
     if hold_s > 0 and now - pos.opened_at >= hold_s:
         return "time_stop"
     if coin is None:
         return None
     if runner in ICHI_RUNNERS:
-        # Pine: reverse only when the *opposite* full condition fires (not when long clears).
         if coin.ichi_side and coin.ichi_side != pos.side:
             return "ichi_flip"
         return None
     if runner in SS_RUNNERS:
-        risk = float(pos.risk_usd or 0)
-        if risk > 0 and upl(pos, mid) >= SS_TP_R * risk:
-            return "ss_tp"
+        if coin.ss_side and coin.ss_side != pos.side:
+            return "ss_flip"
+        return None
+    if runner in UT_RUNNERS:
+        if coin.ut_side and coin.ut_side != pos.side:
+            return "ut_flip"
         return None
     if runner == "windward":
         if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
@@ -364,8 +379,8 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
         coin = by_coin.get(pos.coin)
         mid = coin.mid if coin else pos.peak_px
         if coin:
-            # Peak: no ATR trail / profit locks (Pine had none) — only track peak for UPL.
-            if runner in ICHI_RUNNERS:
+            # Pine-faithful flip books: no hive ATR trail / locks — peak for UPL only.
+            if runner in FLIP_RUNNERS:
                 if pos.side == "long" and coin.mid > pos.peak_px:
                     pos.peak_px = coin.mid
                 elif pos.side == "short" and coin.mid < pos.peak_px:
@@ -388,9 +403,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             continue
         mid = coin.mid
         if (
-            runner not in SS_RUNNERS
-            and runner not in ICHI_RUNNERS
-            and runner != "oppo_mayhem"
+            runner not in FLIP_RUNNERS
             and not pos.added
             and upl(pos, mid) > 0
             and _run_atr(pos, coin) >= 1.5
@@ -398,18 +411,6 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             and (runner != "orakelia" or coin.ret1h >= 0)
         ):
             return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")]
-
-    # Super Scalper: rotate to a stronger band fade when full.
-    if runner in SS_RUNNERS and len(opens) >= MAX_OPENS:
-        ranked = _super_scalper(coins)
-        held = {p.coin for p in opens}
-        if ranked and ranked[0].coin not in held:
-            worst = min(opens, key=lambda p: upl(p, by_coin[p.coin].mid if p.coin in by_coin else p.entry_px))
-            nxt = ranked[0]
-            return [
-                Action("close", worst.coin, worst.side, reason="rotate"),
-                Action("open", nxt.coin, _side_for(runner, nxt), ENTRY_NOTIONAL, "rotate"),
-            ]
 
     if block:
         return [Action("hold", reason=block)]
