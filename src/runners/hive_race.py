@@ -275,6 +275,239 @@ def _ut_bot_signal(
     return None
 
 
+def _ema_series(values: List[float], length: int) -> List[float]:
+    """TradingView ta.ema — SMA seed then EMA."""
+    n = len(values)
+    out = [float("nan")] * n
+    if length <= 0 or n < length:
+        return out
+    alpha = 2.0 / (length + 1)
+    seed = sum(values[:length]) / length
+    out[length - 1] = seed
+    for i in range(length, n):
+        prev = out[i - 1]
+        out[i] = alpha * values[i] + (1.0 - alpha) * prev
+    return out
+
+
+def _rsi_wilder_series(closes: List[float], period: int) -> List[float]:
+    """TradingView ta.rsi (Wilder)."""
+    n = len(closes)
+    out = [float("nan")] * n
+    if period <= 0 or n <= period:
+        return out
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, period + 1):
+        d = closes[i] - closes[i - 1]
+        if d >= 0:
+            gains += d
+        else:
+            losses -= d
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        out[period] = 100.0
+    else:
+        out[period] = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+    for i in range(period + 1, n):
+        d = closes[i] - closes[i - 1]
+        gain = d if d > 0 else 0.0
+        loss = -d if d < 0 else 0.0
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        if avg_loss == 0:
+            out[i] = 100.0
+        else:
+            out[i] = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+    return out
+
+
+def _momentum_zz_signal(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+) -> Tuple[Optional[str], Optional[float]]:
+    """Peter_O Momentum ZigZag — QQE default, RSI5 force filter, pivot SL.
+
+    Returns (side, stop_px) only on a GoLong/GoShort bar. Absolute TP=200 omitted
+    (unusable across coins); exit is opposite signal + disaster stop in rules.
+    """
+    from src.runners.rules import (
+        MZ_QQE_FACTOR,
+        MZ_RSI5_OB,
+        MZ_RSI5_OS,
+        MZ_RSI_LEN,
+        MZ_RSI_SMOOTH,
+    )
+
+    n = len(closes)
+    need = MZ_RSI_LEN * 4 + MZ_RSI_SMOOTH + 20
+    if n < need:
+        return None, None
+
+    rsi5 = _rsi_wilder_series(closes, 5)
+    wilders = MZ_RSI_LEN * 2 - 1
+    rsi_ma = _ema_series(_rsi_wilder_series(closes, MZ_RSI_LEN), MZ_RSI_SMOOTH)
+
+    atr_rsi = [float("nan")] * n
+    for i in range(1, n):
+        a, b = rsi_ma[i], rsi_ma[i - 1]
+        if a == a and b == b:
+            atr_rsi[i] = abs(b - a)
+    dar = _ema_series(_ema_series(atr_rsi, wilders), wilders)
+    for i in range(n):
+        if dar[i] == dar[i]:
+            dar[i] *= MZ_QQE_FACTOR
+
+    longband = [0.0] * n
+    shortband = [0.0] * n
+    trend = [1] * n
+    last_qqe_high = [highs[0]] * n
+    last_qqe_low = [lows[0]] * n
+    last_xlong_i = -10_000
+    last_xshort_i = -10_000
+    qqe_flip = [0] * n  # 1 = long flip, -1 = short flip
+
+    for i in range(n):
+        rs, d = rsi_ma[i], dar[i]
+        if rs != rs or d != d:
+            if i:
+                longband[i] = longband[i - 1]
+                shortband[i] = shortband[i - 1]
+                trend[i] = trend[i - 1]
+                last_qqe_high[i] = last_qqe_high[i - 1]
+                last_qqe_low[i] = last_qqe_low[i - 1]
+            continue
+
+        new_short, new_long = rs + d, rs - d
+        if i == 0:
+            longband[i], shortband[i] = new_long, new_short
+        else:
+            prev_long, prev_short = longband[i - 1], shortband[i - 1]
+            prev_rs = rsi_ma[i - 1]
+            if prev_rs == prev_rs and prev_rs > prev_long and rs > prev_long:
+                longband[i] = max(prev_long, new_long)
+            else:
+                longband[i] = new_long
+            if prev_rs == prev_rs and prev_rs < prev_short and rs < prev_short:
+                shortband[i] = min(prev_short, new_short)
+            else:
+                shortband[i] = new_short
+
+        going_up = (i - last_xlong_i) < (i - last_xshort_i)
+        going_down = (i - last_xlong_i) > (i - last_xshort_i)
+        prev_going_up = ((i - 1 - last_xlong_i) < (i - 1 - last_xshort_i)) if i else going_up
+        prev_going_down = ((i - 1 - last_xlong_i) > (i - 1 - last_xshort_i)) if i else going_down
+        prev_hi = last_qqe_high[i - 1] if i else highs[i]
+        prev_lo = last_qqe_low[i - 1] if i else lows[i]
+        if (highs[i] > prev_hi and going_up) or (prev_going_down and going_up):
+            last_qqe_high[i] = highs[i]
+        else:
+            last_qqe_high[i] = prev_hi
+        if (lows[i] < prev_lo and going_down) or (prev_going_up and going_down):
+            last_qqe_low[i] = lows[i]
+        else:
+            last_qqe_low[i] = prev_lo
+
+        prev_trend = trend[i - 1] if i else 1
+        prev_rs = rsi_ma[i - 1] if i else rs
+        prev_short_b = shortband[i - 1] if i else shortband[i]
+        prev_long_b = longband[i - 1] if i else longband[i]
+        cross_up = prev_rs <= prev_short_b and rs > prev_short_b
+        cross_dn = prev_rs >= prev_long_b and rs < prev_long_b
+        cross_hi = i > 0 and highs[i - 1] <= prev_hi and highs[i] > prev_hi
+        cross_lo = i > 0 and lows[i - 1] >= prev_lo and lows[i] < prev_lo
+        if cross_up or cross_hi:
+            trend[i] = 1
+        elif cross_dn or cross_lo:
+            trend[i] = -1
+        else:
+            trend[i] = prev_trend
+
+        if trend[i] == 1 and prev_trend == -1:
+            last_xlong_i = i
+            qqe_flip[i] = 1
+        elif trend[i] == -1 and prev_trend == 1:
+            last_xshort_i = i
+            qqe_flip[i] = -1
+
+    mom_dir = [0] * n
+    mom_up = [False] * n
+    mom_dn = [False] * n
+    for i in range(n):
+        if qqe_flip[i] == 1:
+            mom_up[i] = True
+            mom_dir[i] = 1
+        elif qqe_flip[i] == -1:
+            mom_dn[i] = True
+            mom_dir[i] = -1
+        else:
+            mom_dir[i] = mom_dir[i - 1] if i else 0
+
+    last_up = last_dn = last_ob = last_os = -10_000
+    ages_up = [10_000] * n
+    ages_dn = [10_000] * n
+    ages_ob = [10_000] * n
+    ages_os = [10_000] * n
+    for i in range(n):
+        if rsi5[i] == rsi5[i]:
+            if rsi5[i] > MZ_RSI5_OB:
+                last_ob = i
+            if rsi5[i] < MZ_RSI5_OS:
+                last_os = i
+        if mom_up[i]:
+            last_up = i
+        if mom_dn[i]:
+            last_dn = i
+        ages_up[i] = i - last_up if last_up >= 0 else 10_000
+        ages_dn[i] = i - last_dn if last_dn >= 0 else 10_000
+        ages_ob[i] = i - last_ob if last_ob >= 0 else 10_000
+        ages_os[i] = i - last_os if last_os >= 0 else 10_000
+
+    go_long = [False] * n
+    go_short = [False] * n
+    for i in range(n):
+        if mom_up[i]:
+            force_dn = i >= 1 and ages_dn[i - 1] >= ages_os[i - 1]
+            go_long[i] = not force_dn
+        if mom_dn[i]:
+            force_up = i >= 1 and ages_up[i - 1] >= ages_ob[i - 1]
+            go_short[i] = not force_up
+
+    zz_peak = [highs[0]] * n
+    zz_bottom = [lows[0]] * n
+    zigzag = [float("nan")] * n
+    for i in range(n):
+        up, dn = mom_dir[i] == 1, mom_dir[i] == -1
+        prev_up = mom_dir[i - 1] == 1 if i else False
+        prev_dn = mom_dir[i - 1] == -1 if i else False
+        prev_peak = zz_peak[i - 1] if i else highs[i]
+        prev_bot = zz_bottom[i - 1] if i else lows[i]
+        zz_peak[i] = highs[i] if ((highs[i] > prev_peak and up) or (prev_dn and up)) else prev_peak
+        zz_bottom[i] = lows[i] if ((lows[i] < prev_bot and dn) or (prev_up and dn)) else prev_bot
+        if up and prev_dn:
+            zigzag[i] = prev_bot
+        elif prev_up and dn:
+            zigzag[i] = prev_peak
+
+    pl = ph = float("nan")
+    for i in range(n):
+        if mom_up[i] and zigzag[i] == zigzag[i]:
+            pl = zigzag[i]
+        if mom_dn[i] and zigzag[i] == zigzag[i]:
+            ph = zigzag[i]
+
+    i = n - 1
+    if go_long[i]:
+        sl = lows[i] if pl != pl or lows[i] < pl else pl
+        return "long", float(sl)
+    if go_short[i]:
+        sl = highs[i] if ph != ph or highs[i] > ph else ph
+        return "short", float(sl)
+    return None, None
+
+
 def _super_scalper_signal(
     opens: List[float],
     highs: List[float],
@@ -466,6 +699,7 @@ def build_coins() -> List[Coin]:
         daily_opens = [_f(c[1]) for c in daily_done] if daily_done else []
         ichi_side = _ichi_hull_signal(opens, highs, lows, daily_opens)
         ut_side = _ut_bot_signal(closes, highs, lows)
+        mz_side, mz_sl_px = _momentum_zz_signal(highs, lows, closes)
         oi_chg = 0.0
         try:
             oi_rows = _public("/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
@@ -504,6 +738,8 @@ def build_coins() -> List[Coin]:
                 ss_score=ss_score,
                 ichi_side=ichi_side,
                 ut_side=ut_side,
+                mz_side=mz_side,
+                mz_sl_px=mz_sl_px,
             )
         )
     return coins
@@ -898,8 +1134,18 @@ async def _order(
 
 
 def _open_pos(coin: Coin, side: str, notional: float, qty: float, now: float, runner: str = "") -> Pos:
+    from src.runners.rules import MZ_RUNNERS, MZ_STOP_PCT
+
     pct = stop_pct(coin, runner=runner) or 8.0
     stop = stop_price(side, coin.mid, pct)
+    # Momentum ZZ: Pine pivot SL, clamped to disaster max (never wider than MZ_STOP_PCT).
+    if runner in MZ_RUNNERS and coin.mz_sl_px and coin.mid > 0:
+        disaster = stop_price(side, coin.mid, min(MZ_STOP_PCT, pct))
+        mz = float(coin.mz_sl_px)
+        if side == "long" and 0 < mz < coin.mid:
+            stop = max(mz, disaster)
+        elif side == "short" and mz > coin.mid:
+            stop = min(mz, disaster)
     risk = abs(coin.mid - stop) / coin.mid * notional
     return Pos(
         coin=coin.coin,
@@ -1216,7 +1462,7 @@ async def _tick(decide: bool = True) -> None:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
                     actions: List[Action] = []
-                    # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward / Orakelia.
+                    # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward MZ / Orakelia.
                     _OPPO_PAIR_Q.clear()
                     _PEAK_PAIR_Q.clear()
                     actions.extend(decide_actions(runner, book, coins, now))

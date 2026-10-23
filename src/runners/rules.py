@@ -33,7 +33,7 @@ RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Mayhem: Super Scalper. Peak: Ichimoku+Hull. Oppo: UT Bot. All Pine-faithful flips.
+# Mayhem: Super Scalper. Peak: Ichimoku+Hull. Oppo: UT Bot. Windward: Momentum ZZ (QQE).
 OPPO_FADE_R = 1.0
 OPPO_GIVEBACK_ARM_R = 0.5
 OPPO_GIVEBACK_KEEP = 0.4
@@ -53,12 +53,20 @@ UT_RUNNERS = frozenset({"oppo_mayhem"})
 UT_KEY = 1.0
 UT_ATR_LEN = 10
 UT_STOP_PCT = 8.0
+# Windward — Peter_O Momentum ZigZag (QQE default); flip + pivot SL (TP=200 skipped).
+MZ_RUNNERS = frozenset({"windward"})
+MZ_RSI_LEN = 14
+MZ_QQE_FACTOR = 4.238
+MZ_RSI_SMOOTH = 5
+MZ_RSI5_OB = 80
+MZ_RSI5_OS = 20
+MZ_STOP_PCT = 8.0
 # Pine-faithful flip books share disaster-stop + no trail.
-FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS
+FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS | MZ_RUNNERS
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem · Super Scalper",
-    "windward": "Windward",
+    "windward": "Windward · Momentum ZZ",
     "orakelia": "Orakelia",
     "peaksting": "Peak · Ichimoku Hull",
     "oppo_mayhem": "Oppo · UT Bot",
@@ -89,6 +97,9 @@ class Coin:
     ichi_side: Optional[str] = None  # long | short
     # Oppo UT Bot — buy/sell flip only
     ut_side: Optional[str] = None  # long | short
+    # Windward Momentum ZigZag (QQE) — signal bar only
+    mz_side: Optional[str] = None  # long | short
+    mz_sl_px: Optional[float] = None  # pivot stop from Pine
 
 
 @dataclass
@@ -142,6 +153,8 @@ def stop_pct(coin: Coin, runner: str = "") -> Optional[float]:
             return min(SS_STOP_PCT, MAX_STOP_PCT)
         if runner in ICHI_RUNNERS:
             return min(ICHI_STOP_PCT, MAX_STOP_PCT)
+        if runner in MZ_RUNNERS:
+            return min(MZ_STOP_PCT, MAX_STOP_PCT)
         return min(UT_STOP_PCT, MAX_STOP_PCT)
     if coin.atr1h_pct is None or coin.atr1h_pct <= 0:
         return None
@@ -251,18 +264,10 @@ def _ut_bot(coins: List[Coin]) -> List[Coin]:
     return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
 
 
-def _windward(coins: List[Coin]) -> List[Coin]:
-    rows = []
-    for c in coins:
-        side = impulse(c)
-        if not side or not _tradable(c) or c.vol_z <= 0:
-            continue
-        if c.ret24h == 0 or c.ret7d == 0 or (c.ret24h > 0) != (c.ret7d > 0):
-            continue
-        if (c.ret1h > 0) != (c.ret24h > 0) and not (c.ret1h == 0 and c.ret24h > 0):
-            continue
-        rows.append(c)
-    return sorted(rows, key=lambda c: (abs(c.ret24h), abs(c.ret7d)), reverse=True)
+def _momentum_zz(coins: List[Coin]) -> List[Coin]:
+    """Pine Momentum ZigZag (QQE) — GoLong/GoShort on completed 15m."""
+    rows = [c for c in coins if _tradable(c, "windward") and c.mz_side in ("long", "short")]
+    return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
 
 
 def _orakelia(coins: List[Coin], blacklist: Dict[str, bool]) -> List[Coin]:
@@ -285,8 +290,8 @@ def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
         return _ichi_hull(coins)
     if runner in UT_RUNNERS:
         return _ut_bot(coins)
-    if runner == "windward":
-        return _windward(coins)
+    if runner in MZ_RUNNERS:
+        return _momentum_zz(coins)
     if runner == "orakelia":
         return _orakelia(coins, book.blacklist)
     return []
@@ -304,6 +309,8 @@ def _side_for(runner: str, coin: Coin) -> str:
         return coin.ichi_side or "long"
     if runner in UT_RUNNERS:
         return coin.ut_side or "long"
+    if runner in MZ_RUNNERS:
+        return coin.mz_side or "long"
     if runner == "orakelia":
         return "long"
     return impulse(coin) or "long"
@@ -347,10 +354,11 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         if coin.ut_side and coin.ut_side != pos.side:
             return "ut_flip"
         return None
-    if runner == "windward":
-        if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
-            return "trend_break"
-    elif runner == "orakelia":
+    if runner in MZ_RUNNERS:
+        if coin.mz_side and coin.mz_side != pos.side:
+            return "mz_flip"
+        return None
+    if runner == "orakelia":
         if coin.ret1h < 0 or coin.vol_z < 0:
             book.blacklist[pos.coin] = True
             return "momentum_fade"
