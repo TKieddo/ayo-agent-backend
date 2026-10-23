@@ -1,8 +1,8 @@
-"""One loop, five OKX demo keys. Public market data is fetched once per tick.
+"""Hive race: OKX demo runners + Confetti on Binance Futures demo.
 
 Each runner keeps a $300 race ledger with up to 3 concurrent opens at $40
-margin (10x isolated), +$15 margin add when winning. Live OKX positions are
-reconciled every tick so the book cannot desync. AYO's key is never used here.
+margin (10x isolated), +$15 margin add when winning. Live exchange positions
+are reconciled every tick. AYO's key is never used for hive demo books.
 """
 
 from __future__ import annotations
@@ -69,7 +69,10 @@ ENV_PREFIX = {
     "peaksting": "PEAKSTING",
     # Oppo Mayhem 1:1 pair — reuses Peak Stinger demo keys (PEAKSTINGER_*).
     "oppo_mayhem": "PEAKSTINGER",
+    # Confetti · BeeBots Momentum on Binance (not OKX).
+    "confetti": "CONFETTI",
 }
+BINANCE_RUNNERS = frozenset({"confetti"})
 
 # Mayhem → Oppo (entries/adds only). PeakSting is idle (no Mayhem sync).
 _OPPO_PAIR_Q: List[Action] = []
@@ -90,12 +93,134 @@ def _enabled() -> bool:
 
 def _creds(runner: str) -> Optional[tuple]:
     prefix = ENV_PREFIX[runner]
+    if runner in BINANCE_RUNNERS:
+        key = os.getenv(f"{prefix}_BINANCE_API_KEY", "").strip()
+        secret = os.getenv(f"{prefix}_BINANCE_API_SECRET", "").strip()
+        if key and secret:
+            testnet_raw = os.getenv(f"{prefix}_BINANCE_TESTNET", "true").strip().lower()
+            testnet = testnet_raw not in ("0", "false", "no", "off")
+            return key, secret, testnet
+        return None
     key = os.getenv(f"{prefix}_OKX_DEMO_API_KEY", "").strip()
     secret = os.getenv(f"{prefix}_OKX_DEMO_API_SECRET", "").strip()
     phrase = os.getenv(f"{prefix}_OKX_DEMO_API_PASSPHRASE", "").strip()
     if key and secret and phrase:
         return key, secret, phrase
     return None
+
+
+def _binance_fapi() -> str:
+    # Public market data — mainnet fapi (same marks Confetti trades against on demo when keys are testnet).
+    return (os.getenv("BINANCE_FAPI_URL") or "https://fapi.binance.com").rstrip("/")
+
+
+def _binance_get(path: str, params: Optional[dict] = None) -> Any:
+    url = f"{_binance_fapi()}{path}"
+    resp = requests.get(url, params=params or {}, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def build_binance_coins() -> List[Coin]:
+    """USDT-M liquid perps for Confetti (BeeBots Momentum gates applied in beebots_boozy)."""
+    from src.runners.beebots_boozy import BOOZY_MIN_VOL_USD, BOOZY_SPREAD_BP
+
+    try:
+        tickers = _binance_get("/fapi/v1/ticker/24hr")
+    except Exception as exc:
+        logger.warning("binance tickers failed: %s", exc)
+        return []
+    if not isinstance(tickers, list):
+        return []
+    ranked: List[Tuple[float, str, dict, float, float, float]] = []
+    for row in tickers:
+        sym = str(row.get("symbol") or "")
+        if not sym.endswith("USDT"):
+            continue
+        # Skip quarterlies / weird symbols
+        base = sym[:-4]
+        if not base or not base.isalnum():
+            continue
+        if base.upper() in HIVE_BLOCKLIST:
+            continue
+        last = _f(row.get("lastPrice"))
+        bid = _f(row.get("bidPrice"))
+        ask = _f(row.get("askPrice"))
+        if last <= 0:
+            continue
+        if bid <= 0 or ask <= 0:
+            bid, ask = last, last
+        vol_usd = _f(row.get("quoteVolume"))
+        spread_bp = (ask - bid) / ((ask + bid) / 2) * 10000 if (ask + bid) > 0 else 99.0
+        if vol_usd < BOOZY_MIN_VOL_USD or spread_bp > BOOZY_SPREAD_BP:
+            continue
+        open24 = _f(row.get("openPrice"), last)
+        ret24 = (last - open24) / open24 * 100 if open24 else 0.0
+        ranked.append((vol_usd, base.upper(), row, last, spread_bp, ret24))
+    ranked.sort(key=lambda r: r[0], reverse=True)
+    out: List[Coin] = []
+    for vol_usd, coin, row, last, spread_bp, ret24 in ranked[:HIVE_SCAN_POOL]:
+        sym = f"{coin}USDT"
+        try:
+            raw = _binance_get("/fapi/v1/klines", {"symbol": sym, "interval": "15m", "limit": "160"})
+            daily = _binance_get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": "8"})
+        except Exception as exc:
+            logger.debug("binance candles %s: %s", sym, exc)
+            continue
+        if not isinstance(raw, list) or len(raw) < 30:
+            continue
+        # Binance kline: [openTime, o, h, l, c, vol, ...]
+        done = raw[:-1] if len(raw) >= 3 else raw
+        closes = [_f(c[4]) for c in done]
+        highs = [_f(c[2]) for c in done]
+        lows = [_f(c[3]) for c in done]
+        vols = [_f(c[5]) for c in done]
+        ret1h = (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 and closes[-5] else 0.0
+        ret7 = 0.0
+        if isinstance(daily, list) and len(daily) >= 2 and _f(daily[0][4]):
+            # daily[0] is oldest when limit=8; use first open of oldest vs last
+            old = _f(daily[0][1]) or _f(daily[0][4])
+            if old:
+                ret7 = (last - old) / old * 100
+        atr15 = _atr_pct(highs, lows, closes)
+        atr1h = atr15 * 2 if atr15 is not None else None
+        # OI / funding optional — missing data treated as 0 so long impulse OI>=0 still passes.
+        oi_chg = 0.0
+        funding_z = 0.0
+        try:
+            oi = _binance_get("/futures/data/openInterestHist", {"symbol": sym, "period": "5m", "limit": "3"})
+            if isinstance(oi, list) and len(oi) >= 2:
+                a = _f(oi[-1].get("sumOpenInterest"))
+                b = _f(oi[-2].get("sumOpenInterest"))
+                if b:
+                    oi_chg = (a - b) / b * 100
+        except Exception:
+            oi_chg = 0.0
+        try:
+            fr = _binance_get("/fapi/v1/premiumIndex", {"symbol": sym})
+            if isinstance(fr, dict):
+                funding_z = _funding_z(sym, _f(fr.get("lastFundingRate")))
+        except Exception:
+            funding_z = 0.0
+        out.append(
+            Coin(
+                coin=coin,
+                mid=last,
+                spread_bp=spread_bp,
+                vol24h_usd=vol_usd,
+                ret1h=ret1h,
+                ret24h=ret24,
+                ret7d=ret7,
+                rsi14=_rsi(closes),
+                atr1h_pct=atr1h,
+                oi_chg_1h=oi_chg,
+                funding_z=funding_z,
+                vol_z=_vol_z(vols),
+                high24h=_f(row.get("highPrice"), last),
+                atr15_pct=atr15,
+            )
+        )
+    return out
 
 
 def _public(path: str, params: Optional[dict] = None) -> Any:
@@ -1302,19 +1427,24 @@ async def _order(
 
 
 def _open_pos(coin: Coin, side: str, notional: float, qty: float, now: float, runner: str = "") -> Pos:
-    from src.runners.rules import MZ_RUNNERS, MZ_STOP_PCT
+    from src.runners.rules import CONFETTI_RUNNERS, MZ_RUNNERS, MZ_STOP_PCT
 
-    pct = stop_pct(coin, runner=runner) or 8.0
-    stop = stop_price(side, coin.mid, pct)
-    # Momentum ZZ: Pine pivot SL, clamped to disaster max (never wider than MZ_STOP_PCT).
-    if runner in MZ_RUNNERS and coin.mz_sl_px and coin.mid > 0:
-        disaster = stop_price(side, coin.mid, min(MZ_STOP_PCT, pct))
-        mz = float(coin.mz_sl_px)
-        if side == "long" and 0 < mz < coin.mid:
-            stop = max(mz, disaster)
-        elif side == "short" and mz > coin.mid:
-            stop = min(mz, disaster)
-    risk = abs(coin.mid - stop) / coin.mid * notional
+    if runner in CONFETTI_RUNNERS:
+        from src.runners.beebots_boozy import boozy_stop_px
+
+        stop = boozy_stop_px(side, coin.mid, coin)
+    else:
+        pct = stop_pct(coin, runner=runner) or 8.0
+        stop = stop_price(side, coin.mid, pct)
+        # Momentum ZZ: Pine pivot SL, clamped to disaster max (never wider than MZ_STOP_PCT).
+        if runner in MZ_RUNNERS and coin.mz_sl_px and coin.mid > 0:
+            disaster = stop_price(side, coin.mid, min(MZ_STOP_PCT, pct))
+            mz = float(coin.mz_sl_px)
+            if side == "long" and 0 < mz < coin.mid:
+                stop = max(mz, disaster)
+            elif side == "short" and mz > coin.mid:
+                stop = min(mz, disaster)
+    risk = abs(coin.mid - stop) / coin.mid * notional if coin.mid else 0.0
     return Pos(
         coin=coin.coin,
         side=side,
@@ -1630,6 +1760,7 @@ async def _refresh_ayo() -> None:
 
 async def _tick(decide: bool = True) -> None:
     coins = await asyncio.to_thread(build_coins) if decide else []
+    bn_coins: List[Coin] = []
     now = time.time()
     await _refresh_ayo()
     async with _LOCK:
@@ -1650,33 +1781,39 @@ async def _tick(decide: bool = True) -> None:
             upl_by_coin: Dict[str, float] = {}
             live_upl = 0.0
             try:
-                if not coins:
-                    coins = await asyncio.to_thread(build_coins)
-                    _STATE["market_coins"] = len(coins)
+                if runner in BINANCE_RUNNERS:
+                    if decide or not bn_coins:
+                        bn_coins = await asyncio.to_thread(build_binance_coins)
+                    runner_coins = bn_coins
+                else:
+                    if not coins:
+                        coins = await asyncio.to_thread(build_coins)
+                        _STATE["market_coins"] = len(coins)
+                    runner_coins = coins
                 upl_by_coin, live_upl = await _reconcile_okx(
-                    book, client, coins, now, runner=runner
+                    book, client, runner_coins, now, runner=runner
                 )
                 if decide:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
                     actions: List[Action] = []
-                    # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward MZ / Orakelia.
+                    # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward MZ / Orakelia / Confetti.
                     _OPPO_PAIR_Q.clear()
                     _PEAK_PAIR_Q.clear()
                     # Patch coin.mid when ticker mid is insane vs live entry (TSLA case).
-                    by_coin = {c.coin: c for c in coins}
+                    by_coin = {c.coin: c for c in runner_coins}
                     for pos in book.positions:
                         c = by_coin.get(pos.coin)
                         if not c or pos.entry_px <= 0 or c.mid <= 0:
                             continue
                         if abs(c.mid - pos.entry_px) / pos.entry_px * 100.0 > HIVE_MID_SANITY_PCT:
                             c.mid = float(pos.peak_px or pos.entry_px)
-                    actions.extend(decide_actions(runner, book, coins, now))
+                    actions.extend(decide_actions(runner, book, runner_coins, now))
                     for action in _dedupe_actions(actions):
-                        await _act(runner, client, book, coins, action, trades, now)
+                        await _act(runner, client, book, runner_coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.
                     upl_by_coin, live_upl = await _reconcile_okx(
-                        book, client, coins, now, runner=runner
+                        book, client, runner_coins, now, runner=runner
                     )
                 # All crypto runners stay live — clear any stale retire / loss_stop caps.
                 if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
@@ -1684,10 +1821,11 @@ async def _tick(decide: bool = True) -> None:
             except Exception as exc:
                 error = str(exc)
                 logger.warning("hive %s tick failed: %s", runner, exc)
-            # Prefer live OKX UPL; fall back to mid mark if reconcile failed.
+            # Prefer live exchange UPL; fall back to mid mark if reconcile failed.
             if not upl_by_coin and book.positions:
+                pool = bn_coins if runner in BINANCE_RUNNERS else coins
                 for pos in book.positions:
-                    match = next((c for c in coins if c.coin == pos.coin), None)
+                    match = next((c for c in pool if c.coin == pos.coin), None)
                     mid = match.mid if match else pos.entry_px
                     upl_by_coin[pos.coin] = upl(pos, mid)
                 live_upl = float(sum(upl_by_coin.values()))
@@ -1697,7 +1835,10 @@ async def _tick(decide: bool = True) -> None:
             stored["day_key"] = time.strftime("%Y-%m-%d", time.gmtime(now))
             stored["mtm"] = round(mtm, 4)
             stored["upl"] = round(live_upl, 4)
-            stored["note"] = f"{len(book.positions)}/{MAX_OPENS} open · ${ENTRY_MARGIN:.0f}+${ADD_MARGIN:.0f} margin"
+            venue = "Binance" if runner in BINANCE_RUNNERS else "OKX"
+            stored["note"] = (
+                f"{len(book.positions)}/{MAX_OPENS} open · ${ENTRY_MARGIN:.0f}+${ADD_MARGIN:.0f} margin · {venue}"
+            )
             _STATE["runners"][runner] = stored
         _save()
 
@@ -1775,6 +1916,7 @@ async def start_hive_race() -> None:
     _hydrate_from_supabase()
     if not _STATE.get("started_at"):
         _STATE["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    from src.trading.binance_api import BinanceAPI
     from src.trading.okx_api import OKXAPI
 
     for runner in RUNNERS:
@@ -1789,8 +1931,22 @@ async def start_hive_race() -> None:
             }
             continue
         try:
-            client = OKXAPI(api_key=creds[0], api_secret=creds[1], passphrase=creds[2], demo=True, td_mode="isolated")
-            client.default_leverage = LEVERAGE
+            if runner in BINANCE_RUNNERS:
+                client = BinanceAPI(
+                    api_key=creds[0],
+                    api_secret=creds[1],
+                    testnet=bool(creds[2]),
+                    leverage=LEVERAGE,
+                )
+            else:
+                client = OKXAPI(
+                    api_key=creds[0],
+                    api_secret=creds[1],
+                    passphrase=creds[2],
+                    demo=True,
+                    td_mode="isolated",
+                )
+                client.default_leverage = LEVERAGE
             _CLIENTS[runner] = client
             if runner not in _STATE["runners"]:
                 _STATE["runners"][runner] = _book_to(Book(), [], True, None)

@@ -63,15 +63,18 @@ MZ_RSI5_OS = 20
 MZ_STOP_PCT = 8.0
 # Pine-faithful flip books share disaster-stop + no trail.
 FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS | MZ_RUNNERS
-RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
+RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem", "confetti")
 RUNNER_LABELS = {
     "mayhem": "Mayhem · Super Scalper",
     "windward": "Windward · Momentum ZZ",
     "orakelia": "Orakelia",
     "peaksting": "Peak · Ichimoku Hull",
     "oppo_mayhem": "Oppo · UT Bot",
+    "confetti": "Confetti · Momentum",
     "ayo": "AYO",
 }
+# BeeBots Momentum (boozy) on Binance — see beebots_boozy.py
+CONFETTI_RUNNERS = frozenset({"confetti"})
 
 
 @dataclass
@@ -376,6 +379,18 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
     block = _blocked(book, now, runner=runner)
     if block == "cooldown" and not opens:
         return [Action("hold", reason=block)]
+
+    # Confetti: BeeBots Momentum (boozy) mechanical engine — hive notional, no LLM.
+    if runner in CONFETTI_RUNNERS:
+        if block == "cooldown" and opens:
+            # Still trail/stop while cooling down after an order.
+            from src.runners.beebots_boozy import decide_confetti
+
+            acts = decide_confetti(book, coins, now)
+            return [a for a in acts if a.kind == "close"] or [Action("hold", reason=block)]
+        from src.runners.beebots_boozy import decide_confetti
+
+        return decide_confetti(book, coins, now)
 
     # Trim OKX orphans above the race slot cap (smallest first).
     if len(opens) > MAX_OPENS:

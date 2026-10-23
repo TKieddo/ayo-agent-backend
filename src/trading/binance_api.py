@@ -19,20 +19,33 @@ logger = logging.getLogger(__name__)
 class BinanceAPI:
     """Client for Binance Perpetual Futures trading with leverage support."""
 
-    def __init__(self):
-        """Initialize Binance Futures client."""
-        api_key = CONFIG.get("binance_api_key")
-        api_secret = CONFIG.get("binance_api_secret")
-        testnet = CONFIG.get("binance_testnet", False)
-        
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        testnet: Optional[bool] = None,
+        leverage: Optional[int] = None,
+    ):
+        """Initialize Binance Futures client.
+
+        Optional api_key/api_secret/testnet override CONFIG so hive runners
+        (e.g. Confetti) can use dedicated demo keys without sharing AYO's.
+        """
+        api_key = (api_key if api_key is not None else CONFIG.get("binance_api_key") or "").strip()
+        api_secret = (api_secret if api_secret is not None else CONFIG.get("binance_api_secret") or "").strip()
+        if testnet is None:
+            testnet = bool(CONFIG.get("binance_testnet", False))
+        else:
+            testnet = bool(testnet)
+
         if not api_key or not api_secret:
             raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET must be set in .env")
-        
+
         # Store API credentials for v3 endpoint calls
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
-        
+
         # Initialize Binance Client with retries to tolerate transient 5xx errors from Binance
         # python-binance Client pings in constructor; wrap in retry/backoff
         def _create_client():
@@ -93,9 +106,12 @@ class BinanceAPI:
         if hasattr(self.client, 'recvWindow'):
             self.client.recvWindow = 60000
         
-        # Default leverage (can be configured per asset)
-        self.default_leverage = int(CONFIG.get("binance_leverage", 10))
-        
+        # Default leverage (can be configured per asset / hive runner)
+        if leverage is not None:
+            self.default_leverage = int(leverage)
+        else:
+            self.default_leverage = int(CONFIG.get("binance_leverage", 10))
+
         logger.info(f"Binance Futures client initialized (testnet={testnet}, leverage={self.default_leverage}x, recvWindow=60000ms)")
 
     def _to_futures_symbol(self, asset: str) -> str:
