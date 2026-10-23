@@ -643,6 +643,56 @@ def _demo_swap_ids() -> set:
     return ids
 
 
+# Hive universe: liquid prefilter → candle metrics → score → keep top N.
+# Strategy rules (SS / Ichimoku / UT / MZ) are unchanged; only which names we load.
+HIVE_SCAN_POOL = 40  # richest by 24h volume after liquidity floor
+HIVE_KEEP = 20  # best metric score kept for the race tick
+
+
+def _hive_pair_score(
+    *,
+    vol_usd: float,
+    atr15_pct: Optional[float],
+    ret1h: float,
+    ret24: float,
+    vol_z: float,
+    spread_bp: float,
+    ss_side: Optional[str],
+    ss_score: float,
+    ichi_side: Optional[str],
+    ut_side: Optional[str],
+    mz_side: Optional[str],
+) -> float:
+    """Rank liquid names for hive: ATR band + momentum + any Pine signal ready."""
+    # Liquidity (log so BTC doesn't always dominate)
+    liq = math.log10(max(vol_usd, 1.0))
+    # Prefer tradable ATR% (sweet spot ~0.8–2.5% on 15m); dead or meme-hot score low
+    atr = float(atr15_pct or 0.0)
+    if atr <= 0.35:
+        atr_s = 0.0
+    elif atr <= 0.8:
+        atr_s = (atr - 0.35) / 0.45
+    elif atr <= 2.5:
+        atr_s = 1.0
+    elif atr <= 4.0:
+        atr_s = max(0.0, 1.0 - (atr - 2.5) / 1.5)
+    else:
+        atr_s = 0.0
+    mom = min(abs(ret24) / 8.0, 1.5) + 0.35 * min(abs(ret1h) / 3.0, 1.0)
+    vz = max(0.0, min(float(vol_z or 0.0), 2.0)) * 0.25
+    tight = max(0.0, 1.0 - spread_bp / 8.0)
+    signal = 0.0
+    if ss_side in ("long", "short"):
+        signal += 1.0 + min(abs(float(ss_score or 0.0)), 2.0) * 0.15
+    if ichi_side in ("long", "short"):
+        signal += 1.0
+    if ut_side in ("long", "short"):
+        signal += 1.0
+    if mz_side in ("long", "short"):
+        signal += 1.0
+    return 0.30 * liq + 1.20 * atr_s + 0.90 * mom + vz + 0.40 * tight + 1.10 * signal
+
+
 def build_coins() -> List[Coin]:
     tickers = _public("/api/v5/market/tickers", {"instType": "SWAP"})
     try:
@@ -670,8 +720,8 @@ def build_coins() -> List[Coin]:
         ret24 = (last - open24) / open24 * 100 if open24 else 0.0
         ranked.append((vol_usd, inst, row, last, spread_bp, ret24))
     ranked.sort(key=lambda r: r[0], reverse=True)
-    coins: List[Coin] = []
-    for vol_usd, inst, row, last, spread_bp, ret24 in ranked[:12]:
+    scored: List[Tuple[float, Coin]] = []
+    for vol_usd, inst, row, last, spread_bp, ret24 in ranked[:HIVE_SCAN_POOL]:
         coin = inst.replace("-USDT-SWAP", "")
         try:
             m15 = _candles(inst, "15m", 160)
@@ -718,31 +768,45 @@ def build_coins() -> List[Coin]:
             funding_z = _funding_z(inst, current)
         except Exception:
             funding_z = 0.0
-        coins.append(
-            Coin(
-                coin=coin,
-                mid=last,
-                spread_bp=spread_bp,
-                vol24h_usd=vol_usd,
-                ret1h=ret1h,
-                ret24h=ret24,
-                ret7d=ret7,
-                rsi14=_rsi(closes),
-                atr1h_pct=atr1h,
-                oi_chg_1h=oi_chg,
-                funding_z=funding_z,
-                vol_z=_vol_z(vols),
-                high24h=_f(row.get("high24h"), last),
-                atr15_pct=atr15,
-                ss_side=ss_side,
-                ss_score=ss_score,
-                ichi_side=ichi_side,
-                ut_side=ut_side,
-                mz_side=mz_side,
-                mz_sl_px=mz_sl_px,
-            )
+        vz = _vol_z(vols)
+        c = Coin(
+            coin=coin,
+            mid=last,
+            spread_bp=spread_bp,
+            vol24h_usd=vol_usd,
+            ret1h=ret1h,
+            ret24h=ret24,
+            ret7d=ret7,
+            rsi14=_rsi(closes),
+            atr1h_pct=atr1h,
+            oi_chg_1h=oi_chg,
+            funding_z=funding_z,
+            vol_z=vz,
+            high24h=_f(row.get("high24h"), last),
+            atr15_pct=atr15,
+            ss_side=ss_side,
+            ss_score=ss_score,
+            ichi_side=ichi_side,
+            ut_side=ut_side,
+            mz_side=mz_side,
+            mz_sl_px=mz_sl_px,
         )
-    return coins
+        score = _hive_pair_score(
+            vol_usd=vol_usd,
+            atr15_pct=atr15,
+            ret1h=ret1h,
+            ret24=ret24,
+            vol_z=vz,
+            spread_bp=spread_bp,
+            ss_side=ss_side,
+            ss_score=ss_score,
+            ichi_side=ichi_side,
+            ut_side=ut_side,
+            mz_side=mz_side,
+        )
+        scored.append((score, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:HIVE_KEEP]]
 
 
 def _pos_from_dict(p: Dict[str, Any]) -> Pos:

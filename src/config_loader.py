@@ -273,7 +273,7 @@ CONFIG = {
     # Pair Hunter - Dynamic pair discovery (ASSETS remains fallback if hunter fails)
     "enable_pair_hunter": _get_bool("ENABLE_PAIR_HUNTER", True),  # Middle-ground dynamic discovery (mech + LLM)
     "mech_use_pair_hunter": _get_bool("MECH_USE_PAIR_HUNTER", True),  # Mechanical book hunts; static list is fallback only
-    "pair_hunter_top_n": _get_int("PAIR_HUNTER_TOP_N", 5),  # Number of top pairs to hunt
+    "pair_hunter_top_n": _get_int("PAIR_HUNTER_TOP_N", 10),  # Number of top pairs to hunt
     "pair_hunter_refresh_interval": _get_int("PAIR_HUNTER_REFRESH_INTERVAL", 5),  # Refresh hunt every N loops
     # Middle-ground hunter band: enough move for ROI targets, not meme chaos.
     "pair_hunter_min_volatility": _get_float("PAIR_HUNTER_MIN_VOLATILITY", 0.7),  # Minimum ATR% (too quiet = skip)
@@ -291,7 +291,7 @@ CONFIG = {
     "pair_hunter_weight_volatility": _get_float("PAIR_HUNTER_WEIGHT_VOLATILITY", 0.25),
     "pair_hunter_weight_trend": _get_float("PAIR_HUNTER_WEIGHT_TREND", 0.40),
     "pair_hunter_weight_setup": _get_float("PAIR_HUNTER_WEIGHT_SETUP", 0.35),
-    "pair_hunter_max_analyze_assets": _get_int("PAIR_HUNTER_MAX_ANALYZE_ASSETS", 8),  # Cap on assets passed to LLM per cycle
+    "pair_hunter_max_analyze_assets": _get_int("PAIR_HUNTER_MAX_ANALYZE_ASSETS", 10),  # Cap on assets scanned per cycle
     "pair_hunter_perf_min_trades": _get_int("PAIR_HUNTER_PERF_MIN_TRADES", 3),  # Minimum completed trades before using performance score
     "pair_hunter_perf_filter_min_trades": _get_int("PAIR_HUNTER_PERF_FILTER_MIN_TRADES", 3),  # Minimum completed trades before filtering weak pairs
     "pair_hunter_perf_filter_min_win_rate": _get_float("PAIR_HUNTER_PERF_FILTER_MIN_WIN_RATE", 25.0),  # Legacy; filter now keys off expectancy

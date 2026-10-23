@@ -2,14 +2,12 @@
 
 Three playbooks share the same OKX candle stack:
 
-* ``session_impulse`` — BTC/ETH trend pullback when 15m ADX and EMAs agree. No clock window.
-* ``range_mr`` — low 15m ADX chop: fade Bollinger tags only at RSI extremes, target 1.5R.
-* ``breakout_retest`` — level break + retest; target 1.5R from ATR-floored stop.
+* ``session_impulse`` — trend pullback when 15m ADX and EMAs agree (structure ~2R).
+* ``range_mr`` — optional chop fade (off by default; fee-hostile).
+* ``breakout_retest`` — level break + retest; structure ~2R from ATR-floored stop.
 
 Universe: live Pair Hunter (middle ATR band) with static allowlist fallback.
-Spread/ATR gates always apply.
-Exits: ATR-floored SL; impulse/range use the dashboard TP/SL book (skip if
-structure risk $ > book TP $ so losers cannot dwarf winners); breakout uses 1.5R.
+Exits: ATR geometry (structure_rr) so targets clear fees — not $2 ROI pins.
 
 Everything here is pure computation. Order placement lives in main.py.
 """
@@ -36,20 +34,27 @@ DEFAULTS: Dict[str, Any] = {
     "mech_cycle_seconds": 60,
     "mech_max_positions": 3,
     "mech_leverage": 10,
-    "mech_margin_usd": 40.0,
-    "mech_take_profit_usd": 2.0,
-    "mech_stop_loss_usd": 2.0,
+    "mech_margin_usd": 60.0,
+    "mech_take_profit_usd": 8.0,
+    "mech_stop_loss_usd": 4.0,
     "mech_tp_mode": "roi_percent",
-    "mech_take_profit_percent": 5.0,
-    "mech_stop_loss_percent": 5.0,
-    "mech_adx_min": 20.0,
+    "mech_take_profit_percent": 15.0,
+    "mech_stop_loss_percent": 7.5,
+    # Regime: trade trends; sit out weak ADX chop.
+    "mech_adx_min": 25.0,
     "mech_adx_range_max": 18.0,
-    "mech_ema_min_separation_pct": 0.05,
-    # Middle-ground ATR band (15m %): enough move for ROI targets, not meme chaos.
-    "mech_atr_min_pct": 0.45,
-    "mech_atr_max_pct": 2.5,
-    "mech_atr_stop_mult": 1.5,
-    "mech_breakout_rr": 1.5,
+    "mech_enable_range_mr": False,
+    "mech_ema_min_separation_pct": 0.08,
+    # Middle-ground ATR band (15m %): move must clear fees; not meme chaos.
+    "mech_atr_min_pct": 0.55,
+    "mech_atr_max_pct": 3.0,
+    "mech_atr_stop_mult": 2.0,
+    "mech_impulse_rr": 2.0,
+    "mech_breakout_rr": 2.0,
+    "mech_range_rr": 2.0,
+    # Expected reward must clear k × round-trip taker fees on notional.
+    "mech_min_reward_fee_mult": 3.0,
+    "mech_taker_fee_rate": 0.0005,
     "mech_rsi_max_long": 72.0,
     "mech_rsi_min_short": 28.0,
     "mech_rvol_full": 1.0,
@@ -57,7 +62,6 @@ DEFAULTS: Dict[str, Any] = {
     "mech_funding_max": 0.001,
     "mech_oi_rising_pct": 2.0,
     "mech_oi_window_minutes": 30,
-    # Global weekday gate (range + breakout). Impulse adds London/NY below.
     "mech_session_start_utc": 0,
     "mech_session_end_utc": 24,
     "mech_trade_weekends": True,
@@ -66,26 +70,24 @@ DEFAULTS: Dict[str, Any] = {
     "mech_ny_start_utc": 13.0,
     "mech_ny_end_utc": 17.0,
     "mech_universe": "BTC ETH SOL XRP BNB DOGE ADA LINK AVAX DOT LTC NEAR",
-    "mech_impulse_universe": "BTC ETH",
-    # When set (by the live pair hunter), this replaces the static allowlist for the cycle.
+    "mech_impulse_universe": "BTC ETH SOL",
     "mech_active_universe": "",
     "mech_use_pair_hunter": True,
     "mech_stop_buffer_pct": 0.05,
-    "mech_min_stop_pct": 0.15,
-    "mech_max_stop_pct": 2.0,
+    "mech_min_stop_pct": 0.25,
+    "mech_max_stop_pct": 3.5,
     "mech_max_spread_frac_of_stop": 0.35,
     "mech_entry_ttl_candles": 2,
     "mech_pullback_lookback": 5,
     "mech_breakout_lookback": 20,
-    "mech_win_cooldown_minutes": 20,
-    "mech_loss_cooldown_minutes": 45,
+    "mech_win_cooldown_minutes": 30,
+    "mech_loss_cooldown_minutes": 60,
     "mech_pair_refresh_minutes": 10,
     "mech_min_size_risk_tolerance": 1.25,
-    # Bank sooner: lower TP + giveback after a small green peak + 8h hard flat.
-    "mech_max_hold_hours": 8.0,
-    "mech_giveback_arm_pct": 2.0,
-    "mech_giveback_pct": 2.5,
-    "max_daily_loss_usd": 15.0,
+    "mech_max_hold_hours": 12.0,
+    "mech_giveback_arm_pct": 3.0,
+    "mech_giveback_pct": 35.0,
+    "max_daily_loss_usd": 25.0,
 }
 
 
@@ -733,8 +735,9 @@ def _try_session_impulse(
     metrics["regime"] = "long" if side == "buy" else "short"
     return _finalize_geometry(
         asset, side, confirm_close, structure_stop, atr5, cfg, metrics,
-        setup="session_impulse", exit_style="book", size_factor=size_factor,
-        signal_ts=signal_ts, confirm_ts=confirm_ts, rr=1.0,
+        setup="session_impulse", exit_style="structure_rr", size_factor=size_factor,
+        signal_ts=signal_ts, confirm_ts=confirm_ts,
+        rr=float(cfg.get("mech_impulse_rr") or 2.0),
     )
 
 
@@ -823,8 +826,9 @@ def _try_range_mr(
     metrics["regime"] = "range_long" if side == "buy" else "range_short"
     return _finalize_geometry(
         asset, side, confirm_close, structure_stop, atr5, cfg, metrics,
-        setup="range_mr", exit_style="book", size_factor=size_factor,
-        signal_ts=signal_ts, confirm_ts=confirm_ts, rr=1.5,
+        setup="range_mr", exit_style="structure_rr", size_factor=size_factor,
+        signal_ts=signal_ts, confirm_ts=confirm_ts,
+        rr=float(cfg.get("mech_range_rr") or 2.0),
     )
 
 
@@ -1006,13 +1010,16 @@ def evaluate(
                 return res
             skips.append(res.reason)
 
-    res = _try_range_mr(
-        asset, o5=o5, h5=h5, l5=l5, x5=x5, v5=v5, bands=bands, atr5=atr5,
-        adx_val=adx_val, cfg=cfg, metrics=dict(metrics), last_signal_ts=last_signal_ts, ts5=ts5,
-    )
-    if isinstance(res, ScalpSignal):
-        return res
-    skips.append(res.reason)
+    if cfg.get("mech_enable_range_mr", False):
+        res = _try_range_mr(
+            asset, o5=o5, h5=h5, l5=l5, x5=x5, v5=v5, bands=bands, atr5=atr5,
+            adx_val=adx_val, cfg=cfg, metrics=dict(metrics), last_signal_ts=last_signal_ts, ts5=ts5,
+        )
+        if isinstance(res, ScalpSignal):
+            return res
+        skips.append(res.reason)
+    else:
+        skips.append("range_mr: disabled")
 
     res = _try_breakout_retest(
         asset, o5=o5, h5=h5, l5=l5, x5=x5, v5=v5, atr5=atr5,
@@ -1091,12 +1098,19 @@ def size_position(
         if margin > max(float(available_balance or 0.0), 0.0) * 0.9:
             return ScalpSkip(signal.asset, f"margin ${margin:.2f} exceeds 90% of available ${available_balance:.2f}")
 
-        # Breakout keeps ATR/structure geometry (1.5R already on the signal).
+        # Structure R:R keeps ATR geometry (impulse / range / breakout).
         if getattr(signal, "exit_style", "book") == "structure_rr":
             dist = abs(entry - float(signal.stop_price))
             risk = coin_qty * dist
             reward = coin_qty * abs(float(signal.target_price) - entry)
             signal.stop_distance_pct = dist / entry * 100.0 if entry else 0.0
+            fee_rt = notional * 2.0 * float(cfg.get("mech_taker_fee_rate") or 0.0005)
+            min_mult = float(cfg.get("mech_min_reward_fee_mult") or 3.0)
+            if fee_rt > 0 and reward < fee_rt * min_mult:
+                return ScalpSkip(
+                    signal.asset,
+                    f"reward ${reward:.2f} < {min_mult:.0f}× fees ${fee_rt:.2f}",
+                )
             return SizedOrder(
                 contracts=contracts,
                 coin_qty=coin_qty,
