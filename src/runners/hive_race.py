@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 import urllib.error
@@ -110,6 +111,100 @@ def _f(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _wma_series(values: List[float], length: int) -> List[float]:
+    n = len(values)
+    out = [float("nan")] * n
+    if length <= 0 or n < length:
+        return out
+    weights = list(range(1, length + 1))
+    wsum = float(sum(weights))
+    for i in range(length - 1, n):
+        window = values[i - length + 1 : i + 1]
+        out[i] = sum(a * b for a, b in zip(window, weights)) / wsum
+    return out
+
+
+def _hma_series(values: List[float], length: int) -> List[float]:
+    """TradingView ta.hma / hma()."""
+    half = max(1, length // 2)
+    sqrt_l = max(1, int(round(math.sqrt(length))))
+    wma_half = _wma_series(values, half)
+    wma_full = _wma_series(values, length)
+    raw: List[float] = []
+    for i in range(len(values)):
+        a, b = wma_half[i], wma_full[i]
+        if a != a or b != b:  # NaN
+            raw.append(float("nan"))
+        else:
+            raw.append(2.0 * a - b)
+    return _wma_series(raw, sqrt_l)
+
+
+def _donchian_mid(highs: List[float], lows: List[float], length: int) -> Optional[float]:
+    if len(highs) < length or len(lows) < length:
+        return None
+    return (max(highs[-length:]) + min(lows[-length:])) / 2.0
+
+
+def _ichi_hull_signal(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    daily_opens: List[float],
+    *,
+    hull_period: int = 14,
+) -> Optional[str]:
+    """Pine: HMA rise + daily open rise + price>hma2 + cloud + Hull-MACD.
+
+    Returns 'long' / 'short' only when the *full* condition set is true (as-is).
+    """
+    need = max(hull_period + 5, 52 + 5, 26 + 9 + 5)
+    if len(opens) < need or len(daily_opens) < 2:
+        return None
+    # Source = open (Pine defval=open)
+    price = opens
+    hma = _hma_series(price, hull_period)
+    if len(hma) < 2:
+        return None
+    hma1, hma2 = hma[-1], hma[-2]
+    if hma1 != hma1 or hma2 != hma2:
+        return None
+    px = price[-1]
+    d1, d2 = daily_opens[-1], daily_opens[-2]
+
+    conversion = _donchian_mid(highs, lows, 9)
+    base = _donchian_mid(highs, lows, 26)
+    lead2 = _donchian_mid(highs, lows, 52)
+    if conversion is None or base is None or lead2 is None:
+        return None
+    lead1 = (conversion + base) / 2.0
+
+    # Hull-MACD: hma(12)-hma(26), signal = hma(macd, 9)
+    hma_fast = _hma_series(price, 12)
+    hma_slow = _hma_series(price, 26)
+    macd_line: List[float] = []
+    for i in range(len(price)):
+        f, s = hma_fast[i], hma_slow[i]
+        if f != f or s != s:
+            macd_line.append(float("nan"))
+        else:
+            macd_line.append(f - s)
+    # Replace leading NaNs with 0 so WMA can warm up on valid tail
+    clean = [0.0 if x != x else x for x in macd_line]
+    amacd = _hma_series(clean, 9)
+    macd_v, amacd_v = macd_line[-1], amacd[-1]
+    if macd_v != macd_v or amacd_v != amacd_v:
+        return None
+
+    long_ok = hma1 > hma2 and d1 > d2 and px > hma2 and lead1 > lead2 and macd_v > amacd_v
+    short_ok = hma1 < hma2 and d1 < d2 and px < hma2 and lead1 < lead2 and macd_v < amacd_v
+    if long_ok:
+        return "long"
+    if short_ok:
+        return "short"
+    return None
 
 
 def _super_scalper_signal(
@@ -286,6 +381,10 @@ def build_coins() -> List[Coin]:
         atr15 = _atr_pct(highs, lows, closes)
         atr1h = atr15 * 2 if atr15 is not None else None
         ss_side, ss_score = _super_scalper_signal(opens, highs, lows, closes, atr15)
+        daily_done = daily[:-1] if len(daily) >= 3 else daily
+        daily_opens = [_f(c[1]) for c in daily_done] if daily_done else []
+        # OKX daily candles are newest-last after reverse; need chronological opens.
+        ichi_side = _ichi_hull_signal(opens, highs, lows, daily_opens)
         oi_chg = 0.0
         try:
             oi_rows = _public("/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
@@ -322,6 +421,7 @@ def build_coins() -> List[Coin]:
                 atr15_pct=atr15,
                 ss_side=ss_side,
                 ss_score=ss_score,
+                ichi_side=ichi_side,
             )
         )
     return coins
