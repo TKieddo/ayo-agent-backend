@@ -1264,23 +1264,34 @@ def main():
             # OKX: full close-position (+ market fallback). Reject "success" if a stub remains.
             if hasattr(ex, "close_position_market"):
                 result = await ex.close_position_market(asset)
-                if result.get("already_flat"):
-                    add_event(f"✅ {asset} already flat ({reason})")
-                    for tr in active_trades[:]:
-                        if tr.get("asset") == asset:
-                            active_trades.remove(tr)
-                    return True
+                # One immediate retry — residues often clear on the second close-position.
                 if result.get("still_open"):
                     add_event(
-                        f"⚠️  {asset} still open after flatten ({reason}) — "
+                        f"🔁 {asset} stub after first flatten ({reason}) — "
+                        f"leftover={result.get('leftover_contracts')} contracts; retrying"
+                    )
+                    try:
+                        await asyncio.sleep(0.75)
+                    except Exception:
+                        pass
+                    result = await ex.close_position_market(asset)
+                if result.get("already_flat") or not result.get("still_open"):
+                    if result.get("already_flat"):
+                        add_event(f"✅ {asset} already flat ({reason})")
+                    else:
+                        close_action = "sell" if result.get("closed_side") != "short" else "buy"
+                        add_event(
+                            f"✅ Closed {asset} ({reason}) via {close_action} reduce-only | "
+                            f"contracts={result.get('closed_contracts')}"
+                        )
+                else:
+                    add_event(
+                        f"⚠️  {asset} still open after flatten retry ({reason}) — "
                         f"leftover={result.get('leftover_contracts')} contracts"
                     )
+                    # Force dust path next watcher tick (clear cooldown).
+                    _DUST_SWEEP_UNTIL.pop(asset, None)
                     return False
-                close_action = "sell" if result.get("closed_side") != "short" else "buy"
-                add_event(
-                    f"✅ Closed {asset} ({reason}) via {close_action} reduce-only | "
-                    f"contracts={result.get('closed_contracts')}"
-                )
             else:
                 if size <= 0:
                     add_event(f"⚠️  Skip close for {asset}: zero size ({reason})")
@@ -1297,9 +1308,25 @@ def main():
             except Exception as e:
                 add_event(f"⚠️  Could not cancel open orders for {asset} (post-close {reason}): {e}")
 
+            # Verify flat — catch exchange lag / partial algo fills before we claim success.
+            try:
+                if hasattr(ex, "get_swap_position"):
+                    still = await ex.get_swap_position(asset)
+                    if still and float(still.get("contracts") or 0) > 0:
+                        add_event(
+                            f"⚠️  {asset} verify-flat failed after close ({reason}) — "
+                            f"{still.get('contracts')} contracts left; queuing dust sweep"
+                        )
+                        _DUST_SWEEP_UNTIL.pop(asset, None)
+                        return False
+            except Exception as e:
+                logging.debug("post-close verify %s: %s", asset, e)
+
             for tr in active_trades[:]:
                 if tr.get("asset") == asset:
                     active_trades.remove(tr)
+            _MECH_STATE.get("open_trades", {}).pop(asset, None)
+            _MECH_STATE.get("managed_assets", set()).discard(asset)
 
             exit_px = current_price
             if exit_px is None:
@@ -5809,6 +5836,23 @@ def main():
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+    async def handle_hive_race_reset(request):
+        """Flatten hive demo books and restart each runner at $300 for a clean scoreboard."""
+        try:
+            body = {}
+            if request.can_read_body:
+                try:
+                    body = await request.json()
+                except Exception:
+                    body = {}
+            flatten = str((body or {}).get("flatten", True)).lower() not in ("0", "false", "no", "off")
+            from src.runners.hive_race import reset_race
+            result = await reset_race(flatten=flatten)
+            return web.json_response(result, dumps=lambda o: json.dumps(o, default=json_default))
+        except Exception as e:
+            logging.error("hive race reset failed: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
     async def handle_status(request):
         """Return API status and basic account info."""
         try:
@@ -6948,6 +6992,7 @@ def main():
         app.router.add_get('/api/trades', handle_trades)  # Add trades endpoint
         app.router.add_get('/api/mechanical', handle_mechanical)  # Mechanical scalp book status
         app.router.add_get('/api/hive-race', handle_hive_race)
+        app.router.add_post('/api/hive-race/reset', handle_hive_race_reset)
         app.router.add_post('/api/test', handle_status)  # Alias for compatibility
         app.router.add_post('/api/alert/signal', handle_alert_signal)
         app.router.add_post('/api/position-protection', handle_position_protection)

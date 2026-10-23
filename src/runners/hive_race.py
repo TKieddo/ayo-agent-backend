@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 _STATE: Dict[str, Any] = {
     "started_at": None,
+    "race_epoch": None,  # ISO — board/equity only count closes at/after this
     "runners": {},
     "updated_at": None,
     "market_coins": 0,
@@ -983,7 +984,12 @@ def _load() -> None:
     try:
         saved = json.loads(path.read_text())
         _STATE["started_at"] = saved.get("started_at")
+        _STATE["race_epoch"] = saved.get("race_epoch") or saved.get("started_at")
         _STATE["runners"] = _migrate_runner_ids(saved.get("runners") or {})
+        for rid, raw in list(_STATE["runners"].items()):
+            if isinstance(raw, dict) and raw.get("trades"):
+                raw["trades"] = _trades_in_epoch(list(raw.get("trades") or []))
+                _STATE["runners"][rid] = raw
     except Exception as exc:
         logger.warning("hive race state unreadable: %s", exc)
 
@@ -992,7 +998,9 @@ def _save() -> None:
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps({k: _STATE[k] for k in ("started_at", "runners")}, default=str))
+    tmp.write_text(
+        json.dumps({k: _STATE[k] for k in ("started_at", "race_epoch", "runners")}, default=str)
+    )
     tmp.replace(path)
 
 
@@ -1131,6 +1139,24 @@ def _trade_key(t: dict) -> tuple:
     return (str(t.get("at") or ""), str(t.get("coin") or ""), round(float(t.get("pnl") or 0), 4))
 
 
+def _epoch_iso() -> Optional[str]:
+    ep = _STATE.get("race_epoch") or _STATE.get("started_at")
+    return str(ep) if ep else None
+
+
+def _trades_in_epoch(trades: List[dict]) -> List[dict]:
+    """Keep closes at/after race_epoch so a reset is not undone by Supabase hydrate."""
+    ep = _epoch_iso()
+    if not ep:
+        return list(trades)
+    out = []
+    for t in trades:
+        at = str(t.get("at") or "")
+        if at and at >= ep:
+            out.append(t)
+    return out
+
+
 def _hydrate_from_supabase() -> None:
     """Merge durable Supabase hive closes into in-memory/file state after Coolify wipes."""
     earliest: Optional[str] = None
@@ -1139,10 +1165,11 @@ def _hydrate_from_supabase() -> None:
         # Legacy id from the short-lived Mayhem Inv A/B slot.
         if runner == "oppo_mayhem":
             db_trades = db_trades + _fetch_runner_trades("mayhem_inv")
+        db_trades = _trades_in_epoch(db_trades)
         if not db_trades:
             continue
         raw = dict(_STATE["runners"].get(runner) or {})
-        file_trades = list(raw.get("trades") or [])
+        file_trades = _trades_in_epoch(list(raw.get("trades") or []))
         by_key = {_trade_key(t): t for t in file_trades}
         for t in db_trades:
             by_key.setdefault(_trade_key(t), t)
@@ -1169,12 +1196,76 @@ def _hydrate_from_supabase() -> None:
             at = str(t.get("at") or "")
             if at and (earliest is None or at < earliest):
                 earliest = at
+    # Do not pull started_at before race_epoch — that undoes a deliberate reset.
+    if _STATE.get("race_epoch"):
+        return
     if earliest and _STATE.get("started_at"):
         # Keep the older race start if we rebuilt history that predates this container boot.
         if earliest < str(_STATE["started_at"]):
             _STATE["started_at"] = earliest
     elif earliest and not _STATE.get("started_at"):
         _STATE["started_at"] = earliest
+
+
+async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
+    """Flatten hive demo books and restart the $300 race ledger (clean scoreboard).
+
+    Does not wipe Supabase trade history — race_epoch filters the board to this race only.
+    AYO practice row is left alone (separate OKX key).
+    """
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    flat_report: Dict[str, Any] = {}
+    async with _LOCK:
+        if flatten:
+            for runner, client in list(_CLIENTS.items()):
+                closed = []
+                errors = []
+                try:
+                    state = await client.get_user_state()
+                    for p in state.get("positions") or []:
+                        coin = str(p.get("coin") or p.get("symbol") or "").upper()
+                        coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "")
+                        qty = abs(float(p.get("quantity") or p.get("szi") or 0))
+                        if not coin or qty <= 0:
+                            continue
+                        try:
+                            if hasattr(client, "close_position_market"):
+                                await client.close_position_market(coin)
+                            else:
+                                side = "long" if float(p.get("quantity") or p.get("szi") or 0) > 0 else "short"
+                                if side == "long":
+                                    await client.place_sell_order(coin, qty, leverage=LEVERAGE, reduce_only=True)
+                                else:
+                                    await client.place_buy_order(coin, qty, leverage=LEVERAGE, reduce_only=True)
+                            closed.append(coin)
+                        except Exception as exc:
+                            errors.append(f"{coin}: {exc}")
+                except Exception as exc:
+                    errors.append(str(exc))
+                flat_report[runner] = {"closed": closed, "errors": errors}
+
+        _STATE["race_epoch"] = now_iso
+        _STATE["started_at"] = now_iso
+        _STATE["last_error"] = None
+        for runner in RUNNERS:
+            prev = _STATE["runners"].get(runner) or {}
+            configured = bool(prev.get("configured") or runner in _CLIENTS)
+            err = None if configured else (prev.get("error") or "API key not set")
+            book = Book()
+            _STATE["runners"][runner] = {
+                **_book_to(book, [], configured, err),
+                "mtm": START_EQUITY,
+                "day_key": time.strftime("%Y-%m-%d", time.gmtime()),
+            }
+        _save()
+    logger.info("hive race reset epoch=%s flatten=%s", now_iso, flatten)
+    return {
+        "ok": True,
+        "race_epoch": now_iso,
+        "start_equity": START_EQUITY,
+        "flatten": flat_report,
+        "runners": list(RUNNERS),
+    }
 
 
 async def _order(
@@ -1609,6 +1700,7 @@ def snapshot() -> dict:
         "ok": True,
         "enabled": _enabled(),
         "started_at": _STATE.get("started_at"),
+        "race_epoch": _STATE.get("race_epoch"),
         "updated_at": _STATE.get("updated_at"),
         "market_coins": _STATE.get("market_coins") or 0,
         "last_error": _STATE.get("last_error"),
