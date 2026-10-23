@@ -96,10 +96,21 @@ def _ret_pct(closes: Sequence[float], bars_back: int) -> Optional[float]:
 
 
 def _vol_z(volumes: Sequence[float], lookback: int = _VOL_Z_LOOKBACK) -> Optional[float]:
-    if not volumes or len(volumes) < lookback + 1:
-        return None
-    window = [float(v or 0) for v in volumes[-(lookback + 1) : -1]]
-    cur = float(volumes[-1] or 0)
+    """Z-score of the last *completed* 15m bar vs prior lookback.
+
+    Using the live/forming bar made vol_z almost always negative (partial volume),
+    so Orakelia never entered during RTH.
+    """
+    # Need: lookback history + 1 completed + 1 forming (optional).
+    if not volumes or len(volumes) < lookback + 2:
+        if not volumes or len(volumes) < lookback + 1:
+            return None
+        # Fallback when feed is short: use last bar as completed.
+        cur = float(volumes[-1] or 0)
+        window = [float(v or 0) for v in volumes[-(lookback + 1) : -1]]
+    else:
+        cur = float(volumes[-2] or 0)  # last closed bar
+        window = [float(v or 0) for v in volumes[-(lookback + 2) : -2]]
     if not window:
         return None
     mean = sum(window) / len(window)
@@ -173,8 +184,12 @@ def momentum_from_bars(
 
 
 def should_momentum_fade(snap: MomentumSnapshot) -> bool:
-    """Orakelia exit: 1h turns down or volume z-score goes cold."""
-    return snap.ret1h < 0 or snap.vol_z < 0
+    """Orakelia-style exit for stocks: 1h turns down.
+
+    Do not fade on vol_z alone — equity 15m volume z-scores flip cold constantly
+    and were scratching winners the same bar they opened.
+    """
+    return snap.ret1h < 0
 
 
 @dataclass
@@ -290,11 +305,12 @@ def evaluate(
         }
     )
 
-    # Long-only Orakelia: green day + elevated volume.
+    # Long-only Orakelia: green day + volume not cold (completed-bar z).
+    # Soft floor (-0.25) — strict >0 never fired on IEX 15m during RTH.
     if snap.ret24h <= 0:
         return StockSkip(symbol, f"ret24h {snap.ret24h:.2f}% <= 0", metrics)
-    if snap.vol_z <= 0:
-        return StockSkip(symbol, f"vol_z {snap.vol_z:.2f} <= 0", metrics)
+    if snap.vol_z < -0.25:
+        return StockSkip(symbol, f"vol_z {snap.vol_z:.2f} cold", metrics)
     if cfg.get("require_htf_above_ema") and not snap.htf_above_ema:
         return StockSkip(symbol, "HTF below EMA20", metrics)
 

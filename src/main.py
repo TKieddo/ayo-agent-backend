@@ -5866,6 +5866,17 @@ def main():
                     "last_cycle_at": _STOCK_STATE.get("last_cycle_at"),
                     "active_set": list(_STOCK_STATE.get("active_set") or [])[:8],
                     "open_count": len(_STOCK_STATE.get("managed_assets") or []),
+                    "open_symbols": sorted(_STOCK_STATE.get("managed_assets") or []),
+                    "open_trades": {
+                        sym: {
+                            "side": (rec or {}).get("side"),
+                            "entry": (rec or {}).get("entry"),
+                            "qty": (rec or {}).get("qty"),
+                            "setup": (rec or {}).get("setup"),
+                            "opened_at": (rec or {}).get("opened_at"),
+                        }
+                        for sym, rec in (_STOCK_STATE.get("open_trades") or {}).items()
+                    },
                     "skips": stock_skips,
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat()
