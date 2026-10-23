@@ -648,6 +648,17 @@ def _demo_swap_ids() -> set:
 # Strategy rules (SS / Ichimoku / UT / MZ) are unchanged; only which names we load.
 HIVE_SCAN_POOL = 40  # richest by 24h volume after liquidity floor
 HIVE_KEEP = 20  # best metric score kept for the race tick
+# Equity / metal / FX-style swaps: SS trail math + ticker mid often diverge from
+# position mark (seen as TSLA entry ~199 vs mid ~378 → phantom 8% stops).
+HIVE_BLOCKLIST = frozenset(
+    {
+        "TSLA", "AAPL", "AMZN", "MSFT", "NVDA", "META", "GOOG", "GOOGL", "COIN",
+        "MSTR", "HOOD", "AMD", "INTC", "BABA", "TSM", "PLTR", "MU", "SMCI",
+        "XAU", "XAG", "XPT", "XPD", "WTI", "BTCDOM",
+    }
+)
+# If hive mid vs position entry diverges beyond this, prefer exchange mark / skip stop.
+HIVE_MID_SANITY_PCT = 20.0
 
 
 def _hive_pair_score(
@@ -724,6 +735,8 @@ def build_coins() -> List[Coin]:
     scored: List[Tuple[float, Coin]] = []
     for vol_usd, inst, row, last, spread_bp, ret24 in ranked[:HIVE_SCAN_POOL]:
         coin = inst.replace("-USDT-SWAP", "")
+        if coin.upper() in HIVE_BLOCKLIST:
+            continue
         try:
             m15 = _candles(inst, "15m", 160)
             daily = _candles(inst, "1Dutc", 8)
@@ -1327,11 +1340,24 @@ def _find_pos(book: Book, coin: Optional[str]) -> Optional[Pos]:
     return None
 
 
+def _sane_mark(entry: float, candidate: float, fallback: float = 0.0) -> float:
+    """Reject hive ticker mids that diverged wildly from the live entry/mark."""
+    if entry > 0 and candidate > 0:
+        if abs(candidate - entry) / entry * 100.0 <= HIVE_MID_SANITY_PCT:
+            return candidate
+    return fallback if fallback > 0 else (entry if entry > 0 else candidate)
+
+
 async def _reconcile_okx(
-    book: Book, client: Any, coins: List[Coin], now: float
+    book: Book,
+    client: Any,
+    coins: List[Coin],
+    now: float,
+    *,
+    runner: str = "",
 ) -> Tuple[Dict[str, float], float]:
     """Overwrite book.positions from live OKX opens; return per-coin UPL and total."""
-    from src.runners.rules import mark as ratchet_stop
+    from src.runners.rules import FLIP_RUNNERS, mark as ratchet_stop
 
     state = await client.get_user_state()
     by_coin = {c.coin: c for c in coins}
@@ -1366,8 +1392,14 @@ async def _reconcile_okx(
             opened_at = old.opened_at
             added = old.added or notional > ENTRY_NOTIONAL * 1.15
             risk = old.risk_usd
+            # Repair inverted stops left by accidental trail on flip books.
+            if entry > 0:
+                if side == "long" and stop >= entry:
+                    stop = stop_price("long", entry, stop_pct(quote, runner=runner) or 8.0)
+                elif side == "short" and stop <= entry:
+                    stop = stop_price("short", entry, stop_pct(quote, runner=runner) or 8.0)
         else:
-            pct = stop_pct(quote) if quote else None
+            pct = stop_pct(quote, runner=runner) if quote else None
             stop = stop_price(side, entry, pct or 8.0) if entry else entry
             peak = mark_px or entry
             opened_at = now
@@ -1385,8 +1417,14 @@ async def _reconcile_okx(
             added=added,
             risk_usd=risk,
         )
-        if quote:
+        # Pine flip books: disaster stop only — never ATR trail / profit-lock ratchet.
+        if quote and runner not in FLIP_RUNNERS:
             ratchet_stop(row, quote)
+        elif mark_px > 0:
+            if side == "long" and mark_px > row.peak_px:
+                row.peak_px = mark_px
+            elif side == "short" and mark_px < row.peak_px:
+                row.peak_px = mark_px
         positions.append(row)
 
     positions.sort(key=lambda r: r.notional, reverse=True)
@@ -1404,7 +1442,10 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         if not pos:
             return
         coin = by_coin.get(pos.coin)
-        mid = coin.mid if coin else pos.entry_px
+        # Prefer exchange mark already on the pos peak / live UPL path — never
+        # book PnL off a ticker mid that disagrees with entry (TSLA 199 vs 378).
+        raw_mid = coin.mid if coin else pos.peak_px
+        mid = _sane_mark(pos.entry_px, float(raw_mid or 0), fallback=float(pos.peak_px or pos.entry_px))
         qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
         pnl = upl(pos, mid)
         fee = fee_usd(pos.notional)
@@ -1612,7 +1653,9 @@ async def _tick(decide: bool = True) -> None:
                 if not coins:
                     coins = await asyncio.to_thread(build_coins)
                     _STATE["market_coins"] = len(coins)
-                upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)
+                upl_by_coin, live_upl = await _reconcile_okx(
+                    book, client, coins, now, runner=runner
+                )
                 if decide:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
@@ -1620,11 +1663,21 @@ async def _tick(decide: bool = True) -> None:
                     # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward MZ / Orakelia.
                     _OPPO_PAIR_Q.clear()
                     _PEAK_PAIR_Q.clear()
+                    # Patch coin.mid when ticker mid is insane vs live entry (TSLA case).
+                    by_coin = {c.coin: c for c in coins}
+                    for pos in book.positions:
+                        c = by_coin.get(pos.coin)
+                        if not c or pos.entry_px <= 0 or c.mid <= 0:
+                            continue
+                        if abs(c.mid - pos.entry_px) / pos.entry_px * 100.0 > HIVE_MID_SANITY_PCT:
+                            c.mid = float(pos.peak_px or pos.entry_px)
                     actions.extend(decide_actions(runner, book, coins, now))
                     for action in _dedupe_actions(actions):
                         await _act(runner, client, book, coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.
-                    upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)
+                    upl_by_coin, live_upl = await _reconcile_okx(
+                        book, client, coins, now, runner=runner
+                    )
                 # All crypto runners stay live — clear any stale retire / loss_stop caps.
                 if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
                     book.cap = None
