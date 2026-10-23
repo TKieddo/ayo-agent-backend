@@ -33,19 +33,25 @@ RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo Mayhem: 1:1 opposite *entries*; bank ~1R / giveback — no clock exit.
-# PeakSting: idle (no Mayhem sync) — slot reserved for a future solo strategy.
-OPPO_FADE_R = 1.0          # full take-profit once UPL >= 1R
-OPPO_GIVEBACK_ARM_R = 0.5  # arm giveback after peak UPL hits 0.5R
-OPPO_GIVEBACK_KEEP = 0.4   # close if open UPL falls below 40% of peak
-OPPO_TIME_STOP_S = 0       # disabled — crypto 24/7, no position time stops
+# Oppo: idle (Mayhem no longer mirrored). Peak + Mayhem: Super Scalper 15m.
+OPPO_FADE_R = 1.0
+OPPO_GIVEBACK_ARM_R = 0.5
+OPPO_GIVEBACK_KEEP = 0.4
+OPPO_TIME_STOP_S = 0
+# Super Scalper (cleaned Pine): ATR band fade + dual RSI + 2×ATR stop / 5R TP.
+SS_RUNNERS = frozenset({"mayhem", "peaksting"})
+SS_BAND_MULT = 1.0
+SS_STOP_ATR = 2.0
+SS_TP_R = 5.0
+SS_RSI_FAST = 25
+SS_RSI_SLOW = 100
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
-    "mayhem": "Mayhem",
+    "mayhem": "Mayhem · Super Scalper",
     "windward": "Windward",
     "orakelia": "Orakelia",
-    "peaksting": "Peak · idle",
-    "oppo_mayhem": "Oppo Mayhem",
+    "peaksting": "Peak · Super Scalper",
+    "oppo_mayhem": "Oppo · idle",
     "ayo": "AYO",
 }
 
@@ -65,6 +71,10 @@ class Coin:
     funding_z: float
     vol_z: float
     high24h: float
+    # Super Scalper (15m completed bar)
+    atr15_pct: Optional[float] = None
+    ss_side: Optional[str] = None  # long | short
+    ss_score: float = 0.0
 
 
 @dataclass
@@ -111,10 +121,15 @@ class Action:
     reason: str = ""
 
 
-def stop_pct(coin: Coin) -> Optional[float]:
-    if coin.atr1h_pct is None or coin.atr1h_pct <= 0:
-        return None
-    pct = STOP_ATR * coin.atr1h_pct
+def stop_pct(coin: Coin, runner: str = "") -> Optional[float]:
+    if runner in SS_RUNNERS:
+        if coin.atr15_pct is None or coin.atr15_pct <= 0:
+            return None
+        pct = SS_STOP_ATR * coin.atr15_pct
+    else:
+        if coin.atr1h_pct is None or coin.atr1h_pct <= 0:
+            return None
+        pct = STOP_ATR * coin.atr1h_pct
     if pct > MAX_STOP_PCT or pct <= 0:
         return None
     return pct
@@ -139,8 +154,8 @@ def impulse(coin: Coin) -> Optional[str]:
     return None
 
 
-def _tradable(coin: Coin) -> bool:
-    return liquid(coin) and stop_pct(coin) is not None
+def _tradable(coin: Coin, runner: str = "") -> bool:
+    return liquid(coin) and stop_pct(coin, runner=runner) is not None
 
 
 def upl(pos: Pos, mid: float) -> float:
@@ -202,9 +217,10 @@ def stop_hit(pos: Pos, mid: float) -> bool:
     return mid >= pos.stop_px
 
 
-def _mayhem(coins: List[Coin]) -> List[Coin]:
-    rows = [c for c in coins if _tradable(c) and impulse(c)]
-    return sorted(rows, key=lambda c: (abs(c.ret1h), abs(c.ret24h)), reverse=True)
+def _super_scalper(coins: List[Coin]) -> List[Coin]:
+    """ATR-band fade + dual RSI on completed 15m (Pine Super Scalper, fixed exits)."""
+    rows = [c for c in coins if _tradable(c, "mayhem") and c.ss_side in ("long", "short")]
+    return sorted(rows, key=lambda c: float(c.ss_score or 0), reverse=True)
 
 
 def _windward(coins: List[Coin]) -> List[Coin]:
@@ -234,59 +250,28 @@ def _orakelia(coins: List[Coin], blacklist: Dict[str, bool]) -> List[Coin]:
     return rows
 
 
-def _off_high_pct(coin: Coin) -> float:
-    if coin.high24h <= 0:
-        return 0.0
-    return (coin.high24h - coin.mid) / coin.high24h * 100
-
-
-def _peaksting(coins: List[Coin]) -> List[Coin]:
-    rows = [
-        c
-        for c in coins
-        if _tradable(c) and c.ret24h >= 6 and c.vol_z >= 1.5 and c.ret1h < 0 and _off_high_pct(c) >= 1.5
-    ]
-    return sorted(rows, key=lambda c: c.ret24h, reverse=True)
-
-
-def _peakstinger(coins: List[Coin]) -> List[Coin]:
-    rows = []
-    for c in coins:
-        rsi = c.rsi14 if c.rsi14 is not None else 0
-        if not _tradable(c) or c.ret24h < 6 or rsi < 70 or c.ret1h >= 0 or c.vol_z >= 0:
-            continue
-        if c.oi_chg_1h > 0:
-            continue
-        rows.append(c)
-    return sorted(rows, key=lambda c: (c.rsi14 or 0, c.ret24h), reverse=True)
-
-
 def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
-    if runner == "mayhem":
-        return _mayhem(coins)
+    if runner in SS_RUNNERS:
+        return _super_scalper(coins)
     if runner == "oppo_mayhem":
-        # Entries only arrive via 1:1 Mayhem pair queue in hive_race.
-        return []
+        return []  # idle — no Mayhem pair, no solo entries
     if runner == "windward":
         return _windward(coins)
     if runner == "orakelia":
         return _orakelia(coins, book.blacklist)
-    if runner == "peaksting":
-        # Entries only via hard 1:1 Mayhem pair sync in hive_race.
-        return []
     return []
 
 
 def flip_side(side: str) -> str:
-    """Opposite of a long/short position side (Mayhem mirrors)."""
+    """Opposite of a long/short position side."""
     return "short" if side == "long" else "long"
 
 
 def _side_for(runner: str, coin: Coin) -> str:
+    if runner in SS_RUNNERS:
+        return coin.ss_side or "long"
     if runner == "orakelia":
         return "long"
-    if runner in ("oppo_mayhem", "peaksting"):
-        return flip_side(impulse(coin) or "long")
     return impulse(coin) or "long"
 
 
@@ -309,32 +294,22 @@ def _open_slots(book: Book) -> List[Pos]:
 
 
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
-    # Peak idle — no solo exits here; tick flattens leftovers via peak_idle closes.
-    if runner == "peaksting":
-        return None
+    if runner == "oppo_mayhem":
+        return None  # idle — flatten only via hive_race oppo_idle
     if stop_hit(pos, mid):
         return "stop"
-    # No position time stops (crypto 24/7 policy). TIME_STOP_S / OPPO_TIME_STOP_S are 0.
     hold_s = OPPO_TIME_STOP_S if runner == "oppo_mayhem" else TIME_STOP_S
     if hold_s > 0 and now - pos.opened_at >= hold_s:
         return "time_stop"
     if coin is None:
         return None
-    if runner == "mayhem":
-        if _against(pos, coin) or upl(pos, mid) < 0:
-            return "bail"
-    elif runner == "oppo_mayhem":
-        # Bank ~1R; if it ran 0.5R+ and gave most of it back, scratch — don't wait 12h.
+    if runner in SS_RUNNERS:
+        # Super Scalper: bank 5R (Pine intended TP); stop handles the rest.
         risk = float(pos.risk_usd or 0)
-        u = upl(pos, mid)
-        peak_u = upl(pos, pos.peak_px)
-        if risk > 0 and u >= OPPO_FADE_R * risk:
-            return "fade_target"
-        if risk > 0 and peak_u >= OPPO_GIVEBACK_ARM_R * risk:
-            floor = max(OPPO_GIVEBACK_KEEP * peak_u, 0.15 * risk)
-            if u < floor:
-                return "fade_giveback"
-    elif runner == "windward":
+        if risk > 0 and upl(pos, mid) >= SS_TP_R * risk:
+            return "ss_tp"
+        return None
+    if runner == "windward":
         if (coin.ret1h > 0) != (coin.ret24h > 0) and coin.ret1h != 0:
             return "trend_break"
     elif runner == "orakelia":
@@ -374,7 +349,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
     if closes:
         return closes
 
-    # Min-hold / missing quote: ride for now.
+    # Pyramid adds: Windward / Orakelia only — Super Scalper has no adds in the Pine.
     for pos in opens:
         if now - pos.opened_at < MIN_HOLD_S:
             continue
@@ -383,7 +358,8 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             continue
         mid = coin.mid
         if (
-            runner not in ("oppo_mayhem", "peaksting")  # mirrors: adds only via Mayhem pair
+            runner not in SS_RUNNERS
+            and runner != "oppo_mayhem"
             and not pos.added
             and upl(pos, mid) > 0
             and _run_atr(pos, coin) >= 1.5
@@ -392,9 +368,9 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
         ):
             return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")]
 
-    # Mayhem: free a slot for a stronger name when full (Oppo mirrors via pair queue).
-    if runner == "mayhem" and len(opens) >= MAX_OPENS:
-        ranked = _mayhem(coins)
+    # Super Scalper: rotate to a stronger band fade when full.
+    if runner in SS_RUNNERS and len(opens) >= MAX_OPENS:
+        ranked = _super_scalper(coins)
         held = {p.coin for p in opens}
         if ranked and ranked[0].coin not in held:
             worst = min(opens, key=lambda p: upl(p, by_coin[p.coin].mid if p.coin in by_coin else p.entry_px))
