@@ -2167,7 +2167,7 @@ def main():
             logging.warning(f"Stock trade insert failed for {symbol}: {e}")
 
     async def _stock_book_cycle(trading_settings: dict) -> None:
-        """Alpaca-only stock cycle: scanner → Orakelia momentum → ATR SL / 1.5R TP + fade."""
+        """Alpaca-only stock cycle: scanner → Sneaky Pivot → ATR/structure SL + 1.5R TP."""
         global _STOCK_SKIP_LOGGED
         alpaca = _alpaca_client()
         if not alpaca:
@@ -2264,26 +2264,30 @@ def main():
                     pnl=pnl,
                 )
 
-        # Orakelia momentum_fade — runs even when RTH is closed for new entries.
+        # Sneaky structure break — runs even when RTH is closed for new entries.
         faded: set = set()
         for sym, pos in list(open_map.items()):
             rec = _STOCK_STATE["open_trades"].get(sym) or {}
             is_long = str(rec.get("side") or "buy") == "buy"
-            # Orakelia book is long-only; still flatten shorts if any leftover.
             try:
                 bars_15 = await alpaca.get_stock_bars(sym, interval=str(cfg["interval"]), limit=120)
-                bars_1h = await alpaca.get_stock_bars(sym, interval=str(cfg["htf_interval"]), limit=80)
-                snap = stock_strat.momentum_from_bars(
-                    bars_15 or [], bars_1h or [], atr_period=int(cfg["atr_period"])
+                snap = stock_strat.sneaky_from_bars(
+                    bars_15 or [], atr_period=int(cfg["atr_period"]), now=now
                 )
-                if snap is None:
+                # Prefer stored sneaky_low from entry; fall back to live structure.
+                sneaky_low = _safe_float(rec.get("sneaky_low"), 0)
+                px = _safe_float(pos.get("current_price") or pos.get("markPrice"), 0)
+                if sneaky_low <= 0 and snap is not None:
+                    sneaky_low = float(snap.sneaky_low)
+                if sneaky_low <= 0 or px <= 0:
                     continue
-                if not stock_strat.should_momentum_fade(snap):
+                if is_long and px >= sneaky_low:
+                    continue
+                if (not is_long) and px <= sneaky_low:
                     continue
                 qty = abs(_safe_float(pos.get("quantity") or pos.get("szi") or rec.get("qty"), 0))
                 if qty <= 0:
                     continue
-                px = _safe_float(pos.get("current_price") or pos.get("markPrice") or snap.entry, 0)
                 entry = _safe_float(rec.get("entry") or pos.get("entry_price") or pos.get("entryPx"), 0)
                 pnl = 0.0
                 if entry > 0 and px > 0:
@@ -2297,7 +2301,7 @@ def main():
                 else:
                     await alpaca.place_buy_order(sym, qty, reduce_only=True)
                 add_event(
-                    f"📕 Stock momentum_fade {sym}: ret1h={snap.ret1h:.2f}% vol_z={snap.vol_z:.2f} "
+                    f"📕 Stock structure_break {sym}: px={px:.2f} < sneaky_low={sneaky_low:.2f} "
                     f"pnl≈${pnl:.2f}"
                 )
                 await _log_stock_trade(
@@ -2311,7 +2315,7 @@ def main():
                 _STOCK_STATE["open_trades"].pop(sym, None)
                 faded.add(sym)
             except Exception as e:
-                add_event(f"⚠️ Stock momentum_fade failed {sym}: {e}")
+                add_event(f"⚠️ Stock structure_break failed {sym}: {e}")
         for sym in faded:
             open_map.pop(sym, None)
 
@@ -2387,16 +2391,15 @@ def main():
             ordered = [s for s in preferred if s in fallback] + [s for s in fallback if s not in preferred]
             candidates = candidates + ordered[: max(0, 5 - len(candidates))]
 
-        # Rank by Orakelia strength (ret24h + vol) so the best name is tried first.
+        # Rank by Sneaky strength so the cleanest hold+break is tried first.
         ranked = []
         for sym in candidates:
             if sym in _STOCK_STATE["managed_assets"]:
                 continue
             try:
                 bars_15 = await alpaca.get_stock_bars(sym, interval=str(cfg["interval"]), limit=120)
-                bars_1h = await alpaca.get_stock_bars(sym, interval=str(cfg["htf_interval"]), limit=80)
                 result = stock_strat.evaluate(
-                    sym, bars_15 or [], bars_1h or [], settings=trading_settings, now=now
+                    sym, bars_15 or [], None, settings=trading_settings, now=now
                 )
                 if isinstance(result, stock_strat.StockSkip):
                     _STOCK_STATE["skips"][sym] = {
@@ -2406,13 +2409,13 @@ def main():
                     }
                     continue
                 strength = float((result.metrics or {}).get("strength") or 0.0)
-                ranked.append((strength, sym, result, bars_15, bars_1h))
+                ranked.append((strength, sym, result))
             except Exception as e:
                 _STOCK_STATE["skips"][sym] = {"reason": f"eval error: {e}", "at": now.isoformat()}
                 logging.error(f"Stock eval error {sym}: {e}", exc_info=True)
         ranked.sort(key=lambda row: row[0], reverse=True)
 
-        for strength, sym, sig, _b15, _b1h in ranked:
+        for strength, sym, sig in ranked:
             if len(open_map) + len([a for a in _STOCK_STATE["managed_assets"] if a not in open_map]) >= max_pos:
                 break
             if sym in _STOCK_STATE["managed_assets"] or sym in open_map:
@@ -2428,12 +2431,10 @@ def main():
                 if not still_open:
                     add_event(f"📊 Stocks session flipped to CLOSED ({sess2}) — aborting entries")
                     break
-                # Market entry + exchange-native SL/TP (long-only Orakelia)
                 if sig.is_long:
                     order = await alpaca.place_buy_order(sym, sig.qty)
                 else:
-                    # Defensive: Orakelia evaluate is buy-only; skip any short signal.
-                    _STOCK_STATE["skips"][sym] = {"reason": "short skipped (orakelia long-only)", "at": now.isoformat()}
+                    _STOCK_STATE["skips"][sym] = {"reason": "short skipped (sneaky long-only)", "at": now.isoformat()}
                     continue
                 try:
                     await alpaca.place_stop_loss(sym, sig.is_long, sig.qty, sig.stop)
@@ -2446,6 +2447,7 @@ def main():
                     oid = oids[0] if oids else ""
                 except Exception:
                     pass
+                sneaky_low = float((sig.metrics or {}).get("sneaky_low") or sig.stop)
                 _STOCK_STATE["managed_assets"].add(sym)
                 _STOCK_STATE["open_trades"][sym] = {
                     "entry": sig.entry,
@@ -2458,9 +2460,10 @@ def main():
                     "scale_out_done": False,
                     "notional": sig.notional,
                     "risk_usd": sig.risk_usd,
+                    "sneaky_low": sneaky_low,
                     "book": "stocks",
                     "venue": "alpaca",
-                    "setup": "orakelia_momentum",
+                    "setup": "sneaky_pivot",
                     "opened_at": now.isoformat(),
                 }
                 open_map[sym] = {"symbol": sym, "quantity": sig.qty}

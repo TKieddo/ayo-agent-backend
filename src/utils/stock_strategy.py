@@ -1,12 +1,14 @@
-"""Orakelia-style momentum for the Alpaca stock book.
+"""Sneaky Pivot (Doug-style) for the Alpaca stock book — long-only v1.
 
-Port of the best hive runner (Orakelia) onto equities:
-- Session: US regular hours (unless STOCK_ALLOW_OVERNIGHT)
-- Entry: long only when ret24h > 0 and vol_z > 0 (soft HTF: 1h close above EMA20)
-- Size: fixed notional ($50 default), leverage 1x
-- Stop: ATR × STOCK_SL_ATR_MULT, clamped by min/max % and $ risk cap
-- TP: atr_rr at STOCK_TP_RR_RATIO (default 1.5R) with optional 50% scale-out at 1R
-- Exit (book cycle): momentum_fade when ret1h < 0 or vol_z < 0
+Mechanics (15m RTH):
+- Prior session high / low from previous US cash day
+- Opening range = first completed 15m bar of today (09:30 ET)
+- Sneaky pivot = first confirmed 3-bar swing low after the open that holds
+  above prior-day low (not a full breakdown)
+- Entry: completed bar closes above the post-pivot swing high (break of sneaky)
+- Stop: under sneaky swing low, clamped by ATR / $ risk knobs
+- TP: atr_rr (default 1.5R) with optional scale-out at 1R
+- Exit (book cycle): structure break — close back below sneaky low
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from zoneinfo import ZoneInfo
 
 from src.config_loader import CONFIG
 from src.utils.stock_session import us_regular_session_open
@@ -23,11 +26,9 @@ from src.utils.stock_session import us_regular_session_open
 logger = logging.getLogger(__name__)
 
 Candle = Sequence[Any]
-
-# 15m bars ≈ one US cash session (~6.5h) and one clock hour.
-_BARS_1H_15M = 4
-_BARS_1D_15M = 26
-_VOL_Z_LOOKBACK = 20
+ET = ZoneInfo("America/New_York")
+RTH_OPEN_MIN = 9 * 60 + 30
+RTH_CLOSE_MIN = 16 * 60
 
 
 def resolve_stock_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -57,20 +58,7 @@ def resolve_stock_config(settings: Optional[Dict[str, Any]] = None) -> Dict[str,
         "entry_cutoff_minutes": int(g("stock_entry_cutoff_minutes", 10) or 10),
         "interval": str(g("stock_interval", "15m") or "15m"),
         "htf_interval": str(g("stock_htf_interval", "1h") or "1h"),
-        "ema_fast": 20,
-        "ema_slow": 50,
-        "require_htf_above_ema": bool(g("stock_require_htf_above_ema", True)),
     }
-
-
-def _ema(values: Sequence[float], period: int) -> List[float]:
-    if not values:
-        return []
-    k = 2.0 / (period + 1)
-    out = [float(values[0])]
-    for v in values[1:]:
-        out.append(out[-1] + k * (float(v) - out[-1]))
-    return out
 
 
 def _atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], period: int = 14) -> Optional[float]:
@@ -85,53 +73,162 @@ def _atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float],
     return sum(trs[-period:]) / period
 
 
-def _ret_pct(closes: Sequence[float], bars_back: int) -> Optional[float]:
-    if not closes or bars_back <= 0 or len(closes) <= bars_back:
-        return None
-    base = float(closes[-(bars_back + 1)])
-    last = float(closes[-1])
-    if base <= 0:
-        return None
-    return (last - base) / base * 100.0
-
-
-def _vol_z(volumes: Sequence[float], lookback: int = _VOL_Z_LOOKBACK) -> Optional[float]:
-    """Z-score of the last *completed* 15m bar vs prior lookback.
-
-    Using the live/forming bar made vol_z almost always negative (partial volume),
-    so Orakelia never entered during RTH.
-    """
-    # Need: lookback history + 1 completed + 1 forming (optional).
-    if not volumes or len(volumes) < lookback + 2:
-        if not volumes or len(volumes) < lookback + 1:
+def _bar_et(ts_ms: Any) -> Optional[datetime]:
+    try:
+        ms = int(ts_ms or 0)
+        if ms <= 0:
             return None
-        # Fallback when feed is short: use last bar as completed.
-        cur = float(volumes[-1] or 0)
-        window = [float(v or 0) for v in volumes[-(lookback + 1) : -1]]
-    else:
-        cur = float(volumes[-2] or 0)  # last closed bar
-        window = [float(v or 0) for v in volumes[-(lookback + 2) : -2]]
-    if not window:
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).astimezone(ET)
+    except Exception:
         return None
-    mean = sum(window) / len(window)
-    var = sum((v - mean) ** 2 for v in window) / len(window)
-    std = math.sqrt(var)
-    if std <= 1e-12:
-        return 0.0 if abs(cur - mean) < 1e-9 else (1.0 if cur > mean else -1.0)
-    return (cur - mean) / std
+
+
+def _is_rth_bar(ts_ms: Any) -> bool:
+    dt = _bar_et(ts_ms)
+    if dt is None or dt.weekday() >= 5:
+        return False
+    mins = dt.hour * 60 + dt.minute
+    return RTH_OPEN_MIN <= mins < RTH_CLOSE_MIN
+
+
+def _session_date(ts_ms: Any) -> Optional[Any]:
+    dt = _bar_et(ts_ms)
+    return dt.date() if dt else None
+
+
+def _completed_rth_bars(bars: List[Candle], now: datetime) -> List[Candle]:
+    """Drop the forming bar and any non-RTH prints."""
+    now_et = now.astimezone(ET) if now.tzinfo else now.replace(tzinfo=timezone.utc).astimezone(ET)
+    out: List[Candle] = []
+    for c in bars:
+        if not _is_rth_bar(c[0]):
+            continue
+        bt = _bar_et(c[0])
+        if bt is None:
+            continue
+        # 15m bar labeled at start — treat as incomplete if less than 14m old.
+        age_s = (now_et - bt).total_seconds()
+        if age_s < 14 * 60:
+            continue
+        out.append(c)
+    return out
+
+
+def _split_sessions(bars: List[Candle]) -> Tuple[List[Candle], List[Candle], Optional[Any]]:
+    """Return (today_rth_bars, prior_session_bars, today_date)."""
+    if not bars:
+        return [], [], None
+    dates = [_session_date(c[0]) for c in bars]
+    today = next((d for d in reversed(dates) if d is not None), None)
+    if today is None:
+        return [], [], None
+    today_bars = [c for c, d in zip(bars, dates) if d == today]
+    prior_dates = sorted({d for d in dates if d is not None and d < today})
+    if not prior_dates:
+        return today_bars, [], today
+    prev = prior_dates[-1]
+    prior_bars = [c for c, d in zip(bars, dates) if d == prev]
+    return today_bars, prior_bars, today
+
+
+def _swing_low_index(lows: Sequence[float], start: int, end: int) -> Optional[int]:
+    """First confirmed 3-bar swing low in [start, end) where end-1 is confirmed."""
+    # Need i-1, i, i+1 all inside today; confirmation requires i+1 exists.
+    for i in range(max(start, 1), end - 1):
+        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
+            return i
+    return None
 
 
 @dataclass
-class MomentumSnapshot:
-    """Orakelia-style metrics from Alpaca bars (used for entry rank + fade exits)."""
+class SneakySnapshot:
+    """Structure levels for entry rank + invalidation exits."""
 
-    ret1h: float
-    ret24h: float
-    vol_z: float
-    atr: float
     entry: float
-    htf_above_ema: bool
-    strength: float  # rank key: ret24h + soft vol boost
+    atr: float
+    prior_high: float
+    prior_low: float
+    or_high: float
+    or_low: float
+    sneaky_low: float
+    break_level: float
+    strength: float
+    sneaky_idx: int
+
+
+def sneaky_from_bars(
+    bars_15m: List[Candle],
+    *,
+    atr_period: int = 14,
+    now: Optional[datetime] = None,
+) -> Optional[SneakySnapshot]:
+    """Build Sneaky Pivot levels from 15m bars. None if structure not ready."""
+    now = now or datetime.now(timezone.utc)
+    completed = _completed_rth_bars(bars_15m, now)
+    if len(completed) < atr_period + 5:
+        return None
+
+    today, prior, _ = _split_sessions(completed)
+    if len(today) < 3 or len(prior) < 2:
+        return None
+
+    h_all = [float(c[2]) for c in completed]
+    l_all = [float(c[3]) for c in completed]
+    x_all = [float(c[4]) for c in completed]
+    atr_val = _atr(h_all, l_all, x_all, atr_period)
+    if atr_val is None or atr_val <= 0:
+        return None
+
+    prior_high = max(float(c[2]) for c in prior)
+    prior_low = min(float(c[3]) for c in prior)
+    or_bar = today[0]
+    or_high = float(or_bar[2])
+    or_low = float(or_bar[3])
+
+    highs = [float(c[2]) for c in today]
+    lows = [float(c[3]) for c in today]
+    closes = [float(c[4]) for c in today]
+
+    # First swing low after the opening bar, holding above prior-day low.
+    pivot_i = _swing_low_index(lows, start=1, end=len(today))
+    if pivot_i is None:
+        return None
+    sneaky_low = lows[pivot_i]
+    if sneaky_low < prior_low * 0.999:
+        return None  # full breakdown — not a sneaky hold
+
+    # Break the sneaky candle's high (not the running max — that never gets "closed through").
+    break_level = highs[pivot_i]
+    if break_level <= sneaky_low:
+        return None
+
+    entry = closes[-1]
+    # Rank: how clean the hold is above prior low + room above OR.
+    hold_pct = (sneaky_low - prior_low) / prior_low * 100.0 if prior_low > 0 else 0.0
+    strength = hold_pct + max(0.0, (entry - or_high) / atr_val if atr_val else 0.0)
+
+    return SneakySnapshot(
+        entry=entry,
+        atr=float(atr_val),
+        prior_high=prior_high,
+        prior_low=prior_low,
+        or_high=or_high,
+        or_low=or_low,
+        sneaky_low=sneaky_low,
+        break_level=float(break_level),
+        strength=float(strength),
+        sneaky_idx=pivot_i,
+    )
+
+
+def should_structure_break(snap: SneakySnapshot, *, last_close: Optional[float] = None) -> bool:
+    """Exit long when price closes back below the sneaky swing low."""
+    px = snap.entry if last_close is None else float(last_close)
+    return px < snap.sneaky_low
+
+
+# Back-compat aliases so older call sites / imports don't explode mid-deploy.
+MomentumSnapshot = SneakySnapshot
 
 
 def momentum_from_bars(
@@ -139,57 +236,13 @@ def momentum_from_bars(
     bars_1h: Optional[List[Candle]] = None,
     *,
     atr_period: int = 14,
-) -> Optional[MomentumSnapshot]:
-    """Compute ret1h / ret24h / vol_z / ATR from bar lists. None if not enough data."""
-    if not bars_15m or len(bars_15m) < max(atr_period + 5, _BARS_1D_15M + 2):
-        return None
-
-    h = [float(c[2]) for c in bars_15m]
-    l = [float(c[3]) for c in bars_15m]
-    x = [float(c[4]) for c in bars_15m]
-    v = [float(c[5] or 0) for c in bars_15m]
-
-    atr_val = _atr(h, l, x, atr_period)
-    if atr_val is None or atr_val <= 0:
-        return None
-
-    ret1h = _ret_pct(x, _BARS_1H_15M)
-    ret24h = _ret_pct(x, _BARS_1D_15M)
-    # Prefer true 1h bars for ret1h when available.
-    if bars_1h and len(bars_1h) >= 3:
-        htf_closes = [float(c[4]) for c in bars_1h]
-        r1 = _ret_pct(htf_closes, 1)
-        if r1 is not None:
-            ret1h = r1
-
-    vol_z = _vol_z(v)
-    if ret1h is None or ret24h is None or vol_z is None:
-        return None
-
-    htf = bars_1h if bars_1h and len(bars_1h) >= 25 else bars_15m
-    htf_x = [float(c[4]) for c in htf]
-    ema20 = _ema(htf_x, 20)
-    htf_above = bool(ema20 and htf_x[-1] >= ema20[-1] * 0.998)
-
-    strength = float(ret24h) + max(0.0, float(vol_z)) * 0.5
-    return MomentumSnapshot(
-        ret1h=float(ret1h),
-        ret24h=float(ret24h),
-        vol_z=float(vol_z),
-        atr=float(atr_val),
-        entry=float(x[-1]),
-        htf_above_ema=htf_above,
-        strength=strength,
-    )
+) -> Optional[SneakySnapshot]:
+    del bars_1h  # unused — Sneaky is 15m structure
+    return sneaky_from_bars(bars_15m, atr_period=atr_period)
 
 
-def should_momentum_fade(snap: MomentumSnapshot) -> bool:
-    """Orakelia-style exit for stocks: 1h turns down.
-
-    Do not fade on vol_z alone — equity 15m volume z-scores flip cold constantly
-    and were scratching winners the same bar they opened.
-    """
-    return snap.ret1h < 0
+def should_momentum_fade(snap: SneakySnapshot) -> bool:
+    return should_structure_break(snap)
 
 
 @dataclass
@@ -205,7 +258,7 @@ class StockSignal:
     atr: float
     stop_pct: float
     rr: float
-    setup: str = "orakelia_momentum"
+    setup: str = "sneaky_pivot"
     scale_out_at_r: float = 1.0
     scale_out_fraction: float = 0.5
     rationale: str = ""
@@ -235,8 +288,13 @@ def geometry(
     atr: float,
     side: str,
     cfg: Dict[str, Any],
+    *,
+    structure_stop: Optional[float] = None,
 ) -> Tuple[float, float, float, float]:
-    """Return (stop, take_profit, stop_pct, risk_usd) clamped to stock knobs."""
+    """Return (stop, take_profit, stop_pct%, risk_usd) clamped to stock knobs.
+
+    Prefer structure_stop (sneaky low) when it sits inside min/max %; otherwise ATR.
+    """
     mult = float(cfg["sl_atr_mult"])
     min_pct = float(cfg["min_stop_pct"]) / 100.0
     max_pct = float(cfg["max_stop_pct"]) / 100.0
@@ -244,28 +302,37 @@ def geometry(
     notional = float(cfg["notional"])
     rr = float(cfg["tp_rr"])
 
-    raw_stop_dist = atr * mult
-    stop_pct = raw_stop_dist / entry if entry > 0 else min_pct
-    stop_pct = max(min_pct, min(max_pct, stop_pct))
+    atr_pct = (atr * mult / entry) if entry > 0 else min_pct
+    stop_frac = max(min_pct, min(max_pct, atr_pct))
+
+    if side == "buy" and structure_stop is not None and entry > 0 and structure_stop < entry:
+        struct_frac = (entry - float(structure_stop)) / entry
+        if min_pct <= struct_frac <= max_pct:
+            stop_frac = max(stop_frac, struct_frac)
+            stop_frac = min(stop_frac, max_pct)
 
     qty = size_qty(entry, notional, int(cfg["leverage"]))
-    risk_usd = qty * entry * stop_pct
-    if risk_usd > risk_cap and qty > 0:
-        capped_pct = risk_cap / (qty * entry) if qty * entry > 0 else stop_pct
-        if capped_pct >= min_pct:
-            stop_pct = min(stop_pct, capped_pct)
-            risk_usd = qty * entry * stop_pct
+    risk_usd = qty * entry * stop_frac
+    if risk_usd > risk_cap and qty > 0 and entry > 0:
+        capped = risk_cap / (qty * entry)
+        if capped >= min_pct:
+            stop_frac = min(stop_frac, capped)
+            risk_usd = qty * entry * stop_frac
         else:
             risk_usd = min(risk_usd, risk_cap)
 
     if side == "buy":
-        stop = entry * (1.0 - stop_pct)
-        take_profit = entry * (1.0 + stop_pct * rr)
+        stop = entry * (1.0 - stop_frac)
+        if structure_stop is not None and min_pct <= (entry - float(structure_stop)) / entry <= max_pct:
+            stop = min(stop, float(structure_stop))
+            stop_frac = (entry - stop) / entry
+            risk_usd = qty * (entry - stop)
+        take_profit = entry + (entry - stop) * rr
     else:
-        stop = entry * (1.0 + stop_pct)
-        take_profit = entry * (1.0 - stop_pct * rr)
+        stop = entry * (1.0 + stop_frac)
+        take_profit = entry - (stop - entry) * rr
 
-    return stop, take_profit, stop_pct * 100.0, risk_usd
+    return stop, take_profit, stop_frac * 100.0, risk_usd
 
 
 def evaluate(
@@ -276,10 +343,11 @@ def evaluate(
     settings: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> StockSignal | StockSkip:
-    """Orakelia momentum: long only when day is green and volume is elevated."""
+    """Sneaky Pivot long: break of post-open swing after a held sneaky low."""
+    del bars_1h
     cfg = resolve_stock_config(settings)
     now = now or datetime.now(timezone.utc)
-    metrics: Dict[str, Any] = {"book": "stocks", "venue": "alpaca", "setup": "orakelia_momentum"}
+    metrics: Dict[str, Any] = {"book": "stocks", "venue": "alpaca", "setup": "sneaky_pivot"}
 
     open_ok, sess = us_regular_session_open(
         now,
@@ -290,33 +358,43 @@ def evaluate(
     if not open_ok:
         return StockSkip(symbol, f"session closed ({sess})", metrics)
 
-    snap = momentum_from_bars(bars_15m, bars_1h, atr_period=int(cfg["atr_period"]))
+    snap = sneaky_from_bars(bars_15m, atr_period=int(cfg["atr_period"]), now=now)
     if snap is None:
-        return StockSkip(symbol, "insufficient bars for momentum", metrics)
+        return StockSkip(symbol, "sneaky structure not ready", metrics)
 
     metrics.update(
         {
-            "ret1h": round(snap.ret1h, 3),
-            "ret24h": round(snap.ret24h, 3),
-            "vol_z": round(snap.vol_z, 3),
+            "prior_high": round(snap.prior_high, 4),
+            "prior_low": round(snap.prior_low, 4),
+            "or_high": round(snap.or_high, 4),
+            "or_low": round(snap.or_low, 4),
+            "sneaky_low": round(snap.sneaky_low, 4),
+            "break_level": round(snap.break_level, 4),
             "strength": round(snap.strength, 3),
-            "htf_above_ema": snap.htf_above_ema,
             "atr": round(snap.atr, 4),
         }
     )
 
-    # Long-only Orakelia: green day + volume not cold (completed-bar z).
-    # Soft floor (-0.25) — strict >0 never fired on IEX 15m during RTH.
-    if snap.ret24h <= 0:
-        return StockSkip(symbol, f"ret24h {snap.ret24h:.2f}% <= 0", metrics)
-    if snap.vol_z < -0.25:
-        return StockSkip(symbol, f"vol_z {snap.vol_z:.2f} cold", metrics)
-    if cfg.get("require_htf_above_ema") and not snap.htf_above_ema:
-        return StockSkip(symbol, "HTF below EMA20", metrics)
+    # Need a completed close through the break level (not just a wick).
+    if snap.entry < snap.break_level:
+        return StockSkip(
+            symbol,
+            f"no break yet close={snap.entry:.2f} < break={snap.break_level:.2f}",
+            metrics,
+        )
+    # Prefer longs that cleared the opening-range high (sneaky continuation).
+    if snap.entry < snap.or_high:
+        return StockSkip(
+            symbol,
+            f"below OR high {snap.or_high:.2f}",
+            metrics,
+        )
 
     side = "buy"
     entry = snap.entry
-    stop, tp, stop_pct, risk_usd = geometry(entry, snap.atr, side, cfg)
+    stop, tp, stop_pct, risk_usd = geometry(
+        entry, snap.atr, side, cfg, structure_stop=snap.sneaky_low
+    )
     qty = size_qty(entry, float(cfg["notional"]), int(cfg["leverage"]))
     if qty <= 0:
         return StockSkip(symbol, "qty too small", metrics)
@@ -342,12 +420,12 @@ def evaluate(
         atr=snap.atr,
         stop_pct=stop_pct,
         rr=float(cfg["tp_rr"]),
-        setup="orakelia_momentum",
+        setup="sneaky_pivot",
         scale_out_at_r=float(cfg["scale_out_at_r"]),
         scale_out_fraction=float(cfg["scale_out_fraction"]),
         rationale=(
-            f"Orakelia long ret24h={snap.ret24h:.2f}% vol_z={snap.vol_z:.2f}; "
-            f"ATR stop {stop_pct:.2f}%; TP {cfg['tp_rr']}R"
+            f"Sneaky Pivot long break={snap.break_level:.2f} sneaky_low={snap.sneaky_low:.2f} "
+            f"OR={snap.or_low:.2f}-{snap.or_high:.2f}; stop {stop_pct:.2f}%; TP {cfg['tp_rr']}R"
         ),
         metrics=metrics,
     )

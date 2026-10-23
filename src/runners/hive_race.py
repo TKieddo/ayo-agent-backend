@@ -28,7 +28,6 @@ from src.runners.rules import (
     ENTRY_NOTIONAL,
     LEVERAGE,
     MAX_OPENS,
-    RETIRE_EQUITY,
     RUNNER_LABELS,
     RUNNERS,
     START_EQUITY,
@@ -70,7 +69,7 @@ ENV_PREFIX = {
     "oppo_mayhem": "PEAKSTINGER",
 }
 
-# Mayhem → Oppo (entries/adds only). Mayhem → PeakSting (full open+close 1:1).
+# Mayhem → Oppo (entries/adds only). PeakSting is idle (no Mayhem sync).
 _OPPO_PAIR_Q: List[Action] = []
 _PEAK_PAIR_Q: List[Action] = []
 
@@ -416,29 +415,9 @@ def _queue_oppo_pair(action: Action) -> None:
 
 
 def _queue_peak_pair(action: Action) -> None:
-    """Hard 1:1: PeakSting clones Mayhem open/close/add on the flipped side."""
-    if action.kind == "close" and action.coin:
-        _PEAK_PAIR_Q.append(Action("close", action.coin, reason="peak_pair_close"))
-    elif action.kind == "open" and action.coin and action.side:
-        _PEAK_PAIR_Q.append(
-            Action(
-                "open",
-                action.coin,
-                flip_side(action.side),
-                action.notional or ENTRY_NOTIONAL,
-                "peak_pair_open",
-            )
-        )
-    elif action.kind == "add" and action.coin and action.side:
-        _PEAK_PAIR_Q.append(
-            Action(
-                "add",
-                action.coin,
-                flip_side(action.side),
-                action.notional or ADD_NOTIONAL,
-                "peak_pair_add",
-            )
-        )
+    """No-op: PeakSting is idle and no longer mirrors Mayhem."""
+    del action
+    return
 
 
 def _oppo_sync_actions(mayhem_book: Book, oppo_book: Book) -> List[Action]:
@@ -473,31 +452,9 @@ def _oppo_sync_actions(mayhem_book: Book, oppo_book: Book) -> List[Action]:
     return out
 
 
-def _peak_sync_actions(mayhem_book: Book, peak_book: Book) -> List[Action]:
-    """Every tick: PeakSting must match Mayhem coins on the flipped side (open+close)."""
-    m_by = {p.coin: p for p in mayhem_book.positions}
-    p_by = {p.coin: p for p in peak_book.positions}
-    out: List[Action] = []
-    for coin, pos in p_by.items():
-        mpos = m_by.get(coin)
-        if mpos is None:
-            out.append(Action("close", coin, pos.side, reason="peak_pair_close"))
-        elif pos.side != flip_side(mpos.side):
-            out.append(Action("close", coin, pos.side, reason="peak_pair_flip"))
-    for coin, mpos in m_by.items():
-        want = flip_side(mpos.side)
-        ppos = p_by.get(coin)
-        if ppos is None or ppos.side != want:
-            out.append(
-                Action(
-                    "open",
-                    coin,
-                    want,
-                    float(mpos.notional or ENTRY_NOTIONAL),
-                    "peak_pair_open",
-                )
-            )
-    return out
+def _peak_idle_actions(peak_book: Book) -> List[Action]:
+    """Flatten any leftover Peak positions once; never open."""
+    return [Action("close", p.coin, p.side, reason="peak_idle") for p in peak_book.positions]
 
 
 def _dedupe_actions(actions: List[Action]) -> List[Action]:
@@ -866,28 +823,24 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         }
         trades.append(row)
         _persist_trade(runner, row)
-        if runner == "mayhem":
-            # PeakSting hard-syncs closes; Oppo keeps the fade until its own exit.
-            _queue_peak_pair(Action("close", pos.coin, reason=action.reason or "close"))
         return
     if action.kind == "open":
-        # Pair mirrors must open with Mayhem even when full — free the worst slot.
+        # Peak idle never opens. Oppo pair opens may free a slot when full.
+        if runner == "peaksting":
+            return
         if len(book.positions) >= MAX_OPENS:
-            pair_open = (runner == "oppo_mayhem" and action.reason == "oppo_pair_open") or (
-                runner == "peaksting" and action.reason == "peak_pair_open"
-            )
+            pair_open = runner == "oppo_mayhem" and action.reason == "oppo_pair_open"
             if pair_open and book.positions:
                 worst = min(
                     book.positions,
                     key=lambda p: upl(p, by_coin[p.coin].mid if p.coin in by_coin else p.entry_px),
                 )
-                slot_reason = "peak_slot" if runner == "peaksting" else "oppo_slot"
                 await _act(
                     runner,
                     client,
                     book,
                     coins,
-                    Action("close", worst.coin, worst.side, reason=slot_reason),
+                    Action("close", worst.coin, worst.side, reason="oppo_slot"),
                     trades,
                     now,
                 )
@@ -911,17 +864,18 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         book.sync_primary()
         if runner == "mayhem":
             _queue_oppo_pair(Action("open", coin.coin, action.side, notional, action.reason or "entry"))
-            _queue_peak_pair(Action("open", coin.coin, action.side, notional, action.reason or "entry"))
         return
     if action.kind == "add":
+        if runner == "peaksting":
+            return
         pos = _find_pos(book, action.coin)
         if not pos:
             return
         coin = by_coin.get(pos.coin)
         if not coin:
             return
-        # Pair adds must stay on the flipped side already held.
-        if runner in ("oppo_mayhem", "peaksting") and action.side and action.side != pos.side:
+        # Oppo pair adds must stay on the flipped side already held.
+        if runner == "oppo_mayhem" and action.side and action.side != pos.side:
             return
         add_n = float(action.notional or ADD_NOTIONAL)
         qty = await _order(client, pos.side, pos.coin, add_n, coin.mid, False)
@@ -944,7 +898,6 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         book.sync_primary()
         if runner == "mayhem":
             _queue_oppo_pair(Action("add", pos.coin, pos.side, add_n, action.reason or "pyramid"))
-            _queue_peak_pair(Action("add", pos.coin, pos.side, add_n, action.reason or "pyramid"))
         return
     if action.kind == "switch":
         # Handled as close+open action lists from decide_actions.
@@ -1097,22 +1050,17 @@ async def _tick(decide: bool = True) -> None:
                         _OPPO_PAIR_Q.clear()
                         actions.extend(decide_actions(runner, book, coins, now))
                     elif runner == "peaksting":
-                        mayhem_raw = _STATE["runners"].get("mayhem") or {}
-                        mayhem_book = _book_from(mayhem_raw)
-                        # Hard 1:1 opposite Mayhem — open+close only; no solo decide exits.
-                        actions.extend(_peak_sync_actions(mayhem_book, book))
-                        actions.extend(_PEAK_PAIR_Q)
+                        # Idle: flatten leftovers; never sync Mayhem; never open.
                         _PEAK_PAIR_Q.clear()
+                        actions.extend(_peak_idle_actions(book))
                     else:
                         actions.extend(decide_actions(runner, book, coins, now))
                     for action in _dedupe_actions(actions):
                         await _act(runner, client, book, coins, action, trades, now)
                     # Re-read exchange after orders so cards show fresh UPL/size.
                     upl_by_coin, live_upl = await _reconcile_okx(book, client, coins, now)
-                # Mayhem + Peak 1:1 stay live so mirrors keep tracking.
-                if runner not in ("mayhem", "peaksting") and book.equity <= RETIRE_EQUITY:
-                    book.cap = "retired"
-                elif runner in ("mayhem", "peaksting") and book.cap in ("retired", "loss_stop"):
+                # All crypto runners stay live — clear any stale retire / loss_stop caps.
+                if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
                     book.cap = None
             except Exception as exc:
                 error = str(exc)

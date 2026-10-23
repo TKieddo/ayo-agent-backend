@@ -24,27 +24,27 @@ STOP_ATR = 2.5
 TRAIL_ATR = 2.0
 MAX_STOP_PCT = 8.0
 MIN_HOLD_S = 30 * 60
-TIME_STOP_S = 12 * 3600
+TIME_STOP_S = 0  # disabled — crypto 24/7, no position time stops
 COOLDOWN_S = 10 * 60
-# Entry count and fee spend do not gate new trades. A setup that passes the
-# runner filters is taken. Daily loss and the $120 retire floor still stop a book.
-DAILY_LOSS_PCT = 0.08
-RETIRE_EQUITY = 120.0
+# Entry count and fee spend do not gate new trades. Crypto books stay live 24/7 —
+# no daily-loss / retire freeze and no position time stops (policy).
+DAILY_LOSS_PCT = 0.08  # retained for metrics only; not used to block
+RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
-# Oppo Mayhem: 1:1 opposite *entries*; bank ~1R / giveback / 4h — not a marathon hold.
-# PeakSting: hard 1:1 opposite Mayhem (open+close) — A/B clone of original Oppo sync.
+# Oppo Mayhem: 1:1 opposite *entries*; bank ~1R / giveback — no clock exit.
+# PeakSting: idle (no Mayhem sync) — slot reserved for a future solo strategy.
 OPPO_FADE_R = 1.0          # full take-profit once UPL >= 1R
 OPPO_GIVEBACK_ARM_R = 0.5  # arm giveback after peak UPL hits 0.5R
 OPPO_GIVEBACK_KEEP = 0.4   # close if open UPL falls below 40% of peak
-OPPO_TIME_STOP_S = 4 * 3600
+OPPO_TIME_STOP_S = 0       # disabled — crypto 24/7, no position time stops
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem")
 RUNNER_LABELS = {
     "mayhem": "Mayhem",
     "windward": "Windward",
     "orakelia": "Orakelia",
-    "peaksting": "Peak · Mayhem 1:1",
+    "peaksting": "Peak · idle",
     "oppo_mayhem": "Oppo Mayhem",
     "ayo": "AYO",
 }
@@ -291,22 +291,9 @@ def _side_for(runner: str, coin: Coin) -> str:
 
 
 def _blocked(book: Book, now: float, runner: str = "") -> Optional[str]:
-    # Mayhem + Peak 1:1 must stay live so mirrors keep tracking — no retire / daily loss freeze.
-    if runner in ("mayhem", "peaksting"):
-        if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
-            book.cap = None
-        if book.last_order_at and now - book.last_order_at < COOLDOWN_S:
-            return "cooldown"
-        return None
-    if book.cap == "retired":
-        return "retired"
-    if book.equity <= RETIRE_EQUITY:
-        return "retired"
-    if book.cap == "loss_stop":
-        return "loss_stop"
-    if book.equity <= book.day_start_equity * (1 - DAILY_LOSS_PCT):
-        return "loss_stop"
-    if book.cap in ("trade_cap", "fee_budget"):
+    # All crypto hive runners stay live 24/7 — clear retire / daily-loss freezes.
+    del runner  # all runners share the same always-live policy
+    if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
         book.cap = None
     if book.last_order_at and now - book.last_order_at < COOLDOWN_S:
         return "cooldown"
@@ -322,13 +309,14 @@ def _open_slots(book: Book) -> List[Pos]:
 
 
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
-    # PeakSting is a hard Mayhem clone — only pair sync closes (no solo stop/bail).
+    # Peak idle — no solo exits here; tick flattens leftovers via peak_idle closes.
     if runner == "peaksting":
         return None
     if stop_hit(pos, mid):
         return "stop"
+    # No position time stops (crypto 24/7 policy). TIME_STOP_S / OPPO_TIME_STOP_S are 0.
     hold_s = OPPO_TIME_STOP_S if runner == "oppo_mayhem" else TIME_STOP_S
-    if now - pos.opened_at >= hold_s:
+    if hold_s > 0 and now - pos.opened_at >= hold_s:
         return "time_stop"
     if coin is None:
         return None
@@ -363,11 +351,10 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
     book.positions = opens
     book.sync_primary()
 
-    # Hard caps: close everything if retired / daily loss (Mayhem exempt — Oppo pair needs it live).
+    # Cooldown only — retire / daily-loss freezes disabled for crypto 24/7.
     block = _blocked(book, now, runner=runner)
-    if block in ("retired", "loss_stop"):
-        book.cap = block
-        return [Action("close", p.coin, p.side, reason=block) for p in opens] or [Action("hold", reason=block)]
+    if block == "cooldown" and not opens:
+        return [Action("hold", reason=block)]
 
     # Trim OKX orphans above the race slot cap (smallest first).
     if len(opens) > MAX_OPENS:
