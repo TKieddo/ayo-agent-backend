@@ -1512,6 +1512,9 @@ async def _reconcile_okx(
         entry = float(p.get("entryPrice") or p.get("entry_price") or p.get("entryPx") or 0)
         mark_px = float(p.get("markPrice") or p.get("current_price") or entry)
         notional = abs(float(p.get("notional") or (abs(sz) * (mark_px or entry or 0))))
+        # Ignore exchange dust (e.g. Binance 0.1 FLOW ~$0.003) so it does not eat a hive slot.
+        if notional < 1.0 and abs(sz) * (mark_px or entry or 0) < 1.0:
+            continue
         live_upl = float(p.get("pnl") or p.get("unrealized_pnl") or 0)
         upl_by_coin[coin] = live_upl
         old = prev.get(coin)
