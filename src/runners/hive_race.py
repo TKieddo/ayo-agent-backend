@@ -61,6 +61,11 @@ _AYO_CLIENT: Any = None
 _OI: Dict[str, float] = {}
 _FUNDING_CACHE: Dict[str, Any] = {}
 _PERSIST_LOGGED = False
+# Reuse scanned universes between decide ticks so mark-only loops stay cheap.
+_COIN_CACHE: Dict[str, List[Coin]] = {"okx": [], "pump": [], "bn": []}
+# Mark often enough to bank spikes; decide less often (CPU-friendly on shared VPS).
+HIVE_MARK_SLEEP_S = 8
+HIVE_DECIDE_EVERY = 4  # decide ≈ every 32s
 
 ENV_PREFIX = {
     "mayhem": "MAYHEM",
@@ -1901,11 +1906,20 @@ async def _refresh_ayo() -> None:
 async def _tick(decide: bool = True) -> None:
     from src.runners.rules import PUMP_RUNNERS
 
-    coins = await asyncio.to_thread(build_coins) if decide else []
-    pump_coins: List[Coin] = []
-    bn_coins: List[Coin] = []
+    # Decide ticks rebuild universes; mark-only reuses cache + exchange UPL (cheap).
+    if decide:
+        coins = await asyncio.to_thread(build_coins)
+        _COIN_CACHE["okx"] = coins
+        if any(r in _CLIENTS for r in PUMP_RUNNERS):
+            _COIN_CACHE["pump"] = await asyncio.to_thread(build_pump_coins)
+        if any(r in _CLIENTS for r in BINANCE_RUNNERS):
+            _COIN_CACHE["bn"] = await asyncio.to_thread(build_binance_coins)
+    coins = list(_COIN_CACHE.get("okx") or [])
+    pump_coins = list(_COIN_CACHE.get("pump") or [])
+    bn_coins = list(_COIN_CACHE.get("bn") or [])
     now = time.time()
-    await _refresh_ayo()
+    if decide:
+        await _refresh_ayo()
     async with _LOCK:
         if decide:
             _STATE["market_coins"] = len(coins)
@@ -1925,20 +1939,13 @@ async def _tick(decide: bool = True) -> None:
             live_upl = 0.0
             try:
                 if runner in BINANCE_RUNNERS:
-                    if decide or not bn_coins:
-                        bn_coins = await asyncio.to_thread(build_binance_coins)
                     runner_coins = bn_coins
                 elif runner in PUMP_RUNNERS:
-                    if decide or not pump_coins:
-                        pump_coins = await asyncio.to_thread(build_pump_coins)
                     runner_coins = pump_coins
                 else:
-                    if not coins:
-                        coins = await asyncio.to_thread(build_coins)
-                        _STATE["market_coins"] = len(coins)
                     runner_coins = coins
-                # Keep open winners in the quote set so trail/locks still ratchet.
-                if runner not in BINANCE_RUNNERS:
+                # Candle re-fetch for held names only on decide (mark uses UPL-implied mid).
+                if decide and runner not in BINANCE_RUNNERS:
                     held = [p.coin for p in book.positions]
                     if book.position and book.position.coin not in held:
                         held.append(book.position.coin)
@@ -2146,13 +2153,19 @@ async def start_hive_race() -> None:
     if not _CLIENTS:
         logger.info("hive race idle: no demo keys yet")
         return
-    # Fast mark loop keeps Open PnL live; decide every 4th cycle (~60s).
+    # ~8s mark (locks/UPL), decide every 4th (~32s). Mark-only skips candle rebuilds.
     mark_n = 0
+    logger.info(
+        "hive race loop mark=%ss decide_every=%s (~%ss)",
+        HIVE_MARK_SLEEP_S,
+        HIVE_DECIDE_EVERY,
+        HIVE_MARK_SLEEP_S * HIVE_DECIDE_EVERY,
+    )
     while True:
         try:
             mark_n += 1
-            await _tick(decide=(mark_n % 4 == 1))
+            await _tick(decide=(mark_n % HIVE_DECIDE_EVERY == 1))
         except Exception as exc:
             _STATE["last_error"] = str(exc)
             logger.warning("hive race tick failed: %s", exc)
-        await asyncio.sleep(15)
+        await asyncio.sleep(HIVE_MARK_SLEEP_S)
