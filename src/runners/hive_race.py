@@ -1487,7 +1487,7 @@ async def _reconcile_okx(
     runner: str = "",
 ) -> Tuple[Dict[str, float], float]:
     """Overwrite book.positions from live OKX opens; return per-coin UPL and total."""
-    from src.runners.rules import FLIP_RUNNERS, mark as ratchet_stop
+    from src.runners.rules import mark as ratchet_stop
 
     state = await client.get_user_state()
     by_coin = {c.coin: c for c in coins}
@@ -1550,9 +1550,15 @@ async def _reconcile_okx(
             added=added,
             risk_usd=risk,
         )
-        # Pine flip books: disaster stop only — never ATR trail / profit-lock ratchet.
-        if quote and runner not in FLIP_RUNNERS:
-            ratchet_stop(row, quote)
+        # Trail + profit locks for all hive books (flip runners still exit on signal).
+        if quote:
+            from src.runners.rules import LOCKS, PUMP_LOCKS, PUMP_RUNNERS
+
+            ratchet_stop(
+                row,
+                quote,
+                locks=PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS,
+            )
         elif mark_px > 0:
             if side == "long" and mark_px > row.peak_px:
                 row.peak_px = mark_px
@@ -1803,14 +1809,18 @@ async def _tick(decide: bool = True) -> None:
                     # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward MZ / Orakelia / Confetti.
                     _OPPO_PAIR_Q.clear()
                     _PEAK_PAIR_Q.clear()
-                    # Patch coin.mid when ticker mid is insane vs live entry (TSLA case).
+                    # Patch coin.mid only on one-tick discontinuities vs peak (TSLA 199→378).
+                    # Do NOT clamp vs entry — real pumps (IRYS +50%+) must keep marking.
                     by_coin = {c.coin: c for c in runner_coins}
                     for pos in book.positions:
                         c = by_coin.get(pos.coin)
-                        if not c or pos.entry_px <= 0 or c.mid <= 0:
+                        if not c or c.mid <= 0:
                             continue
-                        if abs(c.mid - pos.entry_px) / pos.entry_px * 100.0 > HIVE_MID_SANITY_PCT:
-                            c.mid = float(pos.peak_px or pos.entry_px)
+                        ref = float(pos.peak_px or pos.entry_px or 0)
+                        if ref <= 0:
+                            continue
+                        if abs(c.mid - ref) / ref * 100.0 > HIVE_MID_SANITY_PCT:
+                            c.mid = ref
                     actions.extend(decide_actions(runner, book, runner_coins, now))
                     for action in _dedupe_actions(actions):
                         await _act(runner, client, book, runner_coins, action, trades, now)

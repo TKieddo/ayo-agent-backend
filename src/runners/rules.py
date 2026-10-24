@@ -22,7 +22,8 @@ MIN_VOL_USD = 15_000_000.0
 MAX_SPREAD_BP = 8.0
 STOP_ATR = 2.5
 TRAIL_ATR = 2.0
-MAX_STOP_PCT = 8.0
+# Cap adverse move ≈ $20 on $400 notional (was 8% ≈ $32, near full $40 margin).
+MAX_STOP_PCT = 5.0
 MIN_HOLD_S = 30 * 60
 TIME_STOP_S = 0  # disabled — crypto 24/7, no position time stops
 COOLDOWN_S = 10 * 60
@@ -31,9 +32,12 @@ COOLDOWN_S = 10 * 60
 DAILY_LOSS_PCT = 0.08  # retained for metrics only; not used to block
 RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
+# Bank open winners: after +X% from entry, ratchet stop to keep K of the run.
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
+# Pump hunter: tighter bank rungs so IRYS-class spikes keep a floor.
+PUMP_LOCKS = ((2.0, 0.35), (5.0, 0.55), (10.0, 0.70), (20.0, 0.85), (40.0, 0.90))
 
-# Mayhem: Super Scalper. Peak: Ichimoku+Hull. Oppo: UT Bot. Windward: Momentum ZZ (QQE).
+# Mayhem: Super Scalper. Peak: Ichimoku+Hull. Oppo: UT Bot. Windward: Pump hunter.
 OPPO_FADE_R = 1.0
 OPPO_GIVEBACK_ARM_R = 0.5
 OPPO_GIVEBACK_KEEP = 0.4
@@ -44,29 +48,35 @@ SS_BAND_MULT = 1.0
 SS_ATR_LEN = 14
 SS_RSI_FAST = 25
 SS_RSI_SLOW = 100
-SS_STOP_PCT = 8.0
+SS_STOP_PCT = 5.0
 # Peak Ichimoku blend.
 ICHI_RUNNERS = frozenset({"peaksting"})
-ICHI_STOP_PCT = 8.0
+ICHI_STOP_PCT = 5.0
 # Oppo UT Bot (ATR trail flip; Heikin Ashi off).
 UT_RUNNERS = frozenset({"oppo_mayhem"})
 UT_KEY = 1.0
 UT_ATR_LEN = 10
-UT_STOP_PCT = 8.0
-# Windward — Peter_O Momentum ZigZag (QQE default); flip + pivot SL (TP=200 skipped).
-MZ_RUNNERS = frozenset({"windward"})
+UT_STOP_PCT = 5.0
+# Legacy MZ constants kept for signal helpers; Windward no longer uses MZ entries.
+MZ_RUNNERS = frozenset()  # empty — Windward is pump hunter now
 MZ_RSI_LEN = 14
 MZ_QQE_FACTOR = 4.238
 MZ_RSI_SMOOTH = 5
 MZ_RSI5_OB = 80
 MZ_RSI5_OS = 20
-MZ_STOP_PCT = 8.0
-# Pine-faithful flip books share disaster-stop + no trail.
-FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS | MZ_RUNNERS
+MZ_STOP_PCT = 5.0
+# Windward — hunt explosive 1h/24h pumps (IRYS-class), long-only, tight stop + aggressive locks.
+PUMP_RUNNERS = frozenset({"windward"})
+PUMP_MIN_RET1H = 2.5
+PUMP_MIN_RET24H = 8.0
+PUMP_MIN_VOL_Z = 0.25
+PUMP_STOP_PCT = 4.0  # ≈ $16 on $400 — leave room for spike, cut hard if wrong
+# Pine flip books: still exit on opposite signal, but NOW trail + profit-lock (no naked ride).
+FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem", "confetti")
 RUNNER_LABELS = {
     "mayhem": "Mayhem · Super Scalper",
-    "windward": "Windward · Momentum ZZ",
+    "windward": "Windward · Pump Hunter",
     "orakelia": "Orakelia",
     "peaksting": "Peak · Ichimoku Hull",
     "oppo_mayhem": "Oppo · UT Bot",
@@ -150,14 +160,14 @@ class Action:
 
 
 def stop_pct(coin: Coin, runner: str = "") -> Optional[float]:
+    if runner in PUMP_RUNNERS:
+        return min(PUMP_STOP_PCT, MAX_STOP_PCT)
     if runner in FLIP_RUNNERS:
-        # Pine flip books: no strategy.exit SL/TP — wide disaster stop only.
+        # Disaster stop (tightened) — trail/locks ratchet from here via mark().
         if runner in SS_RUNNERS:
             return min(SS_STOP_PCT, MAX_STOP_PCT)
         if runner in ICHI_RUNNERS:
             return min(ICHI_STOP_PCT, MAX_STOP_PCT)
-        if runner in MZ_RUNNERS:
-            return min(MZ_STOP_PCT, MAX_STOP_PCT)
         return min(UT_STOP_PCT, MAX_STOP_PCT)
     if coin.atr1h_pct is None or coin.atr1h_pct <= 0:
         return None
@@ -211,7 +221,7 @@ def _run_atr(pos: Pos, coin: Coin) -> float:
     return direction * (coin.mid - pos.entry_px) / atr
 
 
-def mark(pos: Pos, coin: Coin) -> None:
+def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS) -> None:
     """Ratchet the stop with the trail and the profit lock. Never loosens it."""
     if pos.side == "long":
         if coin.mid > pos.peak_px:
@@ -229,7 +239,7 @@ def mark(pos: Pos, coin: Coin) -> None:
     if move > 0 and pos.entry_px > 0:
         gain = move / pos.entry_px * 100
         keep = 0.0
-        for at, k in LOCKS:
+        for at, k in locks:
             if gain >= at:
                 keep = max(keep, k)
         if keep > 0:
@@ -267,10 +277,24 @@ def _ut_bot(coins: List[Coin]) -> List[Coin]:
     return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
 
 
-def _momentum_zz(coins: List[Coin]) -> List[Coin]:
-    """Pine Momentum ZigZag (QQE) — GoLong/GoShort on completed 15m."""
-    rows = [c for c in coins if _tradable(c, "windward") and c.mz_side in ("long", "short")]
-    return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
+def _pump_hunter(coins: List[Coin]) -> List[Coin]:
+    """Windward: long explosive pumps (strong 1h + 24h + volume attention)."""
+    rows = []
+    for c in coins:
+        if not liquid(c):
+            continue
+        if (
+            c.ret1h >= PUMP_MIN_RET1H
+            and c.ret24h >= PUMP_MIN_RET24H
+            and float(c.vol_z or 0) >= PUMP_MIN_VOL_Z
+            and stop_pct(c, runner="windward") is not None
+        ):
+            rows.append(c)
+    return sorted(
+        rows,
+        key=lambda c: float(c.ret1h) + 0.35 * float(c.ret24h) + 0.5 * max(float(c.vol_z or 0), 0.0),
+        reverse=True,
+    )
 
 
 def _orakelia(coins: List[Coin], blacklist: Dict[str, bool]) -> List[Coin]:
@@ -293,8 +317,8 @@ def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
         return _ichi_hull(coins)
     if runner in UT_RUNNERS:
         return _ut_bot(coins)
-    if runner in MZ_RUNNERS:
-        return _momentum_zz(coins)
+    if runner in PUMP_RUNNERS:
+        return _pump_hunter(coins)
     if runner == "orakelia":
         return _orakelia(coins, book.blacklist)
     return []
@@ -312,8 +336,8 @@ def _side_for(runner: str, coin: Coin) -> str:
         return coin.ichi_side or "long"
     if runner in UT_RUNNERS:
         return coin.ut_side or "long"
-    if runner in MZ_RUNNERS:
-        return coin.mz_side or "long"
+    if runner in PUMP_RUNNERS:
+        return "long"
     if runner == "orakelia":
         return "long"
     return impulse(coin) or "long"
@@ -357,9 +381,15 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         if coin.ut_side and coin.ut_side != pos.side:
             return "ut_flip"
         return None
-    if runner in MZ_RUNNERS:
-        if coin.mz_side and coin.mz_side != pos.side:
-            return "mz_flip"
+    if runner in PUMP_RUNNERS:
+        # Pump fade: 1h turns down, or open P&L gave back >60% from peak run.
+        if coin.ret1h < 0:
+            return "pump_fade"
+        if pos.entry_px > 0 and pos.peak_px > pos.entry_px:
+            peak_run = (pos.peak_px - pos.entry_px) / pos.entry_px
+            cur_run = (mid - pos.entry_px) / pos.entry_px
+            if peak_run >= 0.05 and cur_run < peak_run * 0.4:
+                return "pump_giveback"
         return None
     if runner == "orakelia":
         if coin.ret1h < 0 or coin.vol_z < 0:
@@ -402,14 +432,9 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
         coin = by_coin.get(pos.coin)
         mid = coin.mid if coin else pos.peak_px
         if coin:
-            # Pine-faithful flip books: no hive ATR trail / locks — peak for UPL only.
-            if runner in FLIP_RUNNERS:
-                if pos.side == "long" and coin.mid > pos.peak_px:
-                    pos.peak_px = coin.mid
-                elif pos.side == "short" and coin.mid < pos.peak_px:
-                    pos.peak_px = coin.mid
-            else:
-                mark(pos, coin)
+            # Trail + profit locks for everyone (flip books included — still exit on signal flip).
+            locks = PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS
+            mark(pos, coin, locks=locks)
             mid = coin.mid
         reason = _exit_reason(runner, pos, coin, mid, book, now)
         if reason:
@@ -417,7 +442,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
     if closes:
         return closes
 
-    # Pyramid adds: Windward / Orakelia only.
+    # Pyramid adds: Orakelia + pump hunter (not Pine flip books).
     for pos in opens:
         if now - pos.opened_at < MIN_HOLD_S:
             continue
@@ -432,6 +457,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             and _run_atr(pos, coin) >= 1.5
             and pos.notional + ADD_NOTIONAL <= MAX_SLOT_NOTIONAL + 1e-6
             and (runner != "orakelia" or coin.ret1h >= 0)
+            and (runner not in PUMP_RUNNERS or coin.ret1h >= 0)
         ):
             return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")]
 
