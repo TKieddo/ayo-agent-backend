@@ -34,8 +34,16 @@ RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
 # Bank open winners: after +X% from entry, ratchet stop to keep K of the run.
 LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
-# Pump hunter: tighter bank rungs so IRYS-class spikes keep a floor.
-PUMP_LOCKS = ((2.0, 0.35), (5.0, 0.55), (10.0, 0.70), (20.0, 0.85), (40.0, 0.90))
+# Pump hunter locks — intentionally LOOSER than flip books.
+# IRYS-class: +1700% → retract to +1000% → resume. Keeping 90% of peak would
+# eject on that retract. Keep a rising floor, leave room for violent pullbacks.
+# (gain_from_entry%, fraction_of_peak_run_to_keep)
+PUMP_LOCKS = ((3.0, 0.25), (8.0, 0.40), (20.0, 0.50), (50.0, 0.55), (100.0, 0.60))
+# Hard floor once a pump has really run: never give back below +X% from entry.
+PUMP_FLOOR_AFTER_PCT = 25.0   # arm after +25% peak gain
+PUMP_FLOOR_KEEP_PCT = 12.0    # then stop never below entry+12%
+# Allow deep peak giveback before forced exit (locks still set the real floor).
+PUMP_GIVEBACK_KEEP = 0.35     # exit only if open run < 35% of peak run
 
 # Mayhem: Super Scalper. Peak: Ichimoku+Hull. Oppo: UT Bot. Windward: Pump hunter.
 OPPO_FADE_R = 1.0
@@ -232,7 +240,9 @@ def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS) -> None:
     elif coin.mid < pos.peak_px:
         pos.peak_px = coin.mid
 
-    if coin.atr1h_pct and coin.atr1h_pct > 0:
+    # ATR trail — skip on pump books (ATR explodes mid-spike and fights the wide locks).
+    use_atr_trail = locks is not PUMP_LOCKS
+    if use_atr_trail and coin.atr1h_pct and coin.atr1h_pct > 0:
         dist = coin.mid * TRAIL_ATR * coin.atr1h_pct / 100
         trail = coin.mid - dist if pos.side == "long" else coin.mid + dist
         _ratchet(pos, trail)
@@ -247,6 +257,9 @@ def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS) -> None:
                 keep = max(keep, k)
         if keep > 0:
             _ratchet(pos, pos.entry_px + direction * keep * move)
+        # Pump hard floor: once +25% has printed, never surrender back under +12%.
+        if locks is PUMP_LOCKS and gain >= PUMP_FLOOR_AFTER_PCT:
+            _ratchet(pos, pos.entry_px * (1 + direction * PUMP_FLOOR_KEEP_PCT / 100))
 
 
 def _ratchet(pos: Pos, cand: float) -> None:
@@ -398,14 +411,18 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
             return "ut_flip"
         return None
     if runner in PUMP_RUNNERS:
-        # Pump fade: 1h turns down, or open P&L gave back >60% from peak run.
-        if coin.ret1h < 0:
-            return "pump_fade"
+        # Don't kill on a single red 1h while still clearly winning — pumps chop.
+        # Only fade-exit when 1h is red AND open run has collapsed near entry.
         if pos.entry_px > 0 and pos.peak_px > pos.entry_px:
             peak_run = (pos.peak_px - pos.entry_px) / pos.entry_px
             cur_run = (mid - pos.entry_px) / pos.entry_px
-            if peak_run >= 0.05 and cur_run < peak_run * 0.4:
+            if coin.ret1h < 0 and cur_run < max(0.03, peak_run * 0.15):
+                return "pump_fade"
+            # Deep giveback vs peak (locks already banked a floor via stop).
+            if peak_run >= 0.08 and cur_run < peak_run * PUMP_GIVEBACK_KEEP:
                 return "pump_giveback"
+        elif coin.ret1h < 0:
+            return "pump_fade"
         return None
     if runner == "orakelia":
         if coin.ret1h < 0 or coin.vol_z < 0:
