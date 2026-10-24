@@ -773,13 +773,18 @@ def _demo_swap_ids() -> set:
 # Strategy rules (SS / Ichimoku / UT / MZ) are unchanged; only which names we load.
 HIVE_SCAN_POOL = 40  # richest by 24h volume after liquidity floor
 HIVE_KEEP = 20  # best metric score kept for the race tick
+# Windward Pump Hunter — own wider scan (mid-cap pumps miss the Pine top-20).
+PUMP_SCAN_POOL = 80
+PUMP_KEEP = 25
+PUMP_VOL_FLOOR = 5_000_000.0
+PUMP_SPREAD_CAP = 12.0
 # Equity / metal / FX-style swaps: SS trail math + ticker mid often diverge from
 # position mark (seen as TSLA entry ~199 vs mid ~378 → phantom 8% stops).
 HIVE_BLOCKLIST = frozenset(
     {
         "TSLA", "AAPL", "AMZN", "MSFT", "NVDA", "META", "GOOG", "GOOGL", "COIN",
         "MSTR", "HOOD", "AMD", "INTC", "BABA", "TSM", "PLTR", "MU", "SMCI",
-        "XAU", "XAG", "XPT", "XPD", "WTI", "BTCDOM",
+        "XAU", "XAG", "XPT", "XPD", "WTI", "BTCDOM", "QQQ", "SPY", "IWM",
     }
 )
 # If hive mid vs position entry diverges beyond this, prefer exchange mark / skip stop.
@@ -830,14 +835,20 @@ def _hive_pair_score(
     return 0.30 * liq + 1.20 * atr_s + 0.90 * mom + vz + 0.40 * tight + 1.10 * signal
 
 
-def build_coins() -> List[Coin]:
+def _okx_ticker_pool(
+    *,
+    vol_floor: float,
+    spread_cap: float,
+    pool: int,
+) -> List[Tuple[float, str, dict, float, float, float]]:
+    """USDT swaps above liquidity floor, richest first, capped to ``pool``."""
     tickers = _public("/api/v5/market/tickers", {"instType": "SWAP"})
     try:
         listed = _demo_swap_ids()
     except Exception as exc:
         logger.warning("hive demo instrument list failed: %s", exc)
         listed = set()
-    ranked = []
+    ranked: List[Tuple[float, str, dict, float, float, float]] = []
     for row in tickers:
         inst = str(row.get("instId") or "")
         if not inst.endswith("-USDT-SWAP"):
@@ -851,101 +862,188 @@ def build_coins() -> List[Coin]:
             continue
         vol_usd = _f(row.get("volCcy24h")) * last
         spread_bp = (ask - bid) / ((ask + bid) / 2) * 10000
-        if vol_usd < 15_000_000 or spread_bp > 8:
+        if vol_usd < vol_floor or spread_bp > spread_cap:
             continue
         open24 = _f(row.get("open24h"), last)
         ret24 = (last - open24) / open24 * 100 if open24 else 0.0
         ranked.append((vol_usd, inst, row, last, spread_bp, ret24))
     ranked.sort(key=lambda r: r[0], reverse=True)
-    scored: List[Tuple[float, Coin]] = []
-    for vol_usd, inst, row, last, spread_bp, ret24 in ranked[:HIVE_SCAN_POOL]:
-        coin = inst.replace("-USDT-SWAP", "")
-        if coin.upper() in HIVE_BLOCKLIST:
-            continue
-        try:
-            m15 = _candles(inst, "15m", 160)
-            daily = _candles(inst, "1Dutc", 8)
-        except Exception as exc:
-            logger.debug("hive candles %s: %s", inst, exc)
-            continue
-        if len(m15) < 30:
-            continue
-        # Drop forming bar for structure / Super Scalper (completed 15m only).
-        done = m15[:-1] if len(m15) >= 3 else m15
-        closes = [_f(c[4]) for c in done]
-        highs = [_f(c[2]) for c in done]
-        lows = [_f(c[3]) for c in done]
-        opens = [_f(c[1]) for c in done]
-        vols = [_f(c[5]) for c in done]
-        ret1h = (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 and closes[-5] else 0.0
-        ret7 = 0.0
-        if len(daily) >= 2 and _f(daily[0][4]):
-            ret7 = (last - _f(daily[0][4])) / _f(daily[0][4]) * 100
-        atr15 = _atr_pct(highs, lows, closes)
-        atr1h = atr15 * 2 if atr15 is not None else None
+    return ranked[:pool]
+
+
+def _coin_from_okx_inst(
+    inst: str,
+    row: dict,
+    last: float,
+    spread_bp: float,
+    ret24: float,
+    vol_usd: float,
+    *,
+    with_pine: bool,
+) -> Optional[Coin]:
+    coin = inst.replace("-USDT-SWAP", "")
+    if coin.upper() in HIVE_BLOCKLIST:
+        return None
+    try:
+        m15 = _candles(inst, "15m", 160)
+        daily = _candles(inst, "1Dutc", 8)
+    except Exception as exc:
+        logger.debug("hive candles %s: %s", inst, exc)
+        return None
+    if len(m15) < 30:
+        return None
+    done = m15[:-1] if len(m15) >= 3 else m15
+    closes = [_f(c[4]) for c in done]
+    highs = [_f(c[2]) for c in done]
+    lows = [_f(c[3]) for c in done]
+    opens = [_f(c[1]) for c in done]
+    vols = [_f(c[5]) for c in done]
+    ret1h = (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 and closes[-5] else 0.0
+    ret7 = 0.0
+    if len(daily) >= 2 and _f(daily[0][4]):
+        ret7 = (last - _f(daily[0][4])) / _f(daily[0][4]) * 100
+    atr15 = _atr_pct(highs, lows, closes)
+    atr1h = atr15 * 2 if atr15 is not None else None
+    ss_side: Optional[str] = None
+    ss_score = 0.0
+    ichi_side: Optional[str] = None
+    ut_side: Optional[str] = None
+    mz_side: Optional[str] = None
+    mz_sl_px: Optional[float] = None
+    if with_pine:
         ss_side, ss_score = _super_scalper_signal(opens, highs, lows, closes, atr15)
         daily_done = daily[:-1] if len(daily) >= 3 else daily
         daily_opens = [_f(c[1]) for c in daily_done] if daily_done else []
         ichi_side = _ichi_hull_signal(opens, highs, lows, daily_opens)
         ut_side = _ut_bot_signal(closes, highs, lows)
         mz_side, mz_sl_px = _momentum_zz_signal(highs, lows, closes)
+    oi_chg = 0.0
+    try:
+        oi_rows = _public("/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
+        oi_now = _f(oi_rows[0].get("oi")) if oi_rows else 0.0
+        prev = _OI.get(inst)
+        if prev and oi_now:
+            oi_chg = (oi_now - prev) / prev * 100
+        if oi_now:
+            _OI[inst] = oi_now
+    except Exception:
         oi_chg = 0.0
-        try:
-            oi_rows = _public("/api/v5/public/open-interest", {"instType": "SWAP", "instId": inst})
-            oi_now = _f(oi_rows[0].get("oi")) if oi_rows else 0.0
-            prev = _OI.get(inst)
-            if prev and oi_now:
-                oi_chg = (oi_now - prev) / prev * 100
-            if oi_now:
-                _OI[inst] = oi_now
-        except Exception:
-            oi_chg = 0.0
+    funding_z = 0.0
+    try:
+        fr = _public("/api/v5/public/funding-rate", {"instId": inst})
+        current = _f(fr[0].get("fundingRate")) if fr else 0.0
+        funding_z = _funding_z(inst, current)
+    except Exception:
         funding_z = 0.0
-        try:
-            fr = _public("/api/v5/public/funding-rate", {"instId": inst})
-            current = _f(fr[0].get("fundingRate")) if fr else 0.0
-            funding_z = _funding_z(inst, current)
-        except Exception:
-            funding_z = 0.0
-        vz = _vol_z(vols)
-        c = Coin(
-            coin=coin,
-            mid=last,
-            spread_bp=spread_bp,
-            vol24h_usd=vol_usd,
-            ret1h=ret1h,
-            ret24h=ret24,
-            ret7d=ret7,
-            rsi14=_rsi(closes),
-            atr1h_pct=atr1h,
-            oi_chg_1h=oi_chg,
-            funding_z=funding_z,
-            vol_z=vz,
-            high24h=_f(row.get("high24h"), last),
-            atr15_pct=atr15,
-            ss_side=ss_side,
-            ss_score=ss_score,
-            ichi_side=ichi_side,
-            ut_side=ut_side,
-            mz_side=mz_side,
-            mz_sl_px=mz_sl_px,
-        )
+    return Coin(
+        coin=coin,
+        mid=last,
+        spread_bp=spread_bp,
+        vol24h_usd=vol_usd,
+        ret1h=ret1h,
+        ret24h=ret24,
+        ret7d=ret7,
+        rsi14=_rsi(closes),
+        atr1h_pct=atr1h,
+        oi_chg_1h=oi_chg,
+        funding_z=funding_z,
+        vol_z=_vol_z(vols),
+        high24h=_f(row.get("high24h"), last),
+        atr15_pct=atr15,
+        ss_side=ss_side,
+        ss_score=ss_score,
+        ichi_side=ichi_side,
+        ut_side=ut_side,
+        mz_side=mz_side,
+        mz_sl_px=mz_sl_px,
+    )
+
+
+def _fetch_okx_coin(symbol: str, *, with_pine: bool = False) -> Optional[Coin]:
+    """Load one USDT swap for held-position mark/lock (even if off the scored list)."""
+    coin = symbol.upper().replace("-USDT-SWAP", "").replace("-USDT", "")
+    if not coin or coin in HIVE_BLOCKLIST:
+        return None
+    inst = f"{coin}-USDT-SWAP"
+    try:
+        rows = _public("/api/v5/market/ticker", {"instId": inst})
+    except Exception:
+        return None
+    if not rows:
+        return None
+    row = rows[0] if isinstance(rows, list) else rows
+    last = _f(row.get("last"))
+    bid = _f(row.get("bidPx"), last)
+    ask = _f(row.get("askPx"), last)
+    if last <= 0:
+        return None
+    vol_usd = _f(row.get("volCcy24h")) * last
+    spread_bp = (ask - bid) / ((ask + bid) / 2) * 10000 if (ask + bid) > 0 else 99.0
+    open24 = _f(row.get("open24h"), last)
+    ret24 = (last - open24) / open24 * 100 if open24 else 0.0
+    return _coin_from_okx_inst(inst, row, last, spread_bp, ret24, vol_usd, with_pine=with_pine)
+
+
+def ensure_held_coins(coins: List[Coin], held: List[str], *, with_pine: bool = False) -> List[Coin]:
+    """Always mark/lock open winners even if they fell out of the scan top-N."""
+    have = {c.coin.upper() for c in coins}
+    out = list(coins)
+    for name in held:
+        sym = str(name or "").upper()
+        if not sym or sym in have:
+            continue
+        c = _fetch_okx_coin(sym, with_pine=with_pine)
+        if c:
+            out.append(c)
+            have.add(c.coin.upper())
+    return out
+
+
+def build_coins() -> List[Coin]:
+    ranked = _okx_ticker_pool(vol_floor=15_000_000.0, spread_cap=8.0, pool=HIVE_SCAN_POOL)
+    scored: List[Tuple[float, Coin]] = []
+    for vol_usd, inst, row, last, spread_bp, ret24 in ranked:
+        c = _coin_from_okx_inst(inst, row, last, spread_bp, ret24, vol_usd, with_pine=True)
+        if not c:
+            continue
         score = _hive_pair_score(
             vol_usd=vol_usd,
-            atr15_pct=atr15,
-            ret1h=ret1h,
-            ret24=ret24,
-            vol_z=vz,
+            atr15_pct=c.atr15_pct,
+            ret1h=c.ret1h,
+            ret24=c.ret24h,
+            vol_z=float(c.vol_z or 0),
             spread_bp=spread_bp,
-            ss_side=ss_side,
-            ss_score=ss_score,
-            ichi_side=ichi_side,
-            ut_side=ut_side,
-            mz_side=mz_side,
+            ss_side=c.ss_side,
+            ss_score=float(c.ss_score or 0),
+            ichi_side=c.ichi_side,
+            ut_side=c.ut_side,
+            mz_side=c.mz_side,
         )
         scored.append((score, c))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in scored[:HIVE_KEEP]]
+
+
+def build_pump_coins() -> List[Coin]:
+    """Windward-only universe: wider pool ranked by explosive long momentum."""
+    from src.runners.rules import pump_score
+
+    ranked = _okx_ticker_pool(
+        vol_floor=PUMP_VOL_FLOOR, spread_cap=PUMP_SPREAD_CAP, pool=PUMP_SCAN_POOL
+    )
+    scored: List[Tuple[float, Coin]] = []
+    for vol_usd, inst, row, last, spread_bp, ret24 in ranked:
+        # Prefilter on 24h pump before candle work — skip quiet names early.
+        if ret24 < 3.0:
+            continue
+        c = _coin_from_okx_inst(inst, row, last, spread_bp, ret24, vol_usd, with_pine=False)
+        if not c:
+            continue
+        if c.ret1h < 1.0:
+            continue
+        scored.append((pump_score(c), c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:PUMP_KEEP]]
 
 
 def _pos_from_dict(p: Dict[str, Any]) -> Pos:
@@ -1551,19 +1649,29 @@ async def _reconcile_okx(
             risk_usd=risk,
         )
         # Trail + profit locks for all hive books (flip runners still exit on signal).
-        if quote:
-            from src.runners.rules import LOCKS, PUMP_LOCKS, PUMP_RUNNERS
+        # If the name dropped off the scan list, still lock off exchange mark.
+        from src.runners.rules import LOCKS, PUMP_LOCKS, PUMP_RUNNERS
 
-            ratchet_stop(
-                row,
-                quote,
-                locks=PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS,
-            )
+        locks = PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS
+        if quote:
+            ratchet_stop(row, quote, locks=locks)
         elif mark_px > 0:
-            if side == "long" and mark_px > row.peak_px:
-                row.peak_px = mark_px
-            elif side == "short" and mark_px < row.peak_px:
-                row.peak_px = mark_px
+            synth = Coin(
+                coin=coin,
+                mid=mark_px,
+                spread_bp=0.0,
+                vol24h_usd=0.0,
+                ret1h=0.0,
+                ret24h=0.0,
+                ret7d=0.0,
+                rsi14=None,
+                atr1h_pct=None,
+                oi_chg_1h=0.0,
+                funding_z=0.0,
+                vol_z=0.0,
+                high24h=mark_px,
+            )
+            ratchet_stop(row, synth, locks=locks)
         positions.append(row)
 
     positions.sort(key=lambda r: r.notional, reverse=True)
@@ -1768,7 +1876,10 @@ async def _refresh_ayo() -> None:
 
 
 async def _tick(decide: bool = True) -> None:
+    from src.runners.rules import PUMP_RUNNERS
+
     coins = await asyncio.to_thread(build_coins) if decide else []
+    pump_coins: List[Coin] = []
     bn_coins: List[Coin] = []
     now = time.time()
     await _refresh_ayo()
@@ -1794,11 +1905,27 @@ async def _tick(decide: bool = True) -> None:
                     if decide or not bn_coins:
                         bn_coins = await asyncio.to_thread(build_binance_coins)
                     runner_coins = bn_coins
+                elif runner in PUMP_RUNNERS:
+                    if decide or not pump_coins:
+                        pump_coins = await asyncio.to_thread(build_pump_coins)
+                    runner_coins = pump_coins
                 else:
                     if not coins:
                         coins = await asyncio.to_thread(build_coins)
                         _STATE["market_coins"] = len(coins)
                     runner_coins = coins
+                # Keep open winners in the quote set so trail/locks still ratchet.
+                if runner not in BINANCE_RUNNERS:
+                    held = [p.coin for p in book.positions]
+                    if book.position and book.position.coin not in held:
+                        held.append(book.position.coin)
+                    if held:
+                        runner_coins = await asyncio.to_thread(
+                            ensure_held_coins,
+                            runner_coins,
+                            held,
+                            with_pine=runner not in PUMP_RUNNERS,
+                        )
                 upl_by_coin, live_upl = await _reconcile_okx(
                     book, client, runner_coins, now, runner=runner
                 )
@@ -1806,7 +1933,7 @@ async def _tick(decide: bool = True) -> None:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
                     actions: List[Action] = []
-                    # Mayhem SS / Peak Ichimoku / Oppo UT Bot / Windward MZ / Orakelia / Confetti.
+                    # Mayhem SS / Peak Ichimoku / Oppo UT / Windward Pump / Orakelia / Confetti.
                     _OPPO_PAIR_Q.clear()
                     _PEAK_PAIR_Q.clear()
                     # Patch coin.mid only on one-tick discontinuities vs peak (TSLA 199→378).

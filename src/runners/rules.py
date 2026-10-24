@@ -66,10 +66,13 @@ MZ_RSI5_OB = 80
 MZ_RSI5_OS = 20
 MZ_STOP_PCT = 5.0
 # Windward — hunt explosive 1h/24h pumps (IRYS-class), long-only, tight stop + aggressive locks.
+# Own scan (not shared Pine top-20): lower liquidity floor so mid-cap pumps can appear.
 PUMP_RUNNERS = frozenset({"windward"})
 PUMP_MIN_RET1H = 2.5
 PUMP_MIN_RET24H = 8.0
 PUMP_MIN_VOL_Z = 0.25
+PUMP_MIN_VOL_USD = 5_000_000.0
+PUMP_MAX_SPREAD_BP = 12.0
 PUMP_STOP_PCT = 4.0  # ≈ $16 on $400 — leave room for spike, cut hard if wrong
 # Pine flip books: still exit on opposite signal, but NOW trail + profit-lock (no naked ride).
 FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS
@@ -277,11 +280,28 @@ def _ut_bot(coins: List[Coin]) -> List[Coin]:
     return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
 
 
+def _pump_liquid(coin: Coin) -> bool:
+    return (
+        coin.mid > 0
+        and coin.vol24h_usd >= PUMP_MIN_VOL_USD
+        and coin.spread_bp <= PUMP_MAX_SPREAD_BP
+    )
+
+
+def pump_score(coin: Coin) -> float:
+    """Rank explosive longs — used by Windward's dedicated scan + candidate filter."""
+    return (
+        float(coin.ret1h)
+        + 0.35 * float(coin.ret24h)
+        + 0.5 * max(float(coin.vol_z or 0), 0.0)
+    )
+
+
 def _pump_hunter(coins: List[Coin]) -> List[Coin]:
     """Windward: long explosive pumps (strong 1h + 24h + volume attention)."""
     rows = []
     for c in coins:
-        if not liquid(c):
+        if not _pump_liquid(c):
             continue
         if (
             c.ret1h >= PUMP_MIN_RET1H
@@ -290,11 +310,7 @@ def _pump_hunter(coins: List[Coin]) -> List[Coin]:
             and stop_pct(c, runner="windward") is not None
         ):
             rows.append(c)
-    return sorted(
-        rows,
-        key=lambda c: float(c.ret1h) + 0.35 * float(c.ret24h) + 0.5 * max(float(c.vol_z or 0), 0.0),
-        reverse=True,
-    )
+    return sorted(rows, key=pump_score, reverse=True)
 
 
 def _orakelia(coins: List[Coin], blacklist: Dict[str, bool]) -> List[Coin]:
