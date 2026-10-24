@@ -1615,6 +1615,16 @@ async def _reconcile_okx(
             continue
         live_upl = float(p.get("pnl") or p.get("unrealized_pnl") or 0)
         upl_by_coin[coin] = live_upl
+        # Confetti/MAGMA bug: markPrice can lag while unRealizedProfit is live.
+        # Prefer the mid implied by UPL whenever it disagrees with markPrice.
+        if entry > 0 and notional > 0:
+            implied = entry * (1.0 + live_upl / notional) if side == "long" else entry * (
+                1.0 - live_upl / notional
+            )
+            if implied > 0 and (
+                mark_px <= 0 or abs(implied - mark_px) / entry > 0.01
+            ):
+                mark_px = implied
         old = prev.get(coin)
         quote = by_coin.get(coin)
         if old:
@@ -1623,11 +1633,12 @@ async def _reconcile_okx(
             opened_at = old.opened_at
             added = old.added or notional > ENTRY_NOTIONAL * 1.15
             risk = old.risk_usd
-            # Repair inverted stops left by accidental trail on flip books.
+            # Only clear a stop that claims "locked" while peak never left entry
+            # (legacy wrong-way trail). Real profit locks are stop past entry with peak run.
             if entry > 0:
-                if side == "long" and stop >= entry:
+                if side == "long" and stop > entry and peak <= entry * 1.001:
                     stop = stop_price("long", entry, stop_pct(quote, runner=runner) or 8.0)
-                elif side == "short" and stop <= entry:
+                elif side == "short" and stop < entry and peak >= entry * 0.999:
                     stop = stop_price("short", entry, stop_pct(quote, runner=runner) or 8.0)
         else:
             pct = stop_pct(quote, runner=runner) if quote else None
@@ -1636,6 +1647,11 @@ async def _reconcile_okx(
             opened_at = now
             added = notional > ENTRY_NOTIONAL * 1.15
             risk = abs(entry - stop) / entry * notional if entry else 0.0
+        # Never let peak sit on the wrong side of entry while UPL is winning.
+        if side == "long" and mark_px > peak:
+            peak = mark_px
+        elif side == "short" and mark_px > 0 and (peak <= 0 or mark_px < peak):
+            peak = mark_px
         row = Pos(
             coin=coin,
             side=side,
@@ -1653,8 +1669,7 @@ async def _reconcile_okx(
         from src.runners.rules import LOCKS, PUMP_LOCKS, PUMP_RUNNERS
 
         locks = PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS
-        # Peak/locks must follow exchange mark — ticker mid lags and can be
-        # sanity-clamped, which is how IRYS showed +$53 UPL while peak stayed ~+1%.
+        # Peak/locks follow exchange mark (or UPL-implied mid) — not a lagging ticker.
         mark_for_lock = mark_px if mark_px > 0 else (quote.mid if quote else 0.0)
         if quote and mark_for_lock > 0:
             if side == "long":
