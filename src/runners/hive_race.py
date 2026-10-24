@@ -1653,12 +1653,20 @@ async def _reconcile_okx(
         from src.runners.rules import LOCKS, PUMP_LOCKS, PUMP_RUNNERS
 
         locks = PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS
-        if quote:
+        # Peak/locks must follow exchange mark — ticker mid lags and can be
+        # sanity-clamped, which is how IRYS showed +$53 UPL while peak stayed ~+1%.
+        mark_for_lock = mark_px if mark_px > 0 else (quote.mid if quote else 0.0)
+        if quote and mark_for_lock > 0:
+            if side == "long":
+                quote.mid = max(float(quote.mid or 0), mark_for_lock)
+            else:
+                qmid = float(quote.mid or 0)
+                quote.mid = min(qmid, mark_for_lock) if qmid > 0 else mark_for_lock
             ratchet_stop(row, quote, locks=locks)
-        elif mark_px > 0:
+        elif mark_for_lock > 0:
             synth = Coin(
                 coin=coin,
-                mid=mark_px,
+                mid=mark_for_lock,
                 spread_bp=0.0,
                 vol24h_usd=0.0,
                 ret1h=0.0,
@@ -1669,7 +1677,7 @@ async def _reconcile_okx(
                 oi_chg_1h=0.0,
                 funding_z=0.0,
                 vol_z=0.0,
-                high24h=mark_px,
+                high24h=mark_for_lock,
             )
             ratchet_stop(row, synth, locks=locks)
         positions.append(row)
@@ -1936,8 +1944,8 @@ async def _tick(decide: bool = True) -> None:
                     # Mayhem SS / Peak Ichimoku / Oppo UT / Windward Pump / Orakelia / Confetti.
                     _OPPO_PAIR_Q.clear()
                     _PEAK_PAIR_Q.clear()
-                    # Patch coin.mid only on one-tick discontinuities vs peak (TSLA 199→378).
-                    # Do NOT clamp vs entry — real pumps (IRYS +50%+) must keep marking.
+                    # Sanity: only reject insane ADVERSE one-tick jumps (TSLA phantom).
+                    # Never clamp a favorable pump/dump — that blocked IRYS peak locks.
                     by_coin = {c.coin: c for c in runner_coins}
                     for pos in book.positions:
                         c = by_coin.get(pos.coin)
@@ -1946,7 +1954,11 @@ async def _tick(decide: bool = True) -> None:
                         ref = float(pos.peak_px or pos.entry_px or 0)
                         if ref <= 0:
                             continue
-                        if abs(c.mid - ref) / ref * 100.0 > HIVE_MID_SANITY_PCT:
+                        move_pct = (c.mid - ref) / ref * 100.0
+                        adverse = (pos.side == "long" and move_pct < -HIVE_MID_SANITY_PCT) or (
+                            pos.side == "short" and move_pct > HIVE_MID_SANITY_PCT
+                        )
+                        if adverse:
                             c.mid = ref
                     actions.extend(decide_actions(runner, book, runner_coins, now))
                     for action in _dedupe_actions(actions):
