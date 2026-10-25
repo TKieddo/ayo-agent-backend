@@ -1616,11 +1616,12 @@ async def _reconcile_okx(
     now: float,
     *,
     runner: str = "",
-) -> Tuple[Dict[str, float], float]:
-    """Overwrite book.positions from live OKX opens; return per-coin UPL and total."""
+) -> Tuple[Dict[str, float], float, float]:
+    """Overwrite book.positions from live opens; return UPL map, total UPL, wallet equity."""
     from src.runners.rules import mark as ratchet_stop
 
     state = await client.get_user_state()
+    wallet = float(state.get("total_value") or state.get("balance") or state.get("account_value") or 0)
     by_coin = {c.coin: c for c in coins}
     prev = {p.coin: p for p in book.positions}
     if book.position and book.position.coin not in prev:
@@ -1733,7 +1734,7 @@ async def _reconcile_okx(
     positions.sort(key=lambda r: r.notional, reverse=True)
     book.positions = positions
     book.sync_primary()
-    return upl_by_coin, float(sum(upl_by_coin.values()))
+    return upl_by_coin, float(sum(upl_by_coin.values())), wallet
 
 
 async def _act(
@@ -1989,6 +1990,7 @@ async def _tick(decide: bool = True) -> None:
             error = None
             upl_by_coin: Dict[str, float] = {}
             live_upl = 0.0
+            wallet_eq = float((_STATE["runners"].get(runner) or {}).get("account_equity") or 0)
             try:
                 if runner in BINANCE_RUNNERS:
                     runner_coins = bn_coins
@@ -2008,7 +2010,8 @@ async def _tick(decide: bool = True) -> None:
                             held,
                             with_pine=runner not in PUMP_RUNNERS,
                         )
-                upl_by_coin, live_upl = await _reconcile_okx(
+                wallet_eq = 0.0
+                upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                     book, client, runner_coins, now, runner=runner
                 )
                 # Every tick (mark + decide): honor locked stops off live UPL mid.
@@ -2026,7 +2029,7 @@ async def _tick(decide: bool = True) -> None:
                             now,
                             live_upl_by_coin=upl_by_coin,
                         )
-                    upl_by_coin, live_upl = await _reconcile_okx(
+                    upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                         book, client, runner_coins, now, runner=runner
                     )
                 if decide:
@@ -2070,7 +2073,7 @@ async def _tick(decide: bool = True) -> None:
                             live_upl_by_coin=upl_by_coin,
                         )
                     # Re-read exchange after orders so cards show fresh UPL/size.
-                    upl_by_coin, live_upl = await _reconcile_okx(
+                    upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                         book, client, runner_coins, now, runner=runner
                     )
                 # All crypto runners stay live — clear any stale retire / loss_stop caps.
@@ -2079,6 +2082,7 @@ async def _tick(decide: bool = True) -> None:
             except Exception as exc:
                 error = str(exc)
                 logger.warning("hive %s tick failed: %s", runner, exc)
+                wallet_eq = float((_STATE["runners"].get(runner) or {}).get("account_equity") or 0)
             # Prefer live exchange UPL; fall back to mid mark if reconcile failed.
             if not upl_by_coin and book.positions:
                 pool = bn_coins if runner in BINANCE_RUNNERS else coins
@@ -2093,9 +2097,14 @@ async def _tick(decide: bool = True) -> None:
             stored["day_key"] = time.strftime("%Y-%m-%d", time.gmtime(now))
             stored["mtm"] = round(mtm, 4)
             stored["upl"] = round(live_upl, 4)
+            stored["account_equity"] = round(float(wallet_eq or 0), 2)
             venue = "Binance" if runner in BINANCE_RUNNERS else "OKX"
+            wallet_bit = (
+                f" · {venue} wallet ${float(wallet_eq):,.0f}" if wallet_eq and wallet_eq > 0 else ""
+            )
             stored["note"] = (
-                f"{len(book.positions)}/{MAX_OPENS} open · ${ENTRY_MARGIN:.0f}+${ADD_MARGIN:.0f} margin · {venue}"
+                f"Race from ${START_EQUITY:.0f} · {len(book.positions)}/{MAX_OPENS} open · "
+                f"${ENTRY_MARGIN:.0f}+${ADD_MARGIN:.0f} margin · {venue}{wallet_bit}"
             )
             _STATE["runners"][runner] = stored
         _save()
