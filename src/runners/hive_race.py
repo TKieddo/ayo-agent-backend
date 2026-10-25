@@ -66,6 +66,9 @@ _COIN_CACHE: Dict[str, List[Coin]] = {"okx": [], "pump": [], "bn": []}
 # Mark often enough to bank spikes; decide less often (CPU-friendly on shared VPS).
 HIVE_MARK_SLEEP_S = 8
 HIVE_DECIDE_EVERY = 4  # decide ≈ every 32s
+# Prevent double-booking the same close into race equity (Oppo/Windward CAP spam).
+_RECENT_CLOSE_AT: Dict[str, float] = {}
+_CLOSE_IDEMPOTENCY_S = 180.0
 
 ENV_PREFIX = {
     "mayhem": "MAYHEM",
@@ -1733,7 +1736,17 @@ async def _reconcile_okx(
     return upl_by_coin, float(sum(upl_by_coin.values()))
 
 
-async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: Action, trades: List[dict], now: float) -> None:
+async def _act(
+    runner: str,
+    client: Any,
+    book: Book,
+    coins: List[Coin],
+    action: Action,
+    trades: List[dict],
+    now: float,
+    *,
+    live_upl_by_coin: Optional[Dict[str, float]] = None,
+) -> None:
     by_coin = {c.coin: c for c in coins}
     if action.kind == "hold":
         return
@@ -1741,17 +1754,31 @@ async def _act(runner: str, client: Any, book: Book, coins: List[Coin], action: 
         pos = _find_pos(book, action.coin)
         if not pos:
             return
+        idem = f"{runner}:{pos.coin}:{pos.side}"
+        last_close = float(_RECENT_CLOSE_AT.get(idem) or 0)
+        if last_close and now - last_close < _CLOSE_IDEMPOTENCY_S:
+            # Already booked this close — keep local book flat, do not add equity again.
+            book.positions = [p for p in book.positions if p.coin != pos.coin]
+            book.sync_primary()
+            logger.info("hive %s skip duplicate close %s (%.0fs ago)", runner, pos.coin, now - last_close)
+            return
         coin = by_coin.get(pos.coin)
-        # Prefer exchange mark already on the pos peak / live UPL path — never
-        # book PnL off a ticker mid that disagrees with entry (TSLA 199 vs 378).
-        raw_mid = coin.mid if coin else pos.peak_px
+        live_upl = None
+        if live_upl_by_coin and pos.coin in live_upl_by_coin:
+            live_upl = float(live_upl_by_coin[pos.coin])
+        # Prefer UPL-implied mid, then quote, then peak — never double-count paper PnL.
+        implied = _implied_mid_from_upl(pos, live_upl) if live_upl is not None else None
+        raw_mid = implied if implied and implied > 0 else (coin.mid if coin else pos.peak_px)
         mid = _sane_mark(pos.entry_px, float(raw_mid or 0), fallback=float(pos.peak_px or pos.entry_px))
+        if implied and implied > 0:
+            mid = implied
         qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
-        pnl = upl(pos, mid)
+        pnl = float(live_upl) if live_upl is not None else upl(pos, mid)
         fee = fee_usd(pos.notional)
         book.equity += pnl - fee
         book.fees_today += fee
         book.last_order_at = now
+        _RECENT_CLOSE_AT[idem] = now
         book.positions = [p for p in book.positions if p.coin != pos.coin]
         book.sync_primary()
         row = {
@@ -1989,7 +2016,16 @@ async def _tick(decide: bool = True) -> None:
                 stop_acts = _stop_closes_from_upl(book, upl_by_coin)
                 if stop_acts:
                     for action in _dedupe_actions(stop_acts):
-                        await _act(runner, client, book, runner_coins, action, trades, now)
+                        await _act(
+                            runner,
+                            client,
+                            book,
+                            runner_coins,
+                            action,
+                            trades,
+                            now,
+                            live_upl_by_coin=upl_by_coin,
+                        )
                     upl_by_coin, live_upl = await _reconcile_okx(
                         book, client, runner_coins, now, runner=runner
                     )
@@ -2023,7 +2059,16 @@ async def _tick(decide: bool = True) -> None:
                             c.mid = ref
                     actions.extend(decide_actions(runner, book, runner_coins, now))
                     for action in _dedupe_actions(actions):
-                        await _act(runner, client, book, runner_coins, action, trades, now)
+                        await _act(
+                            runner,
+                            client,
+                            book,
+                            runner_coins,
+                            action,
+                            trades,
+                            now,
+                            live_upl_by_coin=upl_by_coin,
+                        )
                     # Re-read exchange after orders so cards show fresh UPL/size.
                     upl_by_coin, live_upl = await _reconcile_okx(
                         book, client, runner_coins, now, runner=runner
