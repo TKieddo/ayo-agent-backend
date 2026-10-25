@@ -1581,6 +1581,31 @@ def _sane_mark(entry: float, candidate: float, fallback: float = 0.0) -> float:
     return fallback if fallback > 0 else (entry if entry > 0 else candidate)
 
 
+def _implied_mid_from_upl(pos: Pos, live_upl: float) -> Optional[float]:
+    """Mid implied by exchange UPL — authoritative when ticker mid lags (Confetti APR)."""
+    if pos.entry_px <= 0 or pos.notional <= 0:
+        return None
+    if pos.side == "long":
+        return pos.entry_px * (1.0 + float(live_upl) / pos.notional)
+    return pos.entry_px * (1.0 - float(live_upl) / pos.notional)
+
+
+def _stop_closes_from_upl(book: Book, upl_by_coin: Dict[str, float]) -> List[Action]:
+    """Close any open whose live UPL mid has already pierced the locked stop."""
+    from src.runners.rules import stop_hit
+
+    out: List[Action] = []
+    for pos in book.positions:
+        if pos.coin not in upl_by_coin:
+            continue
+        mid = _implied_mid_from_upl(pos, float(upl_by_coin[pos.coin]))
+        if mid is None or mid <= 0:
+            continue
+        if stop_hit(pos, mid):
+            out.append(Action("close", pos.coin, pos.side, reason="stop"))
+    return out
+
+
 async def _reconcile_okx(
     book: Book,
     client: Any,
@@ -1959,6 +1984,15 @@ async def _tick(decide: bool = True) -> None:
                 upl_by_coin, live_upl = await _reconcile_okx(
                     book, client, runner_coins, now, runner=runner
                 )
+                # Every tick (mark + decide): honor locked stops off live UPL mid.
+                # Mark-only used to skip decide → APR stayed open after piercing keep-75%.
+                stop_acts = _stop_closes_from_upl(book, upl_by_coin)
+                if stop_acts:
+                    for action in _dedupe_actions(stop_acts):
+                        await _act(runner, client, book, runner_coins, action, trades, now)
+                    upl_by_coin, live_upl = await _reconcile_okx(
+                        book, client, runner_coins, now, runner=runner
+                    )
                 if decide:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
@@ -1973,6 +2007,11 @@ async def _tick(decide: bool = True) -> None:
                         c = by_coin.get(pos.coin)
                         if not c or c.mid <= 0:
                             continue
+                        # Prefer live UPL mid for stop/trail decisions when available.
+                        if pos.coin in upl_by_coin:
+                            implied = _implied_mid_from_upl(pos, float(upl_by_coin[pos.coin]))
+                            if implied and implied > 0:
+                                c.mid = implied
                         ref = float(pos.peak_px or pos.entry_px or 0)
                         if ref <= 0:
                             continue

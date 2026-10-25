@@ -297,13 +297,16 @@ def decide_confetti(book: Book, coins: List[Coin], now: float) -> List[Action]:
         extras = sorted(opens, key=lambda p: p.notional)[: len(opens) - MAX_OPENS]
         return [Action("close", p.coin, p.side, reason="slot_cap") for p in extras]
 
-    # Hard stop / trail / locks on every open first.
+    # Hard stop / trail / locks on every open first (even if coin left the scan list).
     for pos in opens:
         coin = by_coin.get(pos.coin)
         if coin:
             mark_boozy(pos, coin)
             if stop_hit(pos, coin.mid):
                 return [Action("close", pos.coin, pos.side, reason="stop")]
+        elif stop_hit(pos, float(pos.peak_px or pos.entry_px or 0)):
+            # Last resort — hive tick also force-closes off UPL-implied mid.
+            return [Action("close", pos.coin, pos.side, reason="stop")]
 
     # Per-slot exits / pyramid (one action per tick — same as other hive books).
     for pos in opens:
