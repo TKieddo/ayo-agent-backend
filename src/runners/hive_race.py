@@ -1221,6 +1221,39 @@ def _dedupe_actions(actions: List[Action]) -> List[Action]:
     return out
 
 
+def _align_runner_to_epoch(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop pre-epoch closes and rebuild race equity from the filtered book only.
+
+    Prevents Coolify restarts from showing stale +5000% / inflated closed $ after a reset.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    trades = _trades_in_epoch(list(raw.get("trades") or []))
+    raw["trades"] = trades[-80:]
+    realized = sum(float(t.get("pnl") or 0) for t in trades)
+    # Race ledger only — exchange wallet fields are left alone.
+    raw["equity"] = round(START_EQUITY + realized, 4)
+    live_upl = float(raw.get("upl") or 0)
+    raw["mtm"] = round(float(raw["equity"]) + live_upl, 4)
+    raw["pct"] = round((float(raw["mtm"]) - START_EQUITY) / START_EQUITY * 100, 2)
+    if not trades:
+        # Clean slate after reset / new epoch — do not keep yesterday's peak/dd/caps.
+        raw["trades_today"] = 0
+        raw["fees_today"] = 0
+        raw["peak_equity"] = START_EQUITY
+        raw["max_dd_pct"] = 0
+        if not raw.get("positions"):
+            raw["cap"] = None
+    return raw
+
+
+def _align_all_runners_to_epoch() -> None:
+    for rid, raw in list(_STATE["runners"].items()):
+        if rid == "ayo" or not isinstance(raw, dict):
+            continue
+        _STATE["runners"][rid] = _align_runner_to_epoch(raw)
+
+
 def _load() -> None:
     path = _path()
     if not path.exists():
@@ -1230,10 +1263,7 @@ def _load() -> None:
         _STATE["started_at"] = saved.get("started_at")
         _STATE["race_epoch"] = saved.get("race_epoch") or saved.get("started_at")
         _STATE["runners"] = _migrate_runner_ids(saved.get("runners") or {})
-        for rid, raw in list(_STATE["runners"].items()):
-            if isinstance(raw, dict) and raw.get("trades"):
-                raw["trades"] = _trades_in_epoch(list(raw.get("trades") or []))
-                _STATE["runners"][rid] = raw
+        _align_all_runners_to_epoch()
     except Exception as exc:
         logger.warning("hive race state unreadable: %s", exc)
 
@@ -1402,53 +1432,47 @@ def _trades_in_epoch(trades: List[dict]) -> List[dict]:
 
 
 def _hydrate_from_supabase() -> None:
-    """Merge durable Supabase hive closes into in-memory/file state after Coolify wipes."""
-    earliest: Optional[str] = None
+    """Merge durable Supabase hive closes into in-memory/file state after Coolify wipes.
+
+    Only restores closes at/after race_epoch. If the container lost race_epoch (no volume),
+    start a fresh epoch so ancient Supabase history cannot resurrect fake +5000% boards.
+    """
+    if not _STATE.get("race_epoch"):
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _STATE["race_epoch"] = now_iso
+        _STATE["started_at"] = _STATE.get("started_at") or now_iso
+        logger.info("hive hydrate: no race_epoch on disk — starting fresh epoch %s", now_iso)
+
     for runner in RUNNERS:
         db_trades = _fetch_runner_trades(runner)
         # Legacy id from the short-lived Mayhem Inv A/B slot.
         if runner == "oppo_mayhem":
             db_trades = db_trades + _fetch_runner_trades("mayhem_inv")
         db_trades = _trades_in_epoch(db_trades)
-        if not db_trades:
-            continue
         raw = dict(_STATE["runners"].get(runner) or {})
         file_trades = _trades_in_epoch(list(raw.get("trades") or []))
+        if not db_trades and not file_trades:
+            _STATE["runners"][runner] = _align_runner_to_epoch(raw)
+            continue
         by_key = {_trade_key(t): t for t in file_trades}
         for t in db_trades:
             by_key.setdefault(_trade_key(t), t)
         merged = sorted(by_key.values(), key=lambda t: str(t.get("at") or ""))
         raw["trades"] = merged[-80:]
-        realized = sum(float(t.get("pnl") or 0) for t in merged)
-        # If container state lost the closes, rebuild race equity from START + closed PnL.
         if not file_trades and merged:
-            raw["equity"] = round(START_EQUITY + realized, 4)
-            if raw.get("mtm") is None or abs(float(raw.get("mtm") or 0) - START_EQUITY) < 1e-6:
-                raw["mtm"] = raw["equity"]
             raw["configured"] = True
             logger.info(
-                "hive hydrate %s: restored %d closes from Supabase, equity≈%.2f",
+                "hive hydrate %s: restored %d closes from Supabase (this epoch only)",
                 runner,
                 len(merged),
-                float(raw["equity"]),
             )
         elif len(merged) > len(file_trades):
-            raw["trades"] = merged[-80:]
-            logger.info("hive hydrate %s: merged %d Supabase closes into file state", runner, len(merged) - len(file_trades))
-        _STATE["runners"][runner] = raw
-        for t in merged:
-            at = str(t.get("at") or "")
-            if at and (earliest is None or at < earliest):
-                earliest = at
-    # Do not pull started_at before race_epoch — that undoes a deliberate reset.
-    if _STATE.get("race_epoch"):
-        return
-    if earliest and _STATE.get("started_at"):
-        # Keep the older race start if we rebuilt history that predates this container boot.
-        if earliest < str(_STATE["started_at"]):
-            _STATE["started_at"] = earliest
-    elif earliest and not _STATE.get("started_at"):
-        _STATE["started_at"] = earliest
+            logger.info(
+                "hive hydrate %s: merged %d Supabase closes into file state",
+                runner,
+                len(merged) - len(file_trades),
+            )
+        _STATE["runners"][runner] = _align_runner_to_epoch(raw)
 
 
 async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
@@ -2197,8 +2221,11 @@ async def start_hive_race() -> None:
         return
     _load()
     _hydrate_from_supabase()
+    _align_all_runners_to_epoch()
     if not _STATE.get("started_at"):
         _STATE["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if not _STATE.get("race_epoch"):
+        _STATE["race_epoch"] = _STATE["started_at"]
     from src.trading.binance_api import BinanceAPI
     from src.trading.okx_api import OKXAPI
 
