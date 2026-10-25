@@ -1500,6 +1500,9 @@ async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
                 **_book_to(book, [], configured, err),
                 "mtm": START_EQUITY,
                 "day_key": time.strftime("%Y-%m-%d", time.gmtime()),
+                # Next tick captures a fresh wallet baseline for honest "made" display.
+                "account_equity": prev.get("account_equity"),
+                "account_start_equity": None,
             }
         _save()
     logger.info("hive race reset epoch=%s flatten=%s", now_iso, flatten)
@@ -2098,13 +2101,25 @@ async def _tick(decide: bool = True) -> None:
             stored["mtm"] = round(mtm, 4)
             stored["upl"] = round(live_upl, 4)
             stored["account_equity"] = round(float(wallet_eq or 0), 2)
+            # Baseline wallet at race epoch — honest exchange P&L vs demo account.
+            prev_raw = _STATE["runners"].get(runner) or {}
+            start_wallet = prev_raw.get("account_start_equity")
+            if (start_wallet is None or float(start_wallet or 0) <= 0) and wallet_eq and wallet_eq > 0:
+                start_wallet = round(float(wallet_eq), 2)
+            stored["account_start_equity"] = (
+                round(float(start_wallet), 2) if start_wallet is not None else None
+            )
             venue = "Binance" if runner in BINANCE_RUNNERS else "OKX"
+            made = None
+            if stored["account_start_equity"] and wallet_eq:
+                made = float(wallet_eq) - float(stored["account_start_equity"])
+            made_bit = f" · made {made:+,.0f}" if made is not None else ""
             wallet_bit = (
-                f" · {venue} wallet ${float(wallet_eq):,.0f}" if wallet_eq and wallet_eq > 0 else ""
+                f" · {venue} ${float(wallet_eq):,.0f}{made_bit}" if wallet_eq and wallet_eq > 0 else ""
             )
             stored["note"] = (
-                f"Race from ${START_EQUITY:.0f} · {len(book.positions)}/{MAX_OPENS} open · "
-                f"${ENTRY_MARGIN:.0f}+${ADD_MARGIN:.0f} margin · {venue}{wallet_bit}"
+                f"{len(book.positions)}/{MAX_OPENS} open · "
+                f"${ENTRY_MARGIN:.0f} margin · {venue}{wallet_bit}"
             )
             _STATE["runners"][runner] = stored
         _save()
@@ -2147,6 +2162,7 @@ def snapshot() -> dict:
                 "positions": positions,
                 "open_count": raw.get("open_count") if raw.get("open_count") is not None else len(positions or []),
                 "account_equity": raw.get("account_equity"),
+                "account_start_equity": raw.get("account_start_equity"),
                 "ayo_start_equity": raw.get("ayo_start_equity"),
                 "trades_today": raw.get("trades_today", 0),
                 "fees_today": raw.get("fees_today", 0),
