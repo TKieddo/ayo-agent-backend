@@ -1648,7 +1648,17 @@ async def _reconcile_okx(
     from src.runners.rules import mark as ratchet_stop
 
     state = await client.get_user_state()
-    wallet = float(state.get("total_value") or state.get("balance") or state.get("account_value") or 0)
+    # Binance: prefer USDT asset only (spot never in fapi; still exclude BNB/BTC/USDC multi-asset).
+    wallet = 0.0
+    for row in state.get("asset_balances") or []:
+        if str(row.get("asset") or "").upper() != "USDT":
+            continue
+        cross = float(row.get("crossWalletBalance") or row.get("walletBalance") or 0)
+        upl = float(row.get("crossUnPnl") or 0)
+        wallet = cross + upl
+        break
+    if wallet <= 0:
+        wallet = float(state.get("total_value") or state.get("balance") or state.get("account_value") or 0)
     by_coin = {c.coin: c for c in coins}
     prev = {p.coin: p for p in book.positions}
     if book.position and book.position.coin not in prev:

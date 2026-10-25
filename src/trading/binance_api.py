@@ -920,9 +920,12 @@ class BinanceAPI:
             # Use v3 endpoint to get positionInitialMargin directly
             positions = await self._get_v3_position_risk()
             
-            # Extract relevant data
-            balance = float(account.get('totalWalletBalance', 0))
-            total_value = float(account.get('totalMarginBalance', 0))
+            # Account-level totals can include multi-asset mode (BNB/BTC/USDC valued in USDT).
+            # Spot is never in fapi — but we still pin hive/UI equity to USDT-M USDT only.
+            all_assets_wallet = float(account.get('totalWalletBalance', 0) or 0)
+            all_assets_margin = float(account.get('totalMarginBalance', 0) or 0)
+            balance = all_assets_wallet
+            total_value = all_assets_margin
             
             # Get all asset balances using the balance endpoint (more reliable for getting all assets)
             # This endpoint returns ALL assets (USDT, USDC, BTC, etc.) that have balances
@@ -1003,6 +1006,22 @@ class BinanceAPI:
                                 'positionValue': cross_wallet_balance,  # For compatibility with frontend
                             })
                     logger.info(f"Fetched {len(asset_balances)} asset balances from account endpoint: {[b['asset'] for b in asset_balances]}")
+
+            # Prefer USDT-M USDT only for balance/total_value (Confetti hive equity, Made, etc.).
+            usdt_row = next((b for b in asset_balances if str(b.get("asset") or "").upper() == "USDT"), None)
+            if usdt_row:
+                usdt_wallet = float(usdt_row.get("walletBalance") or usdt_row.get("crossWalletBalance") or 0)
+                usdt_cross = float(usdt_row.get("crossWalletBalance") or usdt_wallet)
+                usdt_upl = float(usdt_row.get("crossUnPnl") or 0)
+                balance = usdt_wallet
+                # Margin equity in USDT = cross wallet + USDT unrealized (not BNB/BTC/USDC).
+                total_value = usdt_cross + usdt_upl
+                if abs(all_assets_margin - total_value) > 1.0:
+                    logger.info(
+                        "Binance equity USDT-only $%.2f (account totalMarginBalance was $%.2f — other assets excluded)",
+                        total_value,
+                        all_assets_margin,
+                    )
             
             # Format positions
             enriched_positions = []
@@ -1111,12 +1130,19 @@ class BinanceAPI:
             return {
                 'balance': balance,
                 'total_value': total_value,
+                'total_value_all_assets': all_assets_margin,
                 'positions': enriched_positions,
                 'asset_balances': asset_balances  # Include all asset balances
             }
         except Exception as e:
             logger.error(f"Error getting user state: {e}")
-            return {'balance': 0, 'total_value': 0, 'positions': [], 'asset_balances': []}
+            return {
+                'balance': 0,
+                'total_value': 0,
+                'total_value_all_assets': 0,
+                'positions': [],
+                'asset_balances': [],
+            }
 
     async def get_current_price(self, asset: str) -> float:
         """Get current mark price for an asset."""
