@@ -1437,11 +1437,24 @@ def _hydrate_from_supabase() -> None:
     Only restores closes at/after race_epoch. If the container lost race_epoch (no volume),
     start a fresh epoch so ancient Supabase history cannot resurrect fake +5000% boards.
     """
+    # Only mint a fresh epoch when state was empty — do NOT do this on every Coolify
+    # restart if runners already carry a baseline (that made gains blink to zero).
     if not _STATE.get("race_epoch"):
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _STATE["race_epoch"] = now_iso
-        _STATE["started_at"] = _STATE.get("started_at") or now_iso
-        logger.info("hive hydrate: no race_epoch on disk — starting fresh epoch %s", now_iso)
+        has_baseline = any(
+            isinstance(raw, dict) and float(raw.get("account_start_equity") or 0) > 0
+            for raw in (_STATE.get("runners") or {}).values()
+        )
+        if has_baseline:
+            # Recover epoch from started_at so we do not wipe Made mid-session.
+            _STATE["race_epoch"] = _STATE.get("started_at") or time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            logger.info("hive hydrate: restored race_epoch from started_at=%s", _STATE["race_epoch"])
+        else:
+            now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            _STATE["race_epoch"] = now_iso
+            _STATE["started_at"] = _STATE.get("started_at") or now_iso
+            logger.info("hive hydrate: no race_epoch on disk — starting fresh epoch %s", now_iso)
 
     for runner in RUNNERS:
         db_trades = _fetch_runner_trades(runner)
@@ -2047,10 +2060,13 @@ async def _tick(decide: bool = True) -> None:
                             held,
                             with_pine=runner not in PUMP_RUNNERS,
                         )
-                wallet_eq = 0.0
+                prev_wallet = float(wallet_eq or 0)
                 upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                     book, client, runner_coins, now, runner=runner
                 )
+                # Exchange blips sometimes return 0 — keep last good wallet so cards don't flicker.
+                if (not wallet_eq or wallet_eq <= 0) and prev_wallet > 0:
+                    wallet_eq = prev_wallet
                 # Every tick (mark + decide): honor locked stops off live UPL mid.
                 # Mark-only used to skip decide → APR stayed open after piercing keep-75%.
                 stop_acts = _stop_closes_from_upl(book, upl_by_coin)
@@ -2134,20 +2150,25 @@ async def _tick(decide: bool = True) -> None:
             stored["day_key"] = time.strftime("%Y-%m-%d", time.gmtime(now))
             stored["mtm"] = round(mtm, 4)
             stored["upl"] = round(live_upl, 4)
-            stored["account_equity"] = round(float(wallet_eq or 0), 2)
-            # Baseline wallet at race epoch — honest exchange P&L vs demo account.
             prev_raw = _STATE["runners"].get(runner) or {}
+            prev_wallet_saved = float(prev_raw.get("account_equity") or 0)
+            if (not wallet_eq or float(wallet_eq) <= 0) and prev_wallet_saved > 0:
+                wallet_eq = prev_wallet_saved
+            stored["account_equity"] = round(float(wallet_eq or 0), 2)
+            # Baseline once per race epoch — never re-arm mid-race (stops gains blinking to 0).
             start_wallet = prev_raw.get("account_start_equity")
-            if (start_wallet is None or float(start_wallet or 0) <= 0) and wallet_eq and wallet_eq > 0:
+            if start_wallet is not None and float(start_wallet or 0) > 0:
+                start_wallet = round(float(start_wallet), 2)
+            elif wallet_eq and float(wallet_eq) > 0:
                 start_wallet = round(float(wallet_eq), 2)
-            stored["account_start_equity"] = (
-                round(float(start_wallet), 2) if start_wallet is not None else None
-            )
+            else:
+                start_wallet = None
+            stored["account_start_equity"] = start_wallet
             venue = "Binance" if runner in BINANCE_RUNNERS else "OKX"
             made = None
-            if stored["account_start_equity"] and wallet_eq:
+            if stored["account_start_equity"] and wallet_eq and float(wallet_eq) > 0:
                 made = float(wallet_eq) - float(stored["account_start_equity"])
-            made_bit = f" · made {made:+,.0f}" if made is not None else ""
+            made_bit = f" · gains {made:+,.0f}" if made is not None else ""
             wallet_bit = (
                 f" · {venue} ${float(wallet_eq):,.0f}{made_bit}" if wallet_eq and wallet_eq > 0 else ""
             )
