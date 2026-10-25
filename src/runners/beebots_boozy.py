@@ -280,7 +280,11 @@ def fallback_decide(
 
 
 def decide_confetti(book: Book, coins: List[Coin], now: float) -> List[Action]:
-    """Mechanical Momentum decisions for hive runner confetti (hive sizing)."""
+    """Mechanical Momentum for Confetti — up to MAX_OPENS concurrent (hive sizing).
+
+    Still BeeBots menus per slot, but free slots can fill with other top movers
+    instead of riding a single MAGMA forever while 2/3 sit empty.
+    """
     ranked = rank_candidates(coins)
     _update_top1(ranked, now)
     top = ranked[:BOOZY_CANDIDATES]
@@ -293,7 +297,7 @@ def decide_confetti(book: Book, coins: List[Coin], now: float) -> List[Action]:
         extras = sorted(opens, key=lambda p: p.notional)[: len(opens) - MAX_OPENS]
         return [Action("close", p.coin, p.side, reason="slot_cap") for p in extras]
 
-    # Hard stop / trail / locks first.
+    # Hard stop / trail / locks on every open first.
     for pos in opens:
         coin = by_coin.get(pos.coin)
         if coin:
@@ -301,34 +305,41 @@ def decide_confetti(book: Book, coins: List[Coin], now: float) -> List[Action]:
             if stop_hit(pos, coin.mid):
                 return [Action("close", pos.coin, pos.side, reason="stop")]
 
-    if not opens:
-        menu = _menu_flat(top)
-        pick = fallback_decide(menu, None)
-        if not pick or menu[pick][0] == "hold":
-            return [Action("hold", reason="no_setup" if not menu else "wait")]
-        kind, coin, side, reason = menu[pick]
-        if kind == "open" and coin and side:
-            return [Action("open", coin, side, ENTRY_NOTIONAL, reason)]
-        return [Action("hold", reason="wait")]
+    # Per-slot exits / pyramid (one action per tick — same as other hive books).
+    for pos in opens:
+        coin = by_coin.get(pos.coin)
+        menu = _menu_held(pos, coin, top, ranked, now)
+        upl_r = _upl_r(pos, coin) if coin else None
+        pick = fallback_decide(menu, upl_r)
+        if not pick:
+            continue
+        kind, c_coin, side, reason = menu[pick]
+        if kind == "close":
+            return [Action("close", pos.coin, pos.side, reason=reason)]
+        if kind == "add":
+            return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, reason)]
+        if kind == "switch" and c_coin and side:
+            # Only rotate when flat slots are full — otherwise just open the new name.
+            if len(opens) >= MAX_OPENS:
+                actions = [Action("close", pos.coin, pos.side, reason=reason)]
+                if c_coin != pos.coin or side != pos.side:
+                    actions.append(Action("open", c_coin, side, ENTRY_NOTIONAL, reason))
+                return actions
+            # Free slot: open the stronger name beside the current ride.
+            if c_coin != pos.coin and side:
+                held = {p.coin for p in opens}
+                if c_coin not in held:
+                    return [Action("open", c_coin, side, ENTRY_NOTIONAL, reason)]
 
-    pos = opens[0]
-    coin = by_coin.get(pos.coin)
-    menu = _menu_held(pos, coin, top, ranked, now)
-    upl_r = _upl_r(pos, coin) if coin else None
-    pick = fallback_decide(menu, upl_r)
-    if not pick:
+    # Fill free slots with next ranked impulses not already held.
+    if len(opens) < MAX_OPENS:
+        held = {p.coin for p in opens}
+        for c in ranked:
+            if c.coin.coin in held or not c.impulse:
+                continue
+            return [Action("open", c.coin.coin, c.impulse, ENTRY_NOTIONAL, "entry")]
+        if not opens:
+            return [Action("hold", reason="no_setup" if not ranked else "wait")]
         return [Action("hold", reason="ride")]
-    kind, c_coin, side, reason = menu[pick]
-    if kind == "hold":
-        return [Action("hold", reason=reason or "ride")]
-    if kind == "close":
-        return [Action("close", pos.coin, pos.side, reason=reason)]
-    if kind == "add":
-        return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, reason)]
-    if kind == "switch" and c_coin and side:
-        # Close held, then open target (same tick if different coin; flip = close+open same).
-        actions = [Action("close", pos.coin, pos.side, reason=reason)]
-        if c_coin != pos.coin or side != pos.side:
-            actions.append(Action("open", c_coin, side, ENTRY_NOTIONAL, reason))
-        return actions
-    return [Action("hold", reason="ride")]
+
+    return [Action("hold", reason="slots_full" if opens else "wait")]
