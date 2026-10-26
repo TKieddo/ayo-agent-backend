@@ -43,11 +43,13 @@ DEFAULTS: Dict[str, Any] = {
     # Regime: trade trends; mild chop allowed so we are not dark for days.
     "mech_adx_min": 16.0,
     "mech_adx_range_max": 22.0,
-    "mech_enable_range_mr": True,
+    # Range fades are fee-hostile on OKX demo — keep impulse + breakout only.
+    "mech_enable_range_mr": False,
     "mech_ema_min_separation_pct": 0.04,
     # Middle-ground ATR band (15m %): move must clear fees; not meme chaos.
-    "mech_atr_min_pct": 0.30,
-    "mech_atr_max_pct": 4.0,
+    # DB had 0.55/3.0 + ADX 25 which left AYO dark while hive bots traded.
+    "mech_atr_min_pct": 0.25,
+    "mech_atr_max_pct": 3.5,
     "mech_atr_stop_mult": 2.0,
     "mech_impulse_rr": 2.0,
     "mech_breakout_rr": 2.0,
@@ -72,7 +74,9 @@ DEFAULTS: Dict[str, Any] = {
     "mech_universe": "BTC ETH SOL XRP BNB DOGE ADA LINK AVAX DOT LTC NEAR APT SUI INJ FIL ARB OP",
     "mech_impulse_universe": "BTC ETH SOL XRP BNB DOGE LINK AVAX NEAR",
     "mech_active_universe": "",
-    "mech_use_pair_hunter": True,
+    # Pair hunter often injects unlisted/meme names with 0 candles (QNT/PUMP/ORDER).
+    # Static liquid majors are the reliable book; hunter is opt-in.
+    "mech_use_pair_hunter": False,
     "mech_stop_buffer_pct": 0.05,
     "mech_min_stop_pct": 0.25,
     "mech_max_stop_pct": 3.5,

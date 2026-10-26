@@ -118,8 +118,10 @@ CONFIG = {
         "STOCK_ASSETS",
         "AAPL MSFT NVDA AMZN META GOOGL AVGO TSLA AMD PLTR SMCI ARM BABA TSM ASML CRM NOW SNOW SPY QQQ XLK SOXX",
     ),
-    # Stock book (Alpaca only) — distinct from crypto mechanical / ROI% exits
-    "enable_stock_scanner": _get_bool("ENABLE_STOCK_SCANNER", True),
+    # Stock book (Alpaca only) — distinct from crypto mechanical / ROI% exits.
+    # Default OFF: penny stock scalps burned cycles/slots and rarely paid; crypto AYO first.
+    "enable_stock_trading": _get_bool("ENABLE_STOCK_TRADING", False),
+    "enable_stock_scanner": _get_bool("ENABLE_STOCK_SCANNER", False),
     "stock_scanner_top_n": _get_int("STOCK_SCANNER_TOP_N", 5),
     "stock_scanner_refresh_minutes": _get_float("STOCK_SCANNER_REFRESH_MINUTES", 15.0),
     "stock_notional_per_position": _get_float("STOCK_NOTIONAL_PER_POSITION", 50.0),

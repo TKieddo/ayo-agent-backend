@@ -2225,6 +2225,14 @@ def main():
     async def _stock_book_cycle(trading_settings: dict) -> None:
         """Alpaca-only stock cycle: scanner → Sneaky Pivot → ATR/structure SL + 1.5R TP."""
         global _STOCK_SKIP_LOGGED
+        if not CONFIG.get("enable_stock_trading", False):
+            _STOCK_STATE["ready"] = False
+            _STOCK_STATE["block_reason"] = "ENABLE_STOCK_TRADING=false"
+            if not _STOCK_SKIP_LOGGED:
+                add_event("📕 Stock book PAUSED (ENABLE_STOCK_TRADING=false) — crypto AYO only")
+                logging.info("Stock book PAUSED: ENABLE_STOCK_TRADING=false")
+                _STOCK_SKIP_LOGGED = True
+            return
         alpaca = _alpaca_client()
         if not alpaca:
             has_key = bool(CONFIG.get("alpaca_api_key") and CONFIG.get("alpaca_api_secret"))
@@ -3050,9 +3058,17 @@ def main():
                     for a in (hunted_assets or getattr(run_loop, "_last_hunted_assets", None) or [])
                     if _mech_allowed(str(a))
                 ]
+                # Default OFF — hunter often feeds unlisted memes with 0 OKX candles.
                 use_hunter = str(
-                    trading_settings.get("mech_use_pair_hunter", CONFIG.get("mech_use_pair_hunter", True))
+                    trading_settings.get(
+                        "mech_use_pair_hunter",
+                        CONFIG.get("mech_use_pair_hunter", False),
+                    )
                 ).lower() not in ("0", "false", "no", "off")
+                if use_hunter and hunted_now:
+                    # Only keep names that are on the liquid allowlist (majors).
+                    allow = set(mech.liquid_universe(mech.resolve_config(trading_settings, CONFIG)))
+                    hunted_now = [a for a in hunted_now if a in allow]
                 if use_hunter and hunted_now:
                     trading_settings["mech_active_universe"] = " ".join(hunted_now)
                 else:
