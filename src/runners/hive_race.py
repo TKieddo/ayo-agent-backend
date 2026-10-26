@@ -71,6 +71,9 @@ HIVE_DECIDE_EVERY = 4  # decide ≈ every 32s
 # restarts. Never let that block wallet reconcile or stop flatten.
 HIVE_SCAN_TIMEOUT_S = float(os.getenv("HIVE_SCAN_TIMEOUT_S", "75") or 75)
 HIVE_HELD_TIMEOUT_S = float(os.getenv("HIVE_HELD_TIMEOUT_S", "20") or 20)
+# Exchange reconcile/close must not freeze the whole hive (Confetti Q stop hang).
+HIVE_EXCHANGE_TIMEOUT_S = float(os.getenv("HIVE_EXCHANGE_TIMEOUT_S", "25") or 25)
+HIVE_RUNNER_TIMEOUT_S = float(os.getenv("HIVE_RUNNER_TIMEOUT_S", "60") or 60)
 # Prevent double-booking the same close into race equity (Oppo/Windward CAP spam).
 # Time window alone was too short — stops re-fired every ~3–5m while the exchange
 # position was still open and booked the same paper UPL again (ENA +16.26 ×14).
@@ -1641,11 +1644,22 @@ async def _order(
     qty = abs(float(coin_qty)) if coin_qty and coin_qty > 0 else (notional / price if price else 0)
     if qty <= 0:
         return 0.0
+    timeout = max(8.0, HIVE_EXCHANGE_TIMEOUT_S)
+    # Fast flatten path — skips Binance futures_exchange_info which hung Confetti stops.
+    if reduce_only and hasattr(client, "close_position_market"):
+        await asyncio.wait_for(
+            client.close_position_market(coin, qty, is_long=(side == "long")),
+            timeout=timeout,
+        )
+        return qty
     if side == "long":
         fn = client.place_sell_order if reduce_only else client.place_buy_order
     else:
         fn = client.place_buy_order if reduce_only else client.place_sell_order
-    await fn(coin, qty, leverage=LEVERAGE, reduce_only=reduce_only)
+    await asyncio.wait_for(
+        fn(coin, qty, leverage=LEVERAGE, reduce_only=reduce_only),
+        timeout=timeout,
+    )
     return qty
 
 
@@ -1737,7 +1751,10 @@ async def _reconcile_okx(
     """Overwrite book.positions from live opens; return UPL map, total UPL, wallet equity."""
     from src.runners.rules import mark as ratchet_stop
 
-    state = await client.get_user_state()
+    state = await asyncio.wait_for(
+        client.get_user_state(),
+        timeout=max(8.0, HIVE_EXCHANGE_TIMEOUT_S),
+    )
     # Binance: prefer USDT asset only (spot never in fapi; still exclude BNB/BTC/USDC multi-asset).
     wallet = 0.0
     for row in state.get("asset_balances") or []:
@@ -1805,16 +1822,27 @@ async def _reconcile_okx(
         else:
             pct = stop_pct(quote, runner=runner) if quote else None
             stop = stop_price(side, entry, pct or 8.0) if entry else entry
-            peak = mark_px or entry
+            # Never seed peak on the losing side of entry (Confetti Q mid << entry).
+            if side == "long":
+                peak = max(float(entry or 0), float(mark_px or 0))
+            else:
+                cands = [float(x) for x in (entry, mark_px) if x and float(x) > 0]
+                peak = min(cands) if cands else float(entry or 0)
             opened_at = now
             added = notional > ENTRY_NOTIONAL * 1.15
             risk = abs(entry - stop) / entry * notional if entry else 0.0
             peak_upl = 0.0
         # Never let peak sit on the wrong side of entry while UPL is winning.
-        if side == "long" and mark_px > peak:
-            peak = mark_px
-        elif side == "short" and mark_px > 0 and (peak <= 0 or mark_px < peak):
-            peak = mark_px
+        if side == "long":
+            if entry > 0 and peak < entry:
+                peak = entry
+            if mark_px > peak:
+                peak = mark_px
+        else:
+            if entry > 0 and (peak <= 0 or peak > entry):
+                peak = entry
+            if mark_px > 0 and mark_px < peak:
+                peak = mark_px
         if live_upl > peak_upl:
             peak_upl = live_upl
         row = Pos(
@@ -1923,7 +1951,10 @@ async def _act(
             return
         # Confirm exchange flattened before booking PnL into race ledger / Supabase.
         try:
-            state = await client.get_user_state()
+            state = await asyncio.wait_for(
+                client.get_user_state(),
+                timeout=max(8.0, HIVE_EXCHANGE_TIMEOUT_S),
+            )
         except Exception as exc:
             _PENDING_CLOSE_AT[idem] = now
             logger.warning("hive %s close verify failed %s: %s", runner, pos.coin, exc)
@@ -2216,16 +2247,26 @@ async def _runners_tick(*, decide_entries: bool) -> None:
                 stop_acts = _stop_closes_from_upl(book, upl_by_coin)
                 if stop_acts:
                     for action in _dedupe_actions(stop_acts):
-                        await _act(
-                            runner,
-                            client,
-                            book,
-                            runner_coins,
-                            action,
-                            trades,
-                            now,
-                            live_upl_by_coin=upl_by_coin,
-                        )
+                        try:
+                            await asyncio.wait_for(
+                                _act(
+                                    runner,
+                                    client,
+                                    book,
+                                    runner_coins,
+                                    action,
+                                    trades,
+                                    now,
+                                    live_upl_by_coin=upl_by_coin,
+                                ),
+                                timeout=max(12.0, HIVE_EXCHANGE_TIMEOUT_S + 5),
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "hive %s stop close timed out %s — continuing race loop",
+                                runner,
+                                action.coin,
+                            )
                     upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                         book, client, runner_coins, now, runner=runner
                     )
@@ -2321,6 +2362,8 @@ async def _runners_tick(*, decide_entries: bool) -> None:
                 f"${ENTRY_MARGIN:.0f} margin · {venue}{wallet_bit}"
             )
             _STATE["runners"][runner] = stored
+            # Heartbeat after each runner so a stuck Confetti close cannot freeze updated_at.
+            _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _save()
 
 

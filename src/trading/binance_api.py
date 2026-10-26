@@ -140,6 +140,68 @@ class BinanceAPI:
             return None
         return None
 
+    async def close_position_market(self, asset: str, quantity: float, *, is_long: bool) -> Any:
+        """Flatten a position without futures_exchange_info (that call can hang hive stops)."""
+        symbol = self._to_futures_symbol(asset)
+        qty = abs(float(quantity or 0))
+        if qty <= 0:
+            # Fall back to exchange-reported size.
+            try:
+                positions = await self._retry(
+                    lambda: self.client.futures_position_information(symbol=symbol)
+                )
+                for pos in positions or []:
+                    if pos.get("symbol") != symbol:
+                        continue
+                    amt = abs(float(pos.get("positionAmt", 0) or 0))
+                    if amt > 0:
+                        qty = amt
+                        break
+            except Exception as exc:
+                logger.warning("Binance close size lookup failed for %s: %s", asset, exc)
+        if qty <= 0:
+            return None
+
+        side = "SELL" if is_long else "BUY"
+        order_params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+        }
+        position_side = await self._get_active_position_side(symbol)
+        if position_side:
+            order_params["positionSide"] = position_side
+        else:
+            order_params["reduceOnly"] = "true"
+
+        try:
+            order = await self._retry(lambda: self.client.futures_create_order(**order_params))
+            logger.info(
+                "Closed %s %s qty=%s reduceOnly market (fast path)",
+                asset,
+                "LONG" if is_long else "SHORT",
+                qty,
+            )
+            return order
+        except BinanceAPIException as e:
+            # Last resort: closePosition flag (hedge / precision edge cases).
+            try:
+                fallback = {
+                    "symbol": symbol,
+                    "side": side,
+                    "type": "MARKET",
+                    "closePosition": "true",
+                }
+                if position_side:
+                    fallback["positionSide"] = position_side
+                order = await self._retry(lambda: self.client.futures_create_order(**fallback))
+                logger.info("Closed %s via closePosition fallback after: %s", asset, e.message)
+                return order
+            except Exception as e2:
+                logger.error("Failed fast close for %s: %s / fallback: %s", asset, e.message, e2)
+                raise
+
     async def _retry(self, fn, *args, max_attempts: int = 3, backoff: float = 0.5, **kwargs):
         """Retry helper with exponential backoff."""
         last_err = None
