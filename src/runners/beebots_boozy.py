@@ -21,6 +21,7 @@ from src.runners.rules import (
     ENTRY_NOTIONAL,
     MAX_OPENS,
     MAX_SLOT_NOTIONAL,
+    MAX_STOP_PCT,
     Pos,
     stop_hit,
     stop_price,
@@ -161,16 +162,36 @@ def _upl_r(pos: Pos, coin: Coin) -> float:
 
 
 def boozy_stop_px(side: str, entry: float, coin: Coin) -> float:
+    """Initial disaster stop: 2.5× ATR(1h), hard-capped at MAX_STOP_PCT (~$20 on $400).
+
+    Uncapped ATR on meme names produced −50%+ stops (Confetti Q) that looked like
+    a guide but barely protected the margin before the first profit lock.
+    """
     atr = atr1h_px(coin)
     if atr is None or atr <= 0:
-        # Fallback: 2.5 × atr1h_pct as % of price if we only have pct
         pct = STOP_ATR1H * float(coin.atr1h_pct or coin.atr15_pct or 1.0)
-        return stop_price(side, entry, min(pct, 8.0))
-    return entry - STOP_ATR1H * atr if side == "long" else entry + STOP_ATR1H * atr
+        return stop_price(side, entry, min(pct, MAX_STOP_PCT))
+    raw = entry - STOP_ATR1H * atr if side == "long" else entry + STOP_ATR1H * atr
+    capped = stop_price(side, entry, MAX_STOP_PCT)
+    if side == "long":
+        return max(raw, capped)
+    return min(raw, capped)
+
+
+def _cap_disaster_stop(pos: Pos) -> None:
+    """Tighten legacy wide ATR stops up to the 5% race cap (never loosens a lock)."""
+    if pos.entry_px <= 0:
+        return
+    capped = stop_price(pos.side, pos.entry_px, MAX_STOP_PCT)
+    if pos.side == "long" and 0 < pos.stop_px < capped:
+        pos.stop_px = capped
+    elif pos.side == "short" and (pos.stop_px <= 0 or pos.stop_px > capped):
+        pos.stop_px = capped
 
 
 def mark_boozy(pos: Pos, coin: Coin) -> None:
     """Trail 2.0× ATR(1h) + BeeBots profit-lock rungs (same as boozy)."""
+    _cap_disaster_stop(pos)
     if pos.side == "long":
         if coin.mid > pos.peak_px:
             pos.peak_px = coin.mid
@@ -178,7 +199,12 @@ def mark_boozy(pos: Pos, coin: Coin) -> None:
         pos.peak_px = coin.mid
 
     atr = atr1h_px(coin)
-    if atr and atr > 0:
+    # Skip ATR trail once a profit lock is already above entry — ATR hugs price
+    # and would cut a small retest that the keep-% floor is meant to survive.
+    locked = (pos.side == "long" and pos.stop_px > pos.entry_px) or (
+        pos.side == "short" and 0 < pos.stop_px < pos.entry_px
+    )
+    if atr and atr > 0 and not locked:
         trail = coin.mid - TRAIL_ATR1H * atr if pos.side == "long" else coin.mid + TRAIL_ATR1H * atr
         if pos.side == "long" and trail > pos.stop_px:
             pos.stop_px = trail
