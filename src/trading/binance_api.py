@@ -123,7 +123,11 @@ class BinanceAPI:
         return symbol.replace("USDT", "")
 
     async def _get_active_position_side(self, symbol: str) -> Optional[str]:
-        """Return active positionSide ('LONG'/'SHORT') when available."""
+        """Return hedge-mode positionSide ('LONG'/'SHORT') or None for one-way (BOTH).
+
+        Inventing LONG/SHORT from signed qty in one-way mode causes -4061
+        ("Order's position side does not match user's setting").
+        """
         try:
             positions = await self._retry(lambda: self.client.futures_position_information(symbol=symbol))
             for pos in positions:
@@ -135,10 +139,60 @@ class BinanceAPI:
                 side = (pos.get("positionSide") or "").upper().strip()
                 if side in {"LONG", "SHORT"}:
                     return side
-                return "LONG" if pos_amt > 0 else "SHORT"
+                # BOTH / blank = one-way — omit positionSide; use reduceOnly instead.
+                return None
         except Exception:
             return None
         return None
+
+    def _futures_base_url(self) -> str:
+        return "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
+
+    def _signed_fapi_post(self, path: str, params: Dict[str, Any]) -> Any:
+        """POST a signed USD-M futures request (used for /fapi/v1/algoOrder)."""
+        body = dict(params)
+        body["timestamp"] = int(time.time() * 1000)
+        body.setdefault("recvWindow", 60000)
+        # Drop None so signatures stay clean.
+        body = {k: v for k, v in body.items() if v is not None}
+        query = urllib.parse.urlencode(body, doseq=True)
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        body["signature"] = signature
+        url = f"{self._futures_base_url()}{path}"
+        response = requests.post(
+            url,
+            params=body,
+            headers={"X-MBX-APIKEY": self.api_key},
+            timeout=12,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            response.raise_for_status()
+            raise
+        err_code = data.get("code") if isinstance(data, dict) else None
+        if response.status_code >= 400 or (isinstance(err_code, int) and err_code < 0):
+            raise BinanceAPIException(response, response.status_code, response.text)
+        return data
+
+    async def _create_algo_order(self, **params: Any) -> Any:
+        """Place conditional order via Algo API (STOP_MARKET etc. after 2025-12-09)."""
+        payload = dict(params)
+        payload.setdefault("algoType", "CONDITIONAL")
+        # New API uses triggerPrice; accept legacy stopPrice callers.
+        if "triggerPrice" not in payload and "stopPrice" in payload:
+            payload["triggerPrice"] = payload.pop("stopPrice")
+        else:
+            payload.pop("stopPrice", None)
+
+        create_algo = getattr(self.client, "futures_create_algo_order", None)
+        if callable(create_algo):
+            return await self._retry(lambda: create_algo(**payload))
+        return await self._retry(lambda: self._signed_fapi_post("/fapi/v1/algoOrder", payload))
 
     async def place_protective_stop(
         self,
@@ -148,7 +202,7 @@ class BinanceAPI:
         sl_price: float,
         quantity: float = 0.0,
     ) -> Any:
-        """Rest a STOP_MARKET reduce-only without futures_exchange_info (that call hangs hive)."""
+        """Rest a STOP_MARKET closePosition guide via Algo Order API (no exchangeInfo)."""
         symbol = self._to_futures_symbol(asset)
         sl = float(sl_price or 0)
         if sl <= 0:
@@ -161,13 +215,13 @@ class BinanceAPI:
             "symbol": symbol,
             "side": side,
             "type": "STOP_MARKET",
-            "stopPrice": sl,
+            "triggerPrice": sl,
             "workingType": "MARK_PRICE",
             "closePosition": "true",
         }
         if position_side:
             params["positionSide"] = position_side
-        order = await self._retry(lambda: self.client.futures_create_order(**params))
+        order = await self._create_algo_order(**params)
         logger.info(
             "Pinned protective STOP_MARKET %s %s @ %s",
             asset,
@@ -179,9 +233,8 @@ class BinanceAPI:
     async def close_position_market(self, asset: str, quantity: float, *, is_long: bool) -> Any:
         """Flatten a live futures position.
 
-        Always re-read positionAmt so a wrong book side cannot sell into a short.
-        Binance rejects ``closePosition`` on plain MARKET — use STOP_MARKET
-        closePosition triggered through the mark (immediate flatten), then qty MARKET.
+        Prefer qty MARKET + reduceOnly (one-way) / hedge positionSide.
+        Algo STOP_MARKET closePosition is a fallback — plain /order rejects it (-4120).
         """
         symbol = self._to_futures_symbol(asset)
         qty = abs(float(quantity or 0))
@@ -208,37 +261,7 @@ class BinanceAPI:
         position_side = await self._get_active_position_side(symbol)
         errors: list[str] = []
 
-        # 1) Immediate STOP_MARKET + closePosition (valid Binance flatten; MARKET+closePosition is not).
-        try:
-            ticker = await self._retry(lambda: self.client.futures_symbol_ticker(symbol=symbol))
-            px = float(ticker.get("price") or 0)
-            if px > 0:
-                # BUY stop triggers when price >= stop; SELL when price <= stop.
-                # Nudge through the mark so the stop is already active.
-                stop_px = px * (0.998 if not live_long else 1.002)
-                stop_params: Dict[str, Any] = {
-                    "symbol": symbol,
-                    "side": side,
-                    "type": "STOP_MARKET",
-                    "stopPrice": stop_px,
-                    "closePosition": "true",
-                    "workingType": "MARK_PRICE",
-                }
-                if position_side:
-                    stop_params["positionSide"] = position_side
-                order = await self._retry(lambda: self.client.futures_create_order(**stop_params))
-                logger.info(
-                    "Closed %s %s via STOP_MARKET closePosition @ ~%s",
-                    asset,
-                    "LONG" if live_long else "SHORT",
-                    stop_px,
-                )
-                return order
-        except Exception as exc:
-            errors.append(f"stop_close: {exc}")
-            logger.warning("Binance STOP_MARKET close failed for %s: %s", asset, exc)
-
-        # 2) MARKET reduceOnly with live qty (trim obvious float junk).
+        # 1) MARKET reduceOnly / hedge positionSide — correct flatten for pierced stops.
         try:
             qty_str = f"{qty:.8f}".rstrip("0").rstrip(".")
             order_params: Dict[str, Any] = {
@@ -261,8 +284,37 @@ class BinanceAPI:
             return order
         except Exception as exc:
             errors.append(f"qty_market: {exc}")
+            logger.warning("Binance MARKET close failed for %s: %s", asset, exc)
+
+        # 2) Algo STOP_MARKET + closePosition (nudged through mark → immediate trigger).
+        try:
+            ticker = await self._retry(lambda: self.client.futures_symbol_ticker(symbol=symbol))
+            px = float(ticker.get("price") or 0)
+            if px > 0:
+                stop_px = px * (0.998 if not live_long else 1.002)
+                stop_params: Dict[str, Any] = {
+                    "symbol": symbol,
+                    "side": side,
+                    "type": "STOP_MARKET",
+                    "triggerPrice": stop_px,
+                    "closePosition": "true",
+                    "workingType": "MARK_PRICE",
+                }
+                if position_side:
+                    stop_params["positionSide"] = position_side
+                order = await self._create_algo_order(**stop_params)
+                logger.info(
+                    "Closed %s %s via algo STOP_MARKET closePosition @ ~%s",
+                    asset,
+                    "LONG" if live_long else "SHORT",
+                    stop_px,
+                )
+                return order
+        except Exception as exc:
+            errors.append(f"stop_close: {exc}")
             logger.error("Failed Binance flatten for %s: %s", asset, " | ".join(errors))
             raise RuntimeError(" | ".join(errors)) from exc
+        raise RuntimeError(" | ".join(errors) or f"no live size for {asset}")
 
     async def _retry(self, fn, *args, max_attempts: int = 3, backoff: float = 0.5, **kwargs):
         """Retry helper with exponential backoff."""
