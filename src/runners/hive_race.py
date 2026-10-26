@@ -1525,30 +1525,195 @@ def _trades_in_epoch(trades: List[dict]) -> List[dict]:
     return out
 
 
+_HIVE_META_RUNNER = "__hive_meta__"
+_META_PERSISTED_SIG: Optional[str] = None
+
+
+def _fetch_hive_meta() -> Optional[Dict[str, Any]]:
+    """Latest durable race_epoch row (survives Coolify when local data/ is wiped)."""
+    creds = _supabase_rest()
+    if not creds:
+        return None
+    url, key = creds
+    qs = urllib.parse.urlencode(
+        {
+            "select": "symbol,executed_at,venue,runner",
+            "runner": f"eq.{_HIVE_META_RUNNER}",
+            "symbol": "eq.RACE_EPOCH",
+            "order": "executed_at.desc",
+            "limit": "1",
+        }
+    )
+    try:
+        req = urllib.request.Request(
+            f"{url}/rest/v1/trades?{qs}",
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            rows = json.loads(resp.read().decode() or "[]")
+        if not rows or not isinstance(rows[0], dict):
+            return None
+        row = rows[0]
+        ep = str(row.get("executed_at") or "")
+        if ep.endswith("+00:00"):
+            ep = ep[:-6] + "Z"
+        elif ep and not ep.endswith("Z") and "T" in ep:
+            ep = ep.split(".")[0] + "Z"
+        if not ep:
+            return None
+        started = ep
+        starts: Dict[str, float] = {}
+        venue = str(row.get("venue") or "")
+        if venue.startswith("meta|"):
+            try:
+                blob = json.loads(venue.split("|", 1)[1] or "{}")
+                if isinstance(blob, dict):
+                    if blob.get("started_at"):
+                        started = str(blob["started_at"])
+                    raw_starts = blob.get("starts") or {}
+                    if isinstance(raw_starts, dict):
+                        for rid, val in raw_starts.items():
+                            try:
+                                starts[str(rid)] = float(val)
+                            except (TypeError, ValueError):
+                                continue
+            except Exception:
+                pass
+        return {"race_epoch": ep, "started_at": started, "starts": starts}
+    except Exception as exc:
+        logger.warning("hive meta fetch failed: %s", exc)
+        return None
+
+
+def _hive_meta_sig() -> str:
+    ep = str(_STATE.get("race_epoch") or "")
+    starts = []
+    for rid in RUNNERS:
+        raw = _STATE["runners"].get(rid) or {}
+        try:
+            v = float(raw.get("account_start_equity") or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            starts.append(f"{rid}:{v:.2f}")
+    return f"{ep}|{'|'.join(starts)}"
+
+
+def _persist_hive_meta(*, force: bool = False) -> None:
+    """Write race_epoch + wallet baselines to Supabase so deploys do not reset the board."""
+    global _META_PERSISTED_SIG
+    ep = _STATE.get("race_epoch")
+    if not ep:
+        return
+    sig = _hive_meta_sig()
+    if not force and sig == _META_PERSISTED_SIG:
+        return
+    creds = _supabase_rest()
+    if not creds:
+        return
+    starts: Dict[str, float] = {}
+    for rid in RUNNERS:
+        raw = _STATE["runners"].get(rid) or {}
+        try:
+            v = float(raw.get("account_start_equity") or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v > 0:
+            starts[rid] = round(v, 2)
+    url, key = creds
+    payload = {
+        "symbol": "RACE_EPOCH",
+        "side": "buy",
+        "size": 0.001,
+        "price": 1.0,
+        "fee": 0.0,
+        "pnl": 0.0,
+        "executed_at": ep,
+        "book": "crypto",
+        "venue": "meta|"
+        + json.dumps(
+            {"started_at": _STATE.get("started_at") or ep, "starts": starts},
+            separators=(",", ":"),
+        ),
+        "runner": _HIVE_META_RUNNER,
+    }
+    try:
+        req = urllib.request.Request(
+            f"{url}/rest/v1/trades",
+            data=json.dumps(payload).encode(),
+            method="POST",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status not in (200, 201, 204):
+                raise RuntimeError(f"supabase status {resp.status}")
+        _META_PERSISTED_SIG = sig
+        logger.info("hive meta persisted epoch=%s starts=%s", ep, list(starts.keys()))
+    except Exception as exc:
+        logger.warning("hive meta persist failed: %s", exc)
+
+
+def _oldest_hive_trade_at() -> Optional[str]:
+    """Earliest durable hive close — last resort so a deploy does not mint a blank race."""
+    oldest: Optional[str] = None
+    for runner in RUNNERS:
+        trades = _fetch_runner_trades(runner, limit=1)
+        if runner == "oppo_mayhem":
+            trades = trades + _fetch_runner_trades("mayhem_inv", limit=1)
+        for t in trades:
+            at = str(t.get("at") or "")
+            if at and (oldest is None or at < oldest):
+                oldest = at
+    return oldest
+
+
+def _recover_race_epoch() -> Optional[Dict[str, Any]]:
+    """Restore epoch after Coolify wipe. Never invent 'now' when history exists."""
+    env_ep = (os.getenv("HIVE_RACE_EPOCH") or "").strip()
+    if env_ep:
+        return {"race_epoch": env_ep, "started_at": env_ep, "starts": {}}
+    meta = _fetch_hive_meta()
+    if meta and meta.get("race_epoch"):
+        return meta
+    oldest = _oldest_hive_trade_at()
+    if oldest:
+        logger.info("hive hydrate: no meta row — using oldest close %s as epoch floor", oldest)
+        return {"race_epoch": oldest, "started_at": oldest, "starts": {}}
+    return None
+
+
 def _hydrate_from_supabase() -> None:
     """Merge durable Supabase hive closes into in-memory/file state after Coolify wipes.
 
-    Only restores closes at/after race_epoch. If the container lost race_epoch (no volume),
-    start a fresh epoch so ancient Supabase history cannot resurrect fake +5000% boards.
+    Only restores closes at/after race_epoch. Deploys must NOT mint a new epoch — that
+    wiped closed trades / Made every Coolify restart. Fresh epoch only via reset_race
+    or a truly empty first install.
     """
-    # Only mint a fresh epoch when state was empty — do NOT do this on every Coolify
-    # restart if runners already carry a baseline (that made gains blink to zero).
     if not _STATE.get("race_epoch"):
-        has_baseline = any(
-            isinstance(raw, dict) and float(raw.get("account_start_equity") or 0) > 0
-            for raw in (_STATE.get("runners") or {}).values()
-        )
-        if has_baseline:
-            # Recover epoch from started_at so we do not wipe Made mid-session.
-            _STATE["race_epoch"] = _STATE.get("started_at") or time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+        recovered = _recover_race_epoch()
+        if recovered:
+            _STATE["race_epoch"] = recovered["race_epoch"]
+            _STATE["started_at"] = _STATE.get("started_at") or recovered.get("started_at") or recovered["race_epoch"]
+            for rid, start_eq in (recovered.get("starts") or {}).items():
+                raw = dict(_STATE["runners"].get(rid) or {})
+                if not float(raw.get("account_start_equity") or 0) and float(start_eq or 0) > 0:
+                    raw["account_start_equity"] = float(start_eq)
+                    _STATE["runners"][rid] = raw
+            logger.info(
+                "hive hydrate: recovered race_epoch=%s (Coolify-safe, not a reset)",
+                _STATE["race_epoch"],
             )
-            logger.info("hive hydrate: restored race_epoch from started_at=%s", _STATE["race_epoch"])
         else:
             now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             _STATE["race_epoch"] = now_iso
             _STATE["started_at"] = _STATE.get("started_at") or now_iso
-            logger.info("hive hydrate: no race_epoch on disk — starting fresh epoch %s", now_iso)
+            logger.info("hive hydrate: first install — new epoch %s", now_iso)
+            _persist_hive_meta()
 
     for runner in RUNNERS:
         db_trades = _fetch_runner_trades(runner)
@@ -1581,11 +1746,15 @@ def _hydrate_from_supabase() -> None:
             )
         _STATE["runners"][runner] = _align_runner_to_epoch(raw)
 
+    # Seed / refresh durable meta so the next Coolify deploy recovers this epoch.
+    _persist_hive_meta()
+
 
 async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
     """Flatten hive demo books and restart the $300 race ledger (clean scoreboard).
 
-    Does not wipe Supabase trade history — race_epoch filters the board to this race only.
+    Explicit only — Coolify deploys must never call this. Does not wipe Supabase
+    trade history; race_epoch filters the board to this race only.
     AYO practice row is left alone (separate OKX key).
     """
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1639,6 +1808,7 @@ async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
                 "account_start_equity": None,
             }
         _save()
+        _persist_hive_meta(force=True)
     logger.info("hive race reset epoch=%s flatten=%s", now_iso, flatten)
     return {
         "ok": True,
@@ -2385,6 +2555,8 @@ async def _runners_tick(*, decide_entries: bool) -> None:
             # Heartbeat after each runner so a stuck Confetti close cannot freeze updated_at.
             _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _save()
+        # Persist epoch + wallet baselines when they first appear (Coolify-safe).
+        _persist_hive_meta()
 
 
 async def _tick(decide: bool = True) -> None:
