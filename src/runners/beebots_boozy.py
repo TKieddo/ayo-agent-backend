@@ -300,12 +300,34 @@ def decide_confetti(book: Book, coins: List[Coin], now: float) -> List[Action]:
     # Hard stop / trail / locks on every open first (even if coin left the scan list).
     for pos in opens:
         coin = by_coin.get(pos.coin)
+        live_upl = float(getattr(pos, "last_upl", 0) or 0)
         if coin:
             mark_boozy(pos, coin)
-            if stop_hit(pos, coin.mid):
+            from src.runners.rules import LOCKS, mark as ratchet_dollar
+
+            # Dollar floor when green; still call with last_upl so peak_upl tracks.
+            ratchet_dollar(
+                pos,
+                coin,
+                locks=LOCKS,
+                live_upl=live_upl if live_upl > 0 else None,
+            )
+            mid = float(coin.mid or 0)
+            # Ticker mid can lag green while UPL is already deep red (Confetti Q).
+            if live_upl != 0 and pos.entry_px > 0 and abs(float(pos.coin_qty or 0)) > 0:
+                qty = abs(float(pos.coin_qty))
+                if pos.side == "long":
+                    implied = pos.entry_px + live_upl / qty
+                    mid = min(mid, implied) if mid > 0 else implied
+                else:
+                    implied = pos.entry_px - live_upl / qty
+                    mid = max(mid, implied) if mid > 0 else implied
+            if mid > 0 and stop_hit(pos, mid):
                 return [Action("close", pos.coin, pos.side, reason="stop")]
-        elif stop_hit(pos, float(pos.peak_px or pos.entry_px or 0)):
-            # Last resort — hive tick also force-closes off UPL-implied mid.
+        elif (pos.side == "long" and pos.stop_px > pos.entry_px) or (
+            pos.side == "short" and 0 < pos.stop_px < pos.entry_px
+        ):
+            # Locked stop, no quote — still request flatten (hive UPL path too).
             return [Action("close", pos.coin, pos.side, reason="stop")]
 
     # Per-slot exits / pyramid (one action per tick — same as other hive books).

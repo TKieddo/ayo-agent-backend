@@ -142,6 +142,8 @@ class Pos:
     risk_usd: float
     # Peak live exchange UPL ($) — dollar locks trail this, not just % price move.
     peak_upl: float = 0.0
+    # Last exchange UPL ($) — Confetti stop checks use this when ticker mid lags.
+    last_upl: float = 0.0
 
 
 @dataclass

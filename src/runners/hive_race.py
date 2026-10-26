@@ -1077,6 +1077,7 @@ def _pos_from_dict(p: Dict[str, Any]) -> Pos:
         added=bool(p.get("added")),
         risk_usd=float(p.get("risk_usd") or 0),
         peak_upl=float(p.get("peak_upl") or 0),
+        last_upl=float(p.get("last_upl") or p.get("upl") or 0),
     )
 
 
@@ -1093,6 +1094,7 @@ def _pos_to_dict(p: Pos, live_upl: Optional[float] = None) -> dict:
         "added": p.added,
         "risk_usd": p.risk_usd,
         "peak_upl": round(float(getattr(p, "peak_upl", 0) or 0), 4),
+        "last_upl": round(float(getattr(p, "last_upl", 0) or 0), 4),
     }
     if live_upl is not None:
         row["upl"] = round(float(live_upl), 4)
@@ -1823,6 +1825,7 @@ async def _reconcile_okx(
             added=added,
             risk_usd=risk,
             peak_upl=peak_upl,
+            last_upl=float(live_upl),
         )
         # Trail + profit locks for all hive books (flip runners still exit on signal).
         # If the name dropped off the scan list, still lock off exchange mark.
@@ -1883,22 +1886,15 @@ async def _act(
             return
         idem = f"{runner}:{pos.coin}:{pos.side}"
         fp = _pos_close_fp(runner, pos)
-        # Already booked this exact open → never credit race/DB again (guide spam fix).
-        if fp in _BOOKED_CLOSE_FPS:
-            book.positions = [p for p in book.positions if p.coin != pos.coin]
-            book.sync_primary()
-            logger.info("hive %s skip already-booked close %s fp=%s", runner, pos.coin, fp)
-            return
-        last_close = float(_RECENT_CLOSE_AT.get(idem) or 0)
-        if last_close and now - last_close < _CLOSE_IDEMPOTENCY_S:
-            book.positions = [p for p in book.positions if p.coin != pos.coin]
-            book.sync_primary()
-            logger.info("hive %s skip duplicate close %s (%.0fs ago)", runner, pos.coin, now - last_close)
-            return
+        already_booked = fp in _BOOKED_CLOSE_FPS
+        # Short backoff only — never skip the exchange flatten when a stop is pierced
+        # (Confetti Q sat at −$160 with stop still green because we returned early).
         pending = float(_PENDING_CLOSE_AT.get(idem) or 0)
-        if pending and now - pending < _PENDING_CLOSE_BACKOFF_S:
+        stop_reason = str(action.reason or "") in ("stop", "pump_giveback", "bail")
+        backoff = 8.0 if stop_reason else _PENDING_CLOSE_BACKOFF_S
+        if pending and now - pending < backoff:
             logger.info(
-                "hive %s close backoff %s (%.0fs since failed flatten)",
+                "hive %s close backoff %s (%.0fs)",
                 runner,
                 pos.coin,
                 now - pending,
@@ -1908,12 +1904,13 @@ async def _act(
         live_upl = None
         if live_upl_by_coin and pos.coin in live_upl_by_coin:
             live_upl = float(live_upl_by_coin[pos.coin])
-        # Prefer UPL-implied mid, then quote, then peak — never double-count paper PnL.
+        # Prefer UPL-implied mid — do NOT clamp with mid-sanity on exits (that blocked Q).
         implied = _implied_mid_from_upl(pos, live_upl) if live_upl is not None else None
-        raw_mid = implied if implied and implied > 0 else (coin.mid if coin else pos.peak_px)
-        mid = _sane_mark(pos.entry_px, float(raw_mid or 0), fallback=float(pos.peak_px or pos.entry_px))
-        if implied and implied > 0:
-            mid = implied
+        mid = (
+            implied
+            if implied and implied > 0
+            else float((coin.mid if coin else 0) or pos.peak_px or pos.entry_px or 0)
+        )
         try:
             qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
         except Exception as exc:
@@ -1929,11 +1926,21 @@ async def _act(
             return
         if _exchange_still_open(state, pos.coin):
             _PENDING_CLOSE_AT[idem] = now
+            # Stuck open after a prior "booked" close — clear fingerprint so we keep trying.
+            _BOOKED_CLOSE_FPS.pop(fp, None)
             logger.warning(
-                "hive %s close sent but %s still open on exchange — not booking PnL",
+                "hive %s close sent but %s still open on exchange — retry flatten, not booking",
                 runner,
                 pos.coin,
             )
+            return
+        if already_booked:
+            # Flatten succeeded; race/DB already has this close — don't double-count.
+            _PENDING_CLOSE_AT.pop(idem, None)
+            _RECENT_CLOSE_AT[idem] = now
+            book.positions = [p for p in book.positions if p.coin != pos.coin]
+            book.sync_primary()
+            logger.info("hive %s exchange flattened %s (PnL already booked)", runner, pos.coin)
             return
         pnl = float(live_upl) if live_upl is not None else upl(pos, mid)
         fee = fee_usd(pos.notional)
