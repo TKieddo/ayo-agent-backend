@@ -1903,8 +1903,19 @@ def _sane_mark(entry: float, candidate: float, fallback: float = 0.0) -> float:
 
 
 def _implied_mid_from_upl(pos: Pos, live_upl: float) -> Optional[float]:
-    """Mid implied by exchange UPL — authoritative when ticker mid lags (Confetti APR)."""
-    if pos.entry_px <= 0 or pos.notional <= 0:
+    """Mid implied by exchange UPL — authoritative when ticker mid lags (Confetti APR).
+
+    Prefer coin_qty: Binance ``notional`` is mark×qty, so entry±upl/notional understates
+    the move on big losers and delayed stop detection.
+    """
+    if pos.entry_px <= 0:
+        return None
+    qty = abs(float(pos.coin_qty or 0))
+    if qty > 0:
+        if pos.side == "long":
+            return pos.entry_px + float(live_upl) / qty
+        return pos.entry_px - float(live_upl) / qty
+    if pos.notional <= 0:
         return None
     if pos.side == "long":
         return pos.entry_px * (1.0 + float(live_upl) / pos.notional)
@@ -1919,11 +1930,14 @@ def _stop_closes_from_upl(book: Book, upl_by_coin: Dict[str, float]) -> List[Act
     for pos in book.positions:
         if pos.coin not in upl_by_coin:
             continue
-        mid = _implied_mid_from_upl(pos, float(upl_by_coin[pos.coin]))
+        live_upl = float(upl_by_coin[pos.coin])
+        mid = _implied_mid_from_upl(pos, live_upl)
         if mid is None or mid <= 0:
             continue
-        if stop_hit(pos, mid):
-            out.append(Action("close", pos.coin, pos.side, reason="stop"))
+        # Soft stop OR disaster: blown past ~full $40 race margin.
+        if stop_hit(pos, mid) or live_upl <= -float(ENTRY_MARGIN):
+            reason = "stop" if stop_hit(pos, mid) else "disaster"
+            out.append(Action("close", pos.coin, pos.side, reason=reason))
     return out
 
 
@@ -2109,8 +2123,9 @@ async def _act(
         # Short backoff only — never skip the exchange flatten when a stop is pierced
         # (Confetti Q sat at −$160 with stop still green because we returned early).
         pending = float(_PENDING_CLOSE_AT.get(idem) or 0)
-        stop_reason = str(action.reason or "") in ("stop", "pump_giveback", "bail")
-        backoff = 8.0 if stop_reason else _PENDING_CLOSE_BACKOFF_S
+        stop_reason = str(action.reason or "") in ("stop", "pump_giveback", "bail", "disaster")
+        # Pierced stops must retry every mark — 8–45s backoff let Confetti Q bleed to −$250.
+        backoff = 1.5 if stop_reason else _PENDING_CLOSE_BACKOFF_S
         if pending and now - pending < backoff:
             logger.info(
                 "hive %s close backoff %s (%.0fs)",
@@ -2134,6 +2149,9 @@ async def _act(
             qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
         except Exception as exc:
             _PENDING_CLOSE_AT[idem] = now
+            raw = _STATE["runners"].get(runner) or {}
+            raw["error"] = f"close {pos.coin}: {exc}"[:240]
+            _STATE["runners"][runner] = raw
             logger.warning("hive %s close order failed %s: %s", runner, pos.coin, exc)
             return
         # Confirm exchange flattened before booking PnL into race ledger / Supabase.
@@ -2150,6 +2168,9 @@ async def _act(
             _PENDING_CLOSE_AT[idem] = now
             # Stuck open after a prior "booked" close — clear fingerprint so we keep trying.
             _BOOKED_CLOSE_FPS.pop(fp, None)
+            raw = _STATE["runners"].get(runner) or {}
+            raw["error"] = f"close sent but {pos.coin} still open — retrying"[:240]
+            _STATE["runners"][runner] = raw
             logger.warning(
                 "hive %s close sent but %s still open on exchange — retry flatten, not booking",
                 runner,
@@ -2388,8 +2409,12 @@ async def _runners_tick(*, decide_entries: bool) -> None:
     now = time.time()
     async with _LOCK:
         _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-        # RUNNERS order: Mayhem before Oppo Mayhem so the pair queue is filled first.
-        for runner in RUNNERS:
+        # Confetti (Binance) first so pierced stops are not starved behind OKX scans.
+        # Then Mayhem before Oppo so the pair queue is filled first.
+        _runner_order = tuple(
+            list(BINANCE_RUNNERS) + [r for r in RUNNERS if r not in BINANCE_RUNNERS]
+        )
+        for runner in _runner_order:
             client = _CLIENTS.get(runner)
             if not client:
                 continue
