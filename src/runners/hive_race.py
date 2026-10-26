@@ -67,6 +67,10 @@ _COIN_CACHE: Dict[str, List[Coin]] = {"okx": [], "pump": [], "bn": []}
 # Mark often enough to bank spikes; decide less often (CPU-friendly on shared VPS).
 HIVE_MARK_SLEEP_S = 8
 HIVE_DECIDE_EVERY = 4  # decide ≈ every 32s
+# Cold universe scans (OKX pine + Binance klines) can hang/rate-limit after Coolify
+# restarts. Never let that block wallet reconcile or stop flatten.
+HIVE_SCAN_TIMEOUT_S = float(os.getenv("HIVE_SCAN_TIMEOUT_S", "75") or 75)
+HIVE_HELD_TIMEOUT_S = float(os.getenv("HIVE_HELD_TIMEOUT_S", "20") or 20)
 # Prevent double-booking the same close into race equity (Oppo/Windward CAP spam).
 # Time window alone was too short — stops re-fired every ~3–5m while the exchange
 # position was still open and booked the same paper UPL again (ENA +16.26 ×14).
@@ -2127,28 +2131,42 @@ async def _refresh_ayo() -> None:
         logger.warning("hive ayo refresh failed: %s", exc)
 
 
-async def _tick(decide: bool = True) -> None:
+async def _refresh_universe_caches() -> Optional[str]:
+    """Rebuild OKX/Binance scan caches. Returns error string if any scan fails/times out."""
     from src.runners.rules import PUMP_RUNNERS
 
-    # Decide ticks rebuild universes; mark-only reuses cache + exchange UPL (cheap).
-    if decide:
-        coins = await asyncio.to_thread(build_coins)
-        _COIN_CACHE["okx"] = coins
-        if any(r in _CLIENTS for r in PUMP_RUNNERS):
-            _COIN_CACHE["pump"] = await asyncio.to_thread(build_pump_coins)
-        if any(r in _CLIENTS for r in BINANCE_RUNNERS):
-            _COIN_CACHE["bn"] = await asyncio.to_thread(build_binance_coins)
+    errors: List[str] = []
+    timeout = max(15.0, HIVE_SCAN_TIMEOUT_S)
+
+    async def _one(label: str, fn) -> None:
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(fn), timeout=timeout)
+            _COIN_CACHE[label] = result
+        except asyncio.TimeoutError:
+            errors.append(f"{label} scan timeout {timeout:.0f}s")
+            logger.warning("hive %s scan timed out after %.0fs", label, timeout)
+        except Exception as exc:
+            errors.append(f"{label} scan: {exc}")
+            logger.warning("hive %s scan failed: %s", label, exc)
+
+    await _one("okx", build_coins)
+    if any(r in _CLIENTS for r in PUMP_RUNNERS):
+        await _one("pump", build_pump_coins)
+    if any(r in _CLIENTS for r in BINANCE_RUNNERS):
+        await _one("bn", build_binance_coins)
+    return "; ".join(errors)[:240] if errors else None
+
+
+async def _runners_tick(*, decide_entries: bool) -> None:
+    """Reconcile wallets + honor stops; optionally take new decide entries."""
+    from src.runners.rules import PUMP_RUNNERS
+
     coins = list(_COIN_CACHE.get("okx") or [])
     pump_coins = list(_COIN_CACHE.get("pump") or [])
     bn_coins = list(_COIN_CACHE.get("bn") or [])
     now = time.time()
-    if decide:
-        await _refresh_ayo()
     async with _LOCK:
-        if decide:
-            _STATE["market_coins"] = len(coins)
         _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-        _STATE["last_error"] = None
         # RUNNERS order: Mayhem before Oppo Mayhem so the pair queue is filled first.
         for runner in RUNNERS:
             client = _CLIENTS.get(runner)
@@ -2170,17 +2188,23 @@ async def _tick(decide: bool = True) -> None:
                 else:
                     runner_coins = coins
                 # Candle re-fetch for held names only on decide (mark uses UPL-implied mid).
-                if decide and runner not in BINANCE_RUNNERS:
+                if decide_entries and runner not in BINANCE_RUNNERS:
                     held = [p.coin for p in book.positions]
                     if book.position and book.position.coin not in held:
                         held.append(book.position.coin)
                     if held:
-                        runner_coins = await asyncio.to_thread(
-                            ensure_held_coins,
-                            runner_coins,
-                            held,
-                            with_pine=runner not in PUMP_RUNNERS,
-                        )
+                        try:
+                            runner_coins = await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    ensure_held_coins,
+                                    runner_coins,
+                                    held,
+                                    with_pine=runner not in PUMP_RUNNERS,
+                                ),
+                                timeout=max(5.0, HIVE_HELD_TIMEOUT_S),
+                            )
+                        except Exception as exc:
+                            logger.warning("hive %s held-coin refresh skipped: %s", runner, exc)
                 prev_wallet = float(wallet_eq or 0)
                 upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                     book, client, runner_coins, now, runner=runner
@@ -2189,7 +2213,6 @@ async def _tick(decide: bool = True) -> None:
                 if (not wallet_eq or wallet_eq <= 0) and prev_wallet > 0:
                     wallet_eq = prev_wallet
                 # Every tick (mark + decide): honor locked stops off live UPL mid.
-                # Mark-only used to skip decide → APR stayed open after piercing keep-75%.
                 stop_acts = _stop_closes_from_upl(book, upl_by_coin)
                 if stop_acts:
                     for action in _dedupe_actions(stop_acts):
@@ -2206,7 +2229,7 @@ async def _tick(decide: bool = True) -> None:
                     upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                         book, client, runner_coins, now, runner=runner
                     )
-                if decide:
+                if decide_entries:
                     _roll_day(book, now)
                     book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
                     actions: List[Action] = []
@@ -2299,6 +2322,29 @@ async def _tick(decide: bool = True) -> None:
             )
             _STATE["runners"][runner] = stored
         _save()
+
+
+async def _tick(decide: bool = True) -> None:
+    now = time.time()
+    # Heartbeat immediately so Coolify/ops never see a forever-stale race after restart.
+    async with _LOCK:
+        _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+
+    # Mark/stops FIRST off cached (or empty) universes — exchange UPL does not need a scan.
+    # Cold decide scans used to run first and hang the whole loop (wallets None, stops dead).
+    await _runners_tick(decide_entries=False)
+
+    if not decide:
+        return
+
+    scan_err = await _refresh_universe_caches()
+    await _refresh_ayo()
+    async with _LOCK:
+        _STATE["market_coins"] = len(_COIN_CACHE.get("okx") or [])
+        _STATE["last_error"] = scan_err
+        _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+
+    await _runners_tick(decide_entries=True)
 
 
 def snapshot() -> dict:
@@ -2452,7 +2498,9 @@ async def start_hive_race() -> None:
     while True:
         try:
             mark_n += 1
-            await _tick(decide=(mark_n % HIVE_DECIDE_EVERY == 1))
+            # Skip decide on the first mark so wallets/stops land before a cold scan.
+            do_decide = mark_n > 1 and (mark_n % HIVE_DECIDE_EVERY == 1)
+            await _tick(decide=do_decide)
         except Exception as exc:
             _STATE["last_error"] = str(exc)
             logger.warning("hive race tick failed: %s", exc)
