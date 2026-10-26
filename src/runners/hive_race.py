@@ -1599,19 +1599,19 @@ async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
                     state = await client.get_user_state()
                     for p in state.get("positions") or []:
                         coin = str(p.get("coin") or p.get("symbol") or "").upper()
-                        coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "")
-                        qty = abs(float(p.get("quantity") or p.get("szi") or 0))
+                        coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "").replace("USDT", "")
+                        signed = _signed_pos_size(p)
+                        qty = abs(signed)
                         if not coin or qty <= 0:
                             continue
                         try:
+                            is_long = signed > 0
                             if hasattr(client, "close_position_market"):
-                                await client.close_position_market(coin)
+                                await client.close_position_market(coin, qty, is_long=is_long)
+                            elif is_long:
+                                await client.place_sell_order(coin, qty, leverage=LEVERAGE, reduce_only=True)
                             else:
-                                side = "long" if float(p.get("quantity") or p.get("szi") or 0) > 0 else "short"
-                                if side == "long":
-                                    await client.place_sell_order(coin, qty, leverage=LEVERAGE, reduce_only=True)
-                                else:
-                                    await client.place_buy_order(coin, qty, leverage=LEVERAGE, reduce_only=True)
+                                await client.place_buy_order(coin, qty, leverage=LEVERAGE, reduce_only=True)
                             closed.append(coin)
                         except Exception as exc:
                             errors.append(f"{coin}: {exc}")
@@ -2118,16 +2118,19 @@ async def _refresh_ayo() -> None:
         upl_total = 0.0
         open_count = 0
         for p in positions:
-            try:
-                sz = float(p.get("size") or p.get("szi") or p.get("quantity") or 0)
-            except (TypeError, ValueError):
-                sz = 0.0
+            sz = _signed_pos_size(p)
+            if abs(sz) <= 0:
+                # AYO OKX rows sometimes only expose size=abs — fall back.
+                try:
+                    sz = float(p.get("size") or 0)
+                except (TypeError, ValueError):
+                    sz = 0.0
             if abs(sz) <= 0:
                 continue
             open_count += 1
             side = "long" if sz > 0 else "short"
             coin = str(p.get("coin") or p.get("symbol") or p.get("asset") or "").upper()
-            coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "")
+            coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "").replace("USDT", "")
             entry = float(p.get("entryPx") or p.get("entry_price") or p.get("avgPx") or 0)
             mark = float(p.get("markPrice") or p.get("current_price") or entry)
             notional = abs(float(p.get("notionalUsd") or p.get("notional") or (abs(sz) * (mark or entry or 0))))
