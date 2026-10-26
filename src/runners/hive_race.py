@@ -2124,9 +2124,9 @@ async def _act(
         # (Confetti Q sat at −$160 with stop still green because we returned early).
         pending = float(_PENDING_CLOSE_AT.get(idem) or 0)
         stop_reason = str(action.reason or "") in ("stop", "pump_giveback", "bail", "disaster")
-        # Pierced stops must retry every mark — 8–45s backoff let Confetti Q bleed to −$250.
-        backoff = 1.5 if stop_reason else _PENDING_CLOSE_BACKOFF_S
-        if pending and now - pending < backoff:
+        # Pierced / disaster: no backoff — Confetti Q bled to −$400 while waiting.
+        backoff = 0.0 if stop_reason else _PENDING_CLOSE_BACKOFF_S
+        if pending and backoff > 0 and now - pending < backoff:
             logger.info(
                 "hive %s close backoff %s (%.0fs)",
                 runner,
@@ -2193,6 +2193,7 @@ async def _act(
         _RECENT_CLOSE_AT[idem] = now
         _BOOKED_CLOSE_FPS[fp] = now
         _PENDING_CLOSE_AT.pop(idem, None)
+        _PINNED_EXCHANGE_STOP.pop(f"{runner}:{pos.coin}", None)
         book.positions = [p for p in book.positions if p.coin != pos.coin]
         book.sync_primary()
         row = {
@@ -2225,8 +2226,11 @@ async def _act(
         book.fees_today += fee
         book.trades_today += 1
         book.last_order_at = now
-        book.positions.append(_open_pos(coin, action.side, notional, qty, now, runner=runner))
+        opened = _open_pos(coin, action.side, notional, qty, now, runner=runner)
+        book.positions.append(opened)
         book.sync_primary()
+        if runner in BINANCE_RUNNERS:
+            await _pin_binance_exchange_stop(runner, client, opened, live_mid=coin.mid)
         return
     if action.kind == "add":
         # Pine flip books: no pyramids.
@@ -2257,6 +2261,8 @@ async def _act(
             else:
                 pos.stop_px = min(pos.stop_px, max(fresh, pos.entry_px))
         book.sync_primary()
+        if runner in BINANCE_RUNNERS:
+            await _pin_binance_exchange_stop(runner, client, pos, live_mid=coin.mid)
         return
     if action.kind == "switch":
         # Handled as close+open action lists from decide_actions.
@@ -2399,6 +2405,56 @@ async def _refresh_universe_caches() -> Optional[str]:
     return "; ".join(errors)[:240] if errors else None
 
 
+# Last Binance STOP_MARKET we rested per runner:coin — avoid re-placing every mark.
+_PINNED_EXCHANGE_STOP: Dict[str, float] = {}
+
+
+async def _pin_binance_exchange_stop(
+    runner: str,
+    client: Any,
+    pos: Pos,
+    *,
+    live_mid: Optional[float] = None,
+) -> None:
+    """Rest a real Binance STOP_MARKET at the book stop (normal guide, not a force flatten).
+
+    Skips when the stop is already pierced — software close path handles that.
+    Replaces the resting order only when the locked stop ratchets.
+    """
+    from src.runners.rules import stop_hit
+
+    if runner not in BINANCE_RUNNERS or not hasattr(client, "place_stop_loss"):
+        return
+    sl = float(pos.stop_px or 0)
+    if sl <= 0 or not pos.coin or pos.entry_px <= 0:
+        return
+    if live_mid and live_mid > 0 and stop_hit(pos, live_mid):
+        return
+    key = f"{runner}:{pos.coin}"
+    prev = float(_PINNED_EXCHANGE_STOP.get(key) or 0)
+    if prev > 0 and abs(prev - sl) / pos.entry_px < 0.0015:
+        return
+    try:
+        if hasattr(client, "cancel_all_orders"):
+            try:
+                await asyncio.wait_for(client.cancel_all_orders(pos.coin), timeout=8.0)
+            except Exception:
+                pass
+        await asyncio.wait_for(
+            client.place_stop_loss(
+                pos.coin,
+                is_long=(pos.side == "long"),
+                quantity=float(pos.coin_qty or 0),
+                sl_price=sl,
+            ),
+            timeout=max(8.0, HIVE_EXCHANGE_TIMEOUT_S),
+        )
+        _PINNED_EXCHANGE_STOP[key] = sl
+        logger.info("hive %s exchange STOP_MARKET %s @ %.6f", runner, pos.coin, sl)
+    except Exception as exc:
+        logger.warning("hive %s exchange stop pin failed %s: %s", runner, pos.coin, exc)
+
+
 async def _runners_tick(*, decide_entries: bool) -> None:
     """Reconcile wallets + honor stops; optionally take new decide entries."""
     from src.runners.rules import PUMP_RUNNERS
@@ -2458,6 +2514,16 @@ async def _runners_tick(*, decide_entries: bool) -> None:
                 # Exchange blips sometimes return 0 — keep last good wallet so cards don't flicker.
                 if (not wallet_eq or wallet_eq <= 0) and prev_wallet > 0:
                     wallet_eq = prev_wallet
+                # Binance: keep a real STOP_MARKET on the exchange at the book stop
+                # so guides exist even if the hive loop stalls (software close still runs).
+                if runner in BINANCE_RUNNERS:
+                    for pos in list(book.positions):
+                        mid = _implied_mid_from_upl(
+                            pos, float(upl_by_coin.get(pos.coin, pos.last_upl or 0))
+                        )
+                        await _pin_binance_exchange_stop(
+                            runner, client, pos, live_mid=mid
+                        )
                 # Every tick (mark + decide): honor locked stops off live UPL mid.
                 stop_acts = _stop_closes_from_upl(book, upl_by_coin)
                 if stop_acts:
