@@ -1257,12 +1257,29 @@ def _parse_trade_ts(at: str) -> float:
             return 0.0
 
 
+def _signed_pos_size(p: dict) -> float:
+    """Exchange size with sign (long +, short −).
+
+    Binance get_user_state sets quantity=abs(positionAmt) and keeps the signed
+    value on szi/positionAmt. Preferring quantity first forced every Confetti
+    position to side=long (Q/ORDER/BIRB shorts showed as longs, stops inverted).
+    """
+    for key in ("szi", "positionAmt", "position_amt"):
+        if p.get(key) is None or p.get(key) == "":
+            continue
+        try:
+            return float(p.get(key))
+        except (TypeError, ValueError):
+            continue
+    try:
+        return float(p.get("quantity") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _exchange_still_open(state: dict, coin: str) -> bool:
     for p in state.get("positions") or []:
-        try:
-            sz = abs(float(p.get("quantity") or p.get("szi") or 0))
-        except (TypeError, ValueError):
-            sz = 0.0
+        sz = abs(_signed_pos_size(p))
         if sz <= 0:
             continue
         name = str(p.get("coin") or p.get("symbol") or "").upper()
@@ -1774,14 +1791,11 @@ async def _reconcile_okx(
     upl_by_coin: Dict[str, float] = {}
     positions: List[Pos] = []
     for p in state.get("positions") or []:
-        try:
-            sz = float(p.get("quantity") or p.get("szi") or 0)
-        except (TypeError, ValueError):
-            sz = 0.0
+        sz = _signed_pos_size(p)
         if abs(sz) <= 0:
             continue
         coin = str(p.get("coin") or p.get("symbol") or "").upper()
-        coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "")
+        coin = coin.replace("-USDT-SWAP", "").replace("-USDT", "").replace("USDT", "")
         if not coin:
             continue
         side = "long" if sz > 0 else "short"
@@ -1805,6 +1819,9 @@ async def _reconcile_okx(
                 mark_px = implied
         old = prev.get(coin)
         quote = by_coin.get(coin)
+        # Drop book state if side flipped (Binance abs-qty bug kept shorts as longs).
+        if old and old.side != side:
+            old = None
         if old:
             stop = old.stop_px
             peak = old.peak_px

@@ -141,28 +141,33 @@ class BinanceAPI:
         return None
 
     async def close_position_market(self, asset: str, quantity: float, *, is_long: bool) -> Any:
-        """Flatten a position without futures_exchange_info (that call can hang hive stops)."""
+        """Flatten a position without futures_exchange_info (that call can hang hive stops).
+
+        Always re-read positionAmt so a wrong book side (abs quantity → fake long)
+        cannot sell into an open short.
+        """
         symbol = self._to_futures_symbol(asset)
         qty = abs(float(quantity or 0))
-        if qty <= 0:
-            # Fall back to exchange-reported size.
-            try:
-                positions = await self._retry(
-                    lambda: self.client.futures_position_information(symbol=symbol)
-                )
-                for pos in positions or []:
-                    if pos.get("symbol") != symbol:
-                        continue
-                    amt = abs(float(pos.get("positionAmt", 0) or 0))
-                    if amt > 0:
-                        qty = amt
-                        break
-            except Exception as exc:
-                logger.warning("Binance close size lookup failed for %s: %s", asset, exc)
+        live_long = bool(is_long)
+        try:
+            positions = await self._retry(
+                lambda: self.client.futures_position_information(symbol=symbol)
+            )
+            for pos in positions or []:
+                if pos.get("symbol") != symbol:
+                    continue
+                amt = float(pos.get("positionAmt", 0) or 0)
+                if abs(amt) <= 0:
+                    continue
+                qty = abs(amt)
+                live_long = amt > 0
+                break
+        except Exception as exc:
+            logger.warning("Binance close size lookup failed for %s: %s", asset, exc)
         if qty <= 0:
             return None
 
-        side = "SELL" if is_long else "BUY"
+        side = "SELL" if live_long else "BUY"
         order_params: Dict[str, Any] = {
             "symbol": symbol,
             "side": side,
@@ -180,7 +185,7 @@ class BinanceAPI:
             logger.info(
                 "Closed %s %s qty=%s reduceOnly market (fast path)",
                 asset,
-                "LONG" if is_long else "SHORT",
+                "LONG" if live_long else "SHORT",
                 qty,
             )
             return order
