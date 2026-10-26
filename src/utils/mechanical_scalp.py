@@ -40,16 +40,16 @@ DEFAULTS: Dict[str, Any] = {
     "mech_tp_mode": "roi_percent",
     "mech_take_profit_percent": 15.0,
     "mech_stop_loss_percent": 7.5,
-    # Regime: trade trends; mild chop allowed so we are not dark for days.
-    "mech_adx_min": 16.0,
+    # Regime: real trends on liquid majors (hunter junk was the dark-book cause).
+    "mech_adx_min": 20.0,
     "mech_adx_range_max": 22.0,
     # Range fades are fee-hostile on OKX demo — keep impulse + breakout only.
     "mech_enable_range_mr": False,
     "mech_ema_min_separation_pct": 0.04,
     # Middle-ground ATR band (15m %): move must clear fees; not meme chaos.
-    # DB had 0.55/3.0 + ADX 25 which left AYO dark while hive bots traded.
-    "mech_atr_min_pct": 0.25,
-    "mech_atr_max_pct": 3.5,
+    # Universe quality matters more than ultra-loose ATR — keep a sane band.
+    "mech_atr_min_pct": 0.45,
+    "mech_atr_max_pct": 3.0,
     "mech_atr_stop_mult": 2.0,
     "mech_impulse_rr": 2.0,
     "mech_breakout_rr": 2.0,
