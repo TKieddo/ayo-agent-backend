@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -67,8 +68,17 @@ _COIN_CACHE: Dict[str, List[Coin]] = {"okx": [], "pump": [], "bn": []}
 HIVE_MARK_SLEEP_S = 8
 HIVE_DECIDE_EVERY = 4  # decide ≈ every 32s
 # Prevent double-booking the same close into race equity (Oppo/Windward CAP spam).
+# Time window alone was too short — stops re-fired every ~3–5m while the exchange
+# position was still open and booked the same paper UPL again (ENA +16.26 ×14).
 _RECENT_CLOSE_AT: Dict[str, float] = {}
 _CLOSE_IDEMPOTENCY_S = 180.0
+# Fingerprint of an open that already booked a close (survives Coolify via _save).
+_BOOKED_CLOSE_FPS: Dict[str, float] = {}
+# Last exchange close attempt that did not flatten — backoff before retrying the order.
+_PENDING_CLOSE_AT: Dict[str, float] = {}
+_PENDING_CLOSE_BACKOFF_S = 45.0
+# Collapse historical stop-spam: same coin+side closes within this window → keep first.
+_CLOSE_SPAM_WINDOW_S = 2 * 3600.0
 
 ENV_PREFIX = {
     "mayhem": "MAYHEM",
@@ -1221,6 +1231,58 @@ def _dedupe_actions(actions: List[Action]) -> List[Action]:
     return out
 
 
+def _parse_trade_ts(at: str) -> float:
+    s = str(at or "").strip()
+    if not s:
+        return 0.0
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+
+def _exchange_still_open(state: dict, coin: str) -> bool:
+    for p in state.get("positions") or []:
+        try:
+            sz = abs(float(p.get("quantity") or p.get("szi") or 0))
+        except (TypeError, ValueError):
+            sz = 0.0
+        if sz <= 0:
+            continue
+        name = str(p.get("coin") or p.get("symbol") or "").upper()
+        name = name.replace("-USDT-SWAP", "").replace("-USDT", "").replace("USDT", "")
+        if name == coin.upper():
+            return True
+    return False
+
+
+def _dedupe_close_spam(trades: List[dict]) -> List[dict]:
+    """Keep the first close per coin+side inside a window; drop stop-spam rebooks."""
+    out: List[dict] = []
+    last: Dict[tuple, float] = {}
+    for t in sorted(trades, key=lambda r: str(r.get("at") or "")):
+        key = (str(t.get("coin") or ""), str(t.get("side") or ""))
+        ts = _parse_trade_ts(str(t.get("at") or ""))
+        prev = last.get(key)
+        if prev is not None and ts > 0 and prev > 0 and (ts - prev) < _CLOSE_SPAM_WINDOW_S:
+            continue
+        if key[0]:
+            last[key] = ts if ts > 0 else prev or 0.0
+        out.append(t)
+    return out
+
+
+def _pos_close_fp(runner: str, pos: "Pos") -> str:
+    opened = int(float(getattr(pos, "opened_at", 0) or 0))
+    entry = round(float(getattr(pos, "entry_px", 0) or 0), 6)
+    return f"{runner}:{pos.coin}:{pos.side}:{entry}:{opened}"
+
+
 def _align_runner_to_epoch(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Drop pre-epoch closes and rebuild race equity from the filtered book only.
 
@@ -1228,7 +1290,7 @@ def _align_runner_to_epoch(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(raw, dict):
         return raw
-    trades = _trades_in_epoch(list(raw.get("trades") or []))
+    trades = _dedupe_close_spam(_trades_in_epoch(list(raw.get("trades") or [])))
     raw["trades"] = trades[-80:]
     realized = sum(float(t.get("pnl") or 0) for t in trades)
     # Race ledger only — exchange wallet fields are left alone.
@@ -1255,6 +1317,7 @@ def _align_all_runners_to_epoch() -> None:
 
 
 def _load() -> None:
+    global _BOOKED_CLOSE_FPS
     path = _path()
     if not path.exists():
         return
@@ -1263,6 +1326,9 @@ def _load() -> None:
         _STATE["started_at"] = saved.get("started_at")
         _STATE["race_epoch"] = saved.get("race_epoch") or saved.get("started_at")
         _STATE["runners"] = _migrate_runner_ids(saved.get("runners") or {})
+        fps = saved.get("booked_close_fps") or {}
+        if isinstance(fps, dict):
+            _BOOKED_CLOSE_FPS = {str(k): float(v) for k, v in fps.items() if k}
         _align_all_runners_to_epoch()
     except Exception as exc:
         logger.warning("hive race state unreadable: %s", exc)
@@ -1272,9 +1338,9 @@ def _save() -> None:
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps({k: _STATE[k] for k in ("started_at", "race_epoch", "runners")}, default=str)
-    )
+    payload = {k: _STATE[k] for k in ("started_at", "race_epoch", "runners")}
+    payload["booked_close_fps"] = dict(_BOOKED_CLOSE_FPS)
+    tmp.write_text(json.dumps(payload, default=str))
     tmp.replace(path)
 
 
@@ -1528,6 +1594,9 @@ async def reset_race(*, flatten: bool = True) -> Dict[str, Any]:
         _STATE["race_epoch"] = now_iso
         _STATE["started_at"] = now_iso
         _STATE["last_error"] = None
+        _BOOKED_CLOSE_FPS.clear()
+        _RECENT_CLOSE_AT.clear()
+        _PENDING_CLOSE_AT.clear()
         for runner in RUNNERS:
             prev = _STATE["runners"].get(runner) or {}
             configured = bool(prev.get("configured") or runner in _CLIENTS)
@@ -1806,12 +1875,27 @@ async def _act(
         if not pos:
             return
         idem = f"{runner}:{pos.coin}:{pos.side}"
+        fp = _pos_close_fp(runner, pos)
+        # Already booked this exact open → never credit race/DB again (guide spam fix).
+        if fp in _BOOKED_CLOSE_FPS:
+            book.positions = [p for p in book.positions if p.coin != pos.coin]
+            book.sync_primary()
+            logger.info("hive %s skip already-booked close %s fp=%s", runner, pos.coin, fp)
+            return
         last_close = float(_RECENT_CLOSE_AT.get(idem) or 0)
         if last_close and now - last_close < _CLOSE_IDEMPOTENCY_S:
-            # Already booked this close — keep local book flat, do not add equity again.
             book.positions = [p for p in book.positions if p.coin != pos.coin]
             book.sync_primary()
             logger.info("hive %s skip duplicate close %s (%.0fs ago)", runner, pos.coin, now - last_close)
+            return
+        pending = float(_PENDING_CLOSE_AT.get(idem) or 0)
+        if pending and now - pending < _PENDING_CLOSE_BACKOFF_S:
+            logger.info(
+                "hive %s close backoff %s (%.0fs since failed flatten)",
+                runner,
+                pos.coin,
+                now - pending,
+            )
             return
         coin = by_coin.get(pos.coin)
         live_upl = None
@@ -1823,13 +1907,35 @@ async def _act(
         mid = _sane_mark(pos.entry_px, float(raw_mid or 0), fallback=float(pos.peak_px or pos.entry_px))
         if implied and implied > 0:
             mid = implied
-        qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
+        try:
+            qty = await _order(client, pos.side, pos.coin, pos.notional, mid, True, coin_qty=pos.coin_qty)
+        except Exception as exc:
+            _PENDING_CLOSE_AT[idem] = now
+            logger.warning("hive %s close order failed %s: %s", runner, pos.coin, exc)
+            return
+        # Confirm exchange flattened before booking PnL into race ledger / Supabase.
+        try:
+            state = await client.get_user_state()
+        except Exception as exc:
+            _PENDING_CLOSE_AT[idem] = now
+            logger.warning("hive %s close verify failed %s: %s", runner, pos.coin, exc)
+            return
+        if _exchange_still_open(state, pos.coin):
+            _PENDING_CLOSE_AT[idem] = now
+            logger.warning(
+                "hive %s close sent but %s still open on exchange — not booking PnL",
+                runner,
+                pos.coin,
+            )
+            return
         pnl = float(live_upl) if live_upl is not None else upl(pos, mid)
         fee = fee_usd(pos.notional)
         book.equity += pnl - fee
         book.fees_today += fee
         book.last_order_at = now
         _RECENT_CLOSE_AT[idem] = now
+        _BOOKED_CLOSE_FPS[fp] = now
+        _PENDING_CLOSE_AT.pop(idem, None)
         book.positions = [p for p in book.positions if p.coin != pos.coin]
         book.sync_primary()
         row = {
@@ -1843,7 +1949,8 @@ async def _act(
             "fee": round(fee, 4),
             "coin_qty": qty,
         }
-        trades.append(row)
+        # Guard in-memory list against same-window spam (hydrate may still bring DB junk).
+        trades[:] = _dedupe_close_spam(trades + [row])
         _persist_trade(runner, row)
         return
     if action.kind == "open":
