@@ -230,18 +230,27 @@ def _menu_held(
     direction = 1 if pos.side == "long" else -1
     r1h = coin.ret1h
     upl_r = _upl_r(pos, coin)
-    u = upl(pos, coin.mid)
+    # Prefer exchange UPL — ticker mid often stayed green while Q was already −$160.
+    u = float(getattr(pos, "last_upl", 0) or 0)
+    if u == 0.0:
+        u = upl(pos, coin.mid)
+    # Min-hold blocks chop exits — but not deep red (Q sat through the whole dump).
+    deep_red = u < -min(25.0, max(10.0, 0.04 * float(pos.notional or 0)))
+    can_exit = (not committed) or deep_red
 
-    if not committed:
-        if upl_r >= 1.5:
+    if can_exit:
+        if upl_r is not None and upl_r >= 1.5:
             m["TAKE_PROFIT"] = ("close", pos.coin, pos.side, "take_profit")
         if direction * r1h < 0 or u < 0:
             m["BAIL"] = ("close", pos.coin, pos.side, "bail")
         best = switch_target(pos, top, ranked)
         if best and best.impulse:
             m["SWITCH_COIN"] = ("switch", best.coin.coin, best.impulse, "switch")
-        if pos.side == "long" and coin.ret1h < 0 and coin.oi_chg_1h < 0:
+        # Flip on momentum reverse — don't require OI dump (that blocked most flips).
+        if pos.side == "long" and (coin.ret1h < 0 or u < 0):
             m["FLIP_SHORT"] = ("switch", pos.coin, "short", "flip_short")
+        elif pos.side == "short" and (coin.ret1h > 0 or u < 0):
+            m["FLIP_LONG"] = ("switch", pos.coin, "long", "flip_long")
 
     if (
         not pos.added
@@ -256,14 +265,20 @@ def fallback_decide(
     menu: Dict[str, Tuple[str, Optional[str], Optional[str], str]],
     upl_r: Optional[float],
 ) -> Optional[str]:
-    """jev.ts fallbackDecide priorities — ignores owner rules text."""
+    """Exit / flip before RIDE — old order made FLIP_SHORT dead code (always hit RIDE)."""
     labels = list(menu.keys())
     if not labels:
         return None
     if "TAKE_PROFIT" in menu:
         return "TAKE_PROFIT"
-    if "BAIL" in menu and upl_r is not None and upl_r < 0:
+    if "BAIL" in menu and (upl_r is None or upl_r < 0):
         return "BAIL"
+    if "FLIP_SHORT" in menu:
+        return "FLIP_SHORT"
+    if "FLIP_LONG" in menu:
+        return "FLIP_LONG"
+    if "SWITCH_COIN" in menu:
+        return "SWITCH_COIN"
     if "DOUBLE_DOWN" in menu and (upl_r is None or upl_r >= 1.0):
         return "DOUBLE_DOWN"
     for lab in labels:
