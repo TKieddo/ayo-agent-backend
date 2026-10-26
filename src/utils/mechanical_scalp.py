@@ -74,9 +74,9 @@ DEFAULTS: Dict[str, Any] = {
     "mech_universe": "BTC ETH SOL XRP BNB DOGE ADA LINK AVAX DOT LTC NEAR APT SUI INJ FIL ARB OP",
     "mech_impulse_universe": "BTC ETH SOL XRP BNB DOGE LINK AVAX NEAR",
     "mech_active_universe": "",
-    # Pair hunter often injects unlisted/meme names with 0 candles (QNT/PUMP/ORDER).
-    # Static liquid majors are the reliable book; hunter is opt-in.
-    "mech_use_pair_hunter": False,
+    # Hunter ON, but only quality OKX-tradable names (see main.py gate).
+    # Static majors stay as a floor so the book is never empty.
+    "mech_use_pair_hunter": True,
     "mech_stop_buffer_pct": 0.05,
     "mech_min_stop_pct": 0.25,
     "mech_max_stop_pct": 3.5,

@@ -3058,19 +3058,47 @@ def main():
                     for a in (hunted_assets or getattr(run_loop, "_last_hunted_assets", None) or [])
                     if _mech_allowed(str(a))
                 ]
-                # Default OFF — hunter often feeds unlisted memes with 0 OKX candles.
+                # Hunter ranks quality pairs; we keep only OKX-tradable names and
+                # always floor with static majors so the book never goes dark.
                 use_hunter = str(
                     trading_settings.get(
                         "mech_use_pair_hunter",
-                        CONFIG.get("mech_use_pair_hunter", False),
+                        CONFIG.get("mech_use_pair_hunter", True),
                     )
                 ).lower() not in ("0", "false", "no", "off")
+                mech_cfg_probe = mech.resolve_config(trading_settings, CONFIG)
+                floor = mech.liquid_universe(
+                    {**mech_cfg_probe, "mech_active_universe": ""}
+                )
+                quality: list[str] = []
+                _okx = exchange
+                try:
+                    _okx = _ex_for("BTC") or exchange
+                except Exception:
+                    _okx = exchange
                 if use_hunter and hunted_now:
-                    # Only keep names that are on the liquid allowlist (majors).
-                    allow = set(mech.liquid_universe(mech.resolve_config(trading_settings, CONFIG)))
-                    hunted_now = [a for a in hunted_now if a in allow]
-                if use_hunter and hunted_now:
-                    trading_settings["mech_active_universe"] = " ".join(hunted_now)
+                    for sym in hunted_now:
+                        au = str(sym or "").upper()
+                        if not au or not _mech_allowed(au):
+                            continue
+                        try:
+                            if (
+                                _okx is not None
+                                and hasattr(_okx, "is_usdt_swap_tradable")
+                                and not _okx.is_usdt_swap_tradable(au)
+                            ):
+                                continue
+                        except Exception:
+                            continue
+                        if au not in quality:
+                            quality.append(au)
+                # Floor majors first (reliable candles), then hunter quality overlays.
+                merged: list[str] = []
+                for au in list(floor) + quality:
+                    if au and au not in merged and _mech_allowed(au):
+                        merged.append(au)
+                if merged:
+                    trading_settings["mech_active_universe"] = " ".join(merged[:16])
                 else:
                     trading_settings.pop("mech_active_universe", None)
 
@@ -3078,7 +3106,7 @@ def main():
                 if not getattr(run_loop, "_mech_announced", False):
                     network_now, label_now = _venue_network()
                     univ = ", ".join(mech.liquid_universe(mech_cfg)[:8])
-                    src = "hunter" if (use_hunter and hunted_now) else "static"
+                    src = "hunter+majors" if (use_hunter and quality) else "static majors"
                     add_event(
                         f"🤖 MECHANICAL multi-setup on {label_now}: AI parked. "
                         f"{mech.resolve_exit_targets(trading_settings, mech_cfg)['label']}, "
