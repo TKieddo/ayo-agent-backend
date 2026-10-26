@@ -2416,14 +2416,17 @@ async def _pin_binance_exchange_stop(
     *,
     live_mid: Optional[float] = None,
 ) -> None:
-    """Rest a real Binance STOP_MARKET at the book stop (normal guide, not a force flatten).
+    """Rest a real Binance STOP_MARKET at the book stop (normal guide).
 
-    Skips when the stop is already pierced — software close path handles that.
-    Replaces the resting order only when the locked stop ratchets.
+    Skips when already pierced (software close handles that). Uses a lightweight
+    pin API — never futures_exchange_info (that hung the hive lock and left Q open).
     """
     from src.runners.rules import stop_hit
 
-    if runner not in BINANCE_RUNNERS or not hasattr(client, "place_stop_loss"):
+    if runner not in BINANCE_RUNNERS:
+        return
+    pin_fn = getattr(client, "place_protective_stop", None) or getattr(client, "place_stop_loss", None)
+    if not pin_fn:
         return
     sl = float(pos.stop_px or 0)
     if sl <= 0 or not pos.coin or pos.entry_px <= 0:
@@ -2437,18 +2440,29 @@ async def _pin_binance_exchange_stop(
     try:
         if hasattr(client, "cancel_all_orders"):
             try:
-                await asyncio.wait_for(client.cancel_all_orders(pos.coin), timeout=8.0)
+                await asyncio.wait_for(client.cancel_all_orders(pos.coin), timeout=6.0)
             except Exception:
                 pass
-        await asyncio.wait_for(
-            client.place_stop_loss(
-                pos.coin,
-                is_long=(pos.side == "long"),
-                quantity=float(pos.coin_qty or 0),
-                sl_price=sl,
-            ),
-            timeout=max(8.0, HIVE_EXCHANGE_TIMEOUT_S),
-        )
+        if getattr(client, "place_protective_stop", None):
+            await asyncio.wait_for(
+                client.place_protective_stop(
+                    pos.coin,
+                    is_long=(pos.side == "long"),
+                    sl_price=sl,
+                    quantity=float(pos.coin_qty or 0),
+                ),
+                timeout=12.0,
+            )
+        else:
+            await asyncio.wait_for(
+                client.place_stop_loss(
+                    pos.coin,
+                    is_long=(pos.side == "long"),
+                    quantity=float(pos.coin_qty or 0),
+                    sl_price=sl,
+                ),
+                timeout=12.0,
+            )
         _PINNED_EXCHANGE_STOP[key] = sl
         logger.info("hive %s exchange STOP_MARKET %s @ %.6f", runner, pos.coin, sl)
     except Exception as exc:
@@ -2463,191 +2477,191 @@ async def _runners_tick(*, decide_entries: bool) -> None:
     pump_coins = list(_COIN_CACHE.get("pump") or [])
     bn_coins = list(_COIN_CACHE.get("bn") or [])
     now = time.time()
-    async with _LOCK:
-        _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
-        # Confetti (Binance) first so pierced stops are not starved behind OKX scans.
-        # Then Mayhem before Oppo so the pair queue is filled first.
-        _runner_order = tuple(
-            list(BINANCE_RUNNERS) + [r for r in RUNNERS if r not in BINANCE_RUNNERS]
-        )
-        for runner in _runner_order:
-            client = _CLIENTS.get(runner)
-            if not client:
-                continue
-            raw = _STATE["runners"].get(runner) or {}
-            book = _book_from(raw)
-            book.day_key = raw.get("day_key")  # type: ignore[attr-defined]
-            trades = list(raw.get("trades") or [])
-            error = None
-            upl_by_coin: Dict[str, float] = {}
-            live_upl = 0.0
-            wallet_eq = float((_STATE["runners"].get(runner) or {}).get("account_equity") or 0)
-            try:
-                if runner in BINANCE_RUNNERS:
-                    runner_coins = bn_coins
-                elif runner in PUMP_RUNNERS:
-                    runner_coins = pump_coins
-                else:
-                    runner_coins = coins
-                # Candle re-fetch for held names only on decide (mark uses UPL-implied mid).
-                if decide_entries and runner not in BINANCE_RUNNERS:
-                    held = [p.coin for p in book.positions]
-                    if book.position and book.position.coin not in held:
-                        held.append(book.position.coin)
-                    if held:
-                        try:
-                            runner_coins = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    ensure_held_coins,
-                                    runner_coins,
-                                    held,
-                                    with_pine=runner not in PUMP_RUNNERS,
-                                ),
-                                timeout=max(5.0, HIVE_HELD_TIMEOUT_S),
-                            )
-                        except Exception as exc:
-                            logger.warning("hive %s held-coin refresh skipped: %s", runner, exc)
-                prev_wallet = float(wallet_eq or 0)
+    # Never hold _LOCK across exchange I/O. Pinning stops via futures_exchange_info
+    # under the lock froze updated_at and left Confetti Q pierced with no closes.
+    _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    # Confetti (Binance) first so pierced stops are not starved behind OKX scans.
+    _runner_order = tuple(
+        list(BINANCE_RUNNERS) + [r for r in RUNNERS if r not in BINANCE_RUNNERS]
+    )
+    for runner in _runner_order:
+        client = _CLIENTS.get(runner)
+        if not client:
+            continue
+        raw = _STATE["runners"].get(runner) or {}
+        book = _book_from(raw)
+        book.day_key = raw.get("day_key")  # type: ignore[attr-defined]
+        trades = list(raw.get("trades") or [])
+        error = None
+        upl_by_coin: Dict[str, float] = {}
+        live_upl = 0.0
+        wallet_eq = float((_STATE["runners"].get(runner) or {}).get("account_equity") or 0)
+        try:
+            if runner in BINANCE_RUNNERS:
+                runner_coins = bn_coins
+            elif runner in PUMP_RUNNERS:
+                runner_coins = pump_coins
+            else:
+                runner_coins = coins
+            # Candle re-fetch for held names only on decide (mark uses UPL-implied mid).
+            if decide_entries and runner not in BINANCE_RUNNERS:
+                held = [p.coin for p in book.positions]
+                if book.position and book.position.coin not in held:
+                    held.append(book.position.coin)
+                if held:
+                    try:
+                        runner_coins = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                ensure_held_coins,
+                                runner_coins,
+                                held,
+                                with_pine=runner not in PUMP_RUNNERS,
+                            ),
+                            timeout=max(5.0, HIVE_HELD_TIMEOUT_S),
+                        )
+                    except Exception as exc:
+                        logger.warning("hive %s held-coin refresh skipped: %s", runner, exc)
+            prev_wallet = float(wallet_eq or 0)
+            upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
+                book, client, runner_coins, now, runner=runner
+            )
+            # Exchange blips sometimes return 0 — keep last good wallet so cards don't flicker.
+            if (not wallet_eq or wallet_eq <= 0) and prev_wallet > 0:
+                wallet_eq = prev_wallet
+            # Binance: keep a real STOP_MARKET on the exchange at the book stop
+            # so guides exist even if the hive loop stalls (software close still runs).
+            if runner in BINANCE_RUNNERS:
+                for pos in list(book.positions):
+                    mid = _implied_mid_from_upl(
+                        pos, float(upl_by_coin.get(pos.coin, pos.last_upl or 0))
+                    )
+                    await _pin_binance_exchange_stop(
+                        runner, client, pos, live_mid=mid
+                    )
+            # Every tick (mark + decide): honor locked stops off live UPL mid.
+            stop_acts = _stop_closes_from_upl(book, upl_by_coin)
+            if stop_acts:
+                for action in _dedupe_actions(stop_acts):
+                    try:
+                        await asyncio.wait_for(
+                            _act(
+                                runner,
+                                client,
+                                book,
+                                runner_coins,
+                                action,
+                                trades,
+                                now,
+                                live_upl_by_coin=upl_by_coin,
+                            ),
+                            timeout=max(12.0, HIVE_EXCHANGE_TIMEOUT_S + 5),
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "hive %s stop close timed out %s — continuing race loop",
+                            runner,
+                            action.coin,
+                        )
                 upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
                     book, client, runner_coins, now, runner=runner
                 )
-                # Exchange blips sometimes return 0 — keep last good wallet so cards don't flicker.
-                if (not wallet_eq or wallet_eq <= 0) and prev_wallet > 0:
-                    wallet_eq = prev_wallet
-                # Binance: keep a real STOP_MARKET on the exchange at the book stop
-                # so guides exist even if the hive loop stalls (software close still runs).
-                if runner in BINANCE_RUNNERS:
-                    for pos in list(book.positions):
-                        mid = _implied_mid_from_upl(
-                            pos, float(upl_by_coin.get(pos.coin, pos.last_upl or 0))
-                        )
-                        await _pin_binance_exchange_stop(
-                            runner, client, pos, live_mid=mid
-                        )
-                # Every tick (mark + decide): honor locked stops off live UPL mid.
-                stop_acts = _stop_closes_from_upl(book, upl_by_coin)
-                if stop_acts:
-                    for action in _dedupe_actions(stop_acts):
-                        try:
-                            await asyncio.wait_for(
-                                _act(
-                                    runner,
-                                    client,
-                                    book,
-                                    runner_coins,
-                                    action,
-                                    trades,
-                                    now,
-                                    live_upl_by_coin=upl_by_coin,
-                                ),
-                                timeout=max(12.0, HIVE_EXCHANGE_TIMEOUT_S + 5),
-                            )
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                "hive %s stop close timed out %s — continuing race loop",
-                                runner,
-                                action.coin,
-                            )
-                    upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
-                        book, client, runner_coins, now, runner=runner
-                    )
-                if decide_entries:
-                    _roll_day(book, now)
-                    book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
-                    actions: List[Action] = []
-                    # Mayhem SS / Peak Ichimoku / Oppo UT / Windward Pump / Orakelia / Confetti.
-                    _OPPO_PAIR_Q.clear()
-                    _PEAK_PAIR_Q.clear()
-                    # Sanity: only reject insane ADVERSE one-tick jumps (TSLA phantom).
-                    # Never clamp a favorable pump/dump — that blocked IRYS peak locks.
-                    by_coin = {c.coin: c for c in runner_coins}
-                    for pos in book.positions:
-                        c = by_coin.get(pos.coin)
-                        if not c or c.mid <= 0:
-                            continue
-                        # Prefer live UPL mid for stop/trail decisions when available.
-                        if pos.coin in upl_by_coin:
-                            implied = _implied_mid_from_upl(pos, float(upl_by_coin[pos.coin]))
-                            if implied and implied > 0:
-                                c.mid = implied
-                        ref = float(pos.peak_px or pos.entry_px or 0)
-                        if ref <= 0:
-                            continue
-                        move_pct = (c.mid - ref) / ref * 100.0
-                        adverse = (pos.side == "long" and move_pct < -HIVE_MID_SANITY_PCT) or (
-                            pos.side == "short" and move_pct > HIVE_MID_SANITY_PCT
-                        )
-                        if adverse:
-                            c.mid = ref
-                    actions.extend(decide_actions(runner, book, runner_coins, now))
-                    for action in _dedupe_actions(actions):
-                        await _act(
-                            runner,
-                            client,
-                            book,
-                            runner_coins,
-                            action,
-                            trades,
-                            now,
-                            live_upl_by_coin=upl_by_coin,
-                        )
-                    # Re-read exchange after orders so cards show fresh UPL/size.
-                    upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
-                        book, client, runner_coins, now, runner=runner
-                    )
-                # All crypto runners stay live — clear any stale retire / loss_stop caps.
-                if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
-                    book.cap = None
-            except Exception as exc:
-                error = str(exc)
-                logger.warning("hive %s tick failed: %s", runner, exc)
-                wallet_eq = float((_STATE["runners"].get(runner) or {}).get("account_equity") or 0)
-            # Prefer live exchange UPL; fall back to mid mark if reconcile failed.
-            if not upl_by_coin and book.positions:
-                pool = bn_coins if runner in BINANCE_RUNNERS else coins
+            if decide_entries:
+                _roll_day(book, now)
+                book.day_key = time.strftime("%Y-%m-%d", time.gmtime(now))  # type: ignore[attr-defined]
+                actions: List[Action] = []
+                # Mayhem SS / Peak Ichimoku / Oppo UT / Windward Pump / Orakelia / Confetti.
+                _OPPO_PAIR_Q.clear()
+                _PEAK_PAIR_Q.clear()
+                # Sanity: only reject insane ADVERSE one-tick jumps (TSLA phantom).
+                # Never clamp a favorable pump/dump — that blocked IRYS peak locks.
+                by_coin = {c.coin: c for c in runner_coins}
                 for pos in book.positions:
-                    match = next((c for c in pool if c.coin == pos.coin), None)
-                    mid = match.mid if match else pos.entry_px
-                    upl_by_coin[pos.coin] = upl(pos, mid)
-                live_upl = float(sum(upl_by_coin.values()))
-            mtm = book.equity + live_upl
-            _note_dd(book, mtm)
-            stored = _book_to(book, trades, True, error, upl_by_coin)
-            stored["day_key"] = time.strftime("%Y-%m-%d", time.gmtime(now))
-            stored["mtm"] = round(mtm, 4)
-            stored["upl"] = round(live_upl, 4)
-            prev_raw = _STATE["runners"].get(runner) or {}
-            prev_wallet_saved = float(prev_raw.get("account_equity") or 0)
-            if (not wallet_eq or float(wallet_eq) <= 0) and prev_wallet_saved > 0:
-                wallet_eq = prev_wallet_saved
-            stored["account_equity"] = round(float(wallet_eq or 0), 2)
-            # Baseline once per race epoch — never re-arm mid-race (stops gains blinking to 0).
-            start_wallet = prev_raw.get("account_start_equity")
-            if start_wallet is not None and float(start_wallet or 0) > 0:
-                start_wallet = round(float(start_wallet), 2)
-            elif wallet_eq and float(wallet_eq) > 0:
-                start_wallet = round(float(wallet_eq), 2)
-            else:
-                start_wallet = None
-            stored["account_start_equity"] = start_wallet
-            venue = "Binance" if runner in BINANCE_RUNNERS else "OKX"
-            made = None
-            if stored["account_start_equity"] and wallet_eq and float(wallet_eq) > 0:
-                made = float(wallet_eq) - float(stored["account_start_equity"])
-            made_bit = f" · gains {made:+,.0f}" if made is not None else ""
-            wallet_bit = (
-                f" · {venue} ${float(wallet_eq):,.0f}{made_bit}" if wallet_eq and wallet_eq > 0 else ""
-            )
-            stored["note"] = (
-                f"{len(book.positions)}/{MAX_OPENS} open · "
-                f"${ENTRY_MARGIN:.0f} margin · {venue}{wallet_bit}"
-            )
-            _STATE["runners"][runner] = stored
-            # Heartbeat after each runner so a stuck Confetti close cannot freeze updated_at.
-            _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        _save()
-        # Persist epoch + wallet baselines when they first appear (Coolify-safe).
-        _persist_hive_meta()
+                    c = by_coin.get(pos.coin)
+                    if not c or c.mid <= 0:
+                        continue
+                    # Prefer live UPL mid for stop/trail decisions when available.
+                    if pos.coin in upl_by_coin:
+                        implied = _implied_mid_from_upl(pos, float(upl_by_coin[pos.coin]))
+                        if implied and implied > 0:
+                            c.mid = implied
+                    ref = float(pos.peak_px or pos.entry_px or 0)
+                    if ref <= 0:
+                        continue
+                    move_pct = (c.mid - ref) / ref * 100.0
+                    adverse = (pos.side == "long" and move_pct < -HIVE_MID_SANITY_PCT) or (
+                        pos.side == "short" and move_pct > HIVE_MID_SANITY_PCT
+                    )
+                    if adverse:
+                        c.mid = ref
+                actions.extend(decide_actions(runner, book, runner_coins, now))
+                for action in _dedupe_actions(actions):
+                    await _act(
+                        runner,
+                        client,
+                        book,
+                        runner_coins,
+                        action,
+                        trades,
+                        now,
+                        live_upl_by_coin=upl_by_coin,
+                    )
+                # Re-read exchange after orders so cards show fresh UPL/size.
+                upl_by_coin, live_upl, wallet_eq = await _reconcile_okx(
+                    book, client, runner_coins, now, runner=runner
+                )
+            # All crypto runners stay live — clear any stale retire / loss_stop caps.
+            if book.cap in ("retired", "loss_stop", "trade_cap", "fee_budget"):
+                book.cap = None
+        except Exception as exc:
+            error = str(exc)
+            logger.warning("hive %s tick failed: %s", runner, exc)
+            wallet_eq = float((_STATE["runners"].get(runner) or {}).get("account_equity") or 0)
+        # Prefer live exchange UPL; fall back to mid mark if reconcile failed.
+        if not upl_by_coin and book.positions:
+            pool = bn_coins if runner in BINANCE_RUNNERS else coins
+            for pos in book.positions:
+                match = next((c for c in pool if c.coin == pos.coin), None)
+                mid = match.mid if match else pos.entry_px
+                upl_by_coin[pos.coin] = upl(pos, mid)
+            live_upl = float(sum(upl_by_coin.values()))
+        mtm = book.equity + live_upl
+        _note_dd(book, mtm)
+        stored = _book_to(book, trades, True, error, upl_by_coin)
+        stored["day_key"] = time.strftime("%Y-%m-%d", time.gmtime(now))
+        stored["mtm"] = round(mtm, 4)
+        stored["upl"] = round(live_upl, 4)
+        prev_raw = _STATE["runners"].get(runner) or {}
+        prev_wallet_saved = float(prev_raw.get("account_equity") or 0)
+        if (not wallet_eq or float(wallet_eq) <= 0) and prev_wallet_saved > 0:
+            wallet_eq = prev_wallet_saved
+        stored["account_equity"] = round(float(wallet_eq or 0), 2)
+        # Baseline once per race epoch — never re-arm mid-race (stops gains blinking to 0).
+        start_wallet = prev_raw.get("account_start_equity")
+        if start_wallet is not None and float(start_wallet or 0) > 0:
+            start_wallet = round(float(start_wallet), 2)
+        elif wallet_eq and float(wallet_eq) > 0:
+            start_wallet = round(float(wallet_eq), 2)
+        else:
+            start_wallet = None
+        stored["account_start_equity"] = start_wallet
+        venue = "Binance" if runner in BINANCE_RUNNERS else "OKX"
+        made = None
+        if stored["account_start_equity"] and wallet_eq and float(wallet_eq) > 0:
+            made = float(wallet_eq) - float(stored["account_start_equity"])
+        made_bit = f" · gains {made:+,.0f}" if made is not None else ""
+        wallet_bit = (
+            f" · {venue} ${float(wallet_eq):,.0f}{made_bit}" if wallet_eq and wallet_eq > 0 else ""
+        )
+        stored["note"] = (
+            f"{len(book.positions)}/{MAX_OPENS} open · "
+            f"${ENTRY_MARGIN:.0f} margin · {venue}{wallet_bit}"
+        )
+        _STATE["runners"][runner] = stored
+        # Heartbeat after each runner so a stuck Confetti close cannot freeze updated_at.
+        _STATE["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _save()
+    # Persist epoch + wallet baselines when they first appear (Coolify-safe).
+    _persist_hive_meta()
 
 
 async def _tick(decide: bool = True) -> None:

@@ -140,6 +140,42 @@ class BinanceAPI:
             return None
         return None
 
+    async def place_protective_stop(
+        self,
+        asset: str,
+        *,
+        is_long: bool,
+        sl_price: float,
+        quantity: float = 0.0,
+    ) -> Any:
+        """Rest a STOP_MARKET reduce-only without futures_exchange_info (that call hangs hive)."""
+        symbol = self._to_futures_symbol(asset)
+        sl = float(sl_price or 0)
+        if sl <= 0:
+            raise ValueError("sl_price required")
+        # Round lightly — exchange rejects insane precision; avoid full exchangeInfo fetch.
+        sl = float(f"{sl:.8g}")
+        side = "SELL" if is_long else "BUY"
+        position_side = await self._get_active_position_side(symbol)
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_MARKET",
+            "stopPrice": sl,
+            "workingType": "MARK_PRICE",
+            "closePosition": "true",
+        }
+        if position_side:
+            params["positionSide"] = position_side
+        order = await self._retry(lambda: self.client.futures_create_order(**params))
+        logger.info(
+            "Pinned protective STOP_MARKET %s %s @ %s",
+            asset,
+            "LONG" if is_long else "SHORT",
+            sl,
+        )
+        return order
+
     async def close_position_market(self, asset: str, quantity: float, *, is_long: bool) -> Any:
         """Flatten a live futures position.
 
