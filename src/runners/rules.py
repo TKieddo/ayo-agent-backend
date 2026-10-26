@@ -33,7 +33,9 @@ DAILY_LOSS_PCT = 0.08  # retained for metrics only; not used to block
 RETIRE_EQUITY = 120.0  # retained for metrics only; not used to block
 TAKER_FEE = 0.0005
 # Bank open winners: after +X% from entry, ratchet stop to keep K of the run.
-LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
+# Extra rungs on big runners so a +$400 open cannot bleed back near flat
+# before the stop fires (keep most of a 20%+ peak run).
+LOCKS = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75), (15.0, 0.85), (30.0, 0.92))
 # Pump hunter locks — intentionally LOOSER than flip books.
 # IRYS-class: +1700% → retract to +1000% → resume. Keeping 90% of peak would
 # eject on that retract. Keep a rising floor, leave room for violent pullbacks.

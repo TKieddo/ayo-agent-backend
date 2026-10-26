@@ -1864,15 +1864,44 @@ def main():
             mark = _safe_float(p.get("markPrice") or p.get("current_price") or p.get("entryPrice"), 0)
             return qty_abs * mark
 
+        # Crypto mechanical book only — Alpaca stocks must not eat max_positions
+        # (ASML/SMCI/SOXX open → AYO sat idle for days with "3/3 full").
+        _stock_set = {
+            p.strip().upper()
+            for p in str(CONFIG.get("stock_assets") or "").replace(",", " ").split()
+            if p.strip()
+        }
+        _CRYPTO_VENUES = ("okx", "binance", "aster")
+
+        def _is_crypto_pos(p: dict) -> bool:
+            au = str(p.get("symbol") or p.get("coin") or "").upper()
+            if not au or au in _stock_set or _looks_like_forex(au):
+                return False
+            pos_ex = str(p.get("exchange") or "").lower()
+            if pos_ex and pos_ex not in _CRYPTO_VENUES:
+                return False
+            if use_multi_exchange and exchange_manager:
+                mapped = exchange_manager.get_exchange_name_for_asset(au)
+                if mapped and mapped not in _CRYPTO_VENUES:
+                    return False
+            return True
+
+        # Drop stray stock tags from the crypto mech book.
+        for _sym in list(_MECH_STATE.get("managed_assets") or []):
+            if _sym in _stock_set or _looks_like_forex(_sym):
+                _MECH_STATE["managed_assets"].discard(_sym)
+                _MECH_STATE.get("open_trades", {}).pop(_sym, None)
+
+        crypto_positions = [p for p in positions if _is_crypto_pos(p)]
         open_assets = {
             str(p.get("symbol") or p.get("coin") or "").upper()
-            for p in positions
+            for p in crypto_positions
             if abs(_safe_float(p.get("quantity") or p.get("szi"), 0)) > 0 and _pos_notional(p) > dust_cap
         }
         await _mech_reconcile_closed(open_assets)
 
         # Repair open legs when exit targets change (e.g. $2 → 5% ROI).
-        for pos in positions:
+        for pos in crypto_positions:
             asset = str(pos.get("symbol") or pos.get("coin") or "").upper()
             qty = abs(_safe_float(pos.get("quantity") or pos.get("szi"), 0))
             if not asset or qty <= 0:
