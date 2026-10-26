@@ -238,26 +238,50 @@ def _run_atr(pos: Pos, coin: Coin) -> float:
     return direction * (coin.mid - pos.entry_px) / atr
 
 
+def _dollar_keep_frac(peak_u: float) -> float:
+    """Fraction of peak UPL to bank. ≥$300 peak → 95% (≈$440 on a $463 peak)."""
+    if peak_u >= 300:
+        return 0.95
+    if peak_u >= 150:
+        return 0.92
+    return 0.88
+
+
 def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS, live_upl: Optional[float] = None) -> None:
     """Ratchet the stop with the trail and the profit lock. Never loosens it.
 
     Flip books also trail a *dollar* floor off peak exchange UPL so a +$460
     winner locks ~$400+, not a weak price-% stop that only banks ~$200.
     """
+    mid = float(coin.mid or 0)
+    # Reject absurd peak prints (bad mark tick) that would slam stop through the market.
+    if live_upl is not None and pos.entry_px > 0 and abs(float(pos.coin_qty or 0)) > 0:
+        qty_g = abs(float(pos.coin_qty))
+        implied = (
+            pos.entry_px + float(live_upl) / qty_g
+            if pos.side == "long"
+            else pos.entry_px - float(live_upl) / qty_g
+        )
+        if implied > 0:
+            if pos.side == "long" and pos.peak_px > max(pos.entry_px, implied) * 1.15:
+                pos.peak_px = max(pos.entry_px, implied)
+            elif pos.side == "short" and 0 < pos.peak_px < min(pos.entry_px, implied) * 0.85:
+                pos.peak_px = min(pos.entry_px, implied)
+
     if pos.side == "long":
-        if coin.mid > pos.peak_px:
-            pos.peak_px = coin.mid
-    elif coin.mid < pos.peak_px:
-        pos.peak_px = coin.mid
+        if mid > pos.peak_px:
+            pos.peak_px = mid
+    elif mid > 0 and (pos.peak_px <= 0 or mid < pos.peak_px):
+        pos.peak_px = mid
 
     # ATR trail — skip on pump books, and skip once dollar locks are active
     # (ATR hugs price and would block a proper ~90%+ USD floor).
     use_atr_trail = locks is not PUMP_LOCKS and (
         live_upl is None or float(live_upl) < 40
     )
-    if use_atr_trail and coin.atr1h_pct and coin.atr1h_pct > 0:
-        dist = coin.mid * TRAIL_ATR * coin.atr1h_pct / 100
-        trail = coin.mid - dist if pos.side == "long" else coin.mid + dist
+    if use_atr_trail and coin.atr1h_pct and coin.atr1h_pct > 0 and mid > 0:
+        dist = mid * TRAIL_ATR * coin.atr1h_pct / 100
+        trail = mid - dist if pos.side == "long" else mid + dist
         _ratchet(pos, trail)
 
     direction = 1 if pos.side == "long" else -1
@@ -275,7 +299,8 @@ def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS, live_upl: Optional[float] =
             _ratchet(pos, pos.entry_px * (1 + direction * PUMP_FLOOR_KEEP_PCT / 100))
 
     # Dollar lock (flip / momentum books only — pumps keep wider % room).
-    # Uses UPL-implied size so a +$462 open locks ~$400+, with a little bounce room.
+    # Floor is PEAK-based only — never slide down with current UPL (that let
+    # Peak BZ bleed 463 → 401 instead of banking ~95% ≈ $440).
     if locks is PUMP_LOCKS or live_upl is None or pos.entry_px <= 0:
         return
     upl_now = float(live_upl)
@@ -284,16 +309,7 @@ def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS, live_upl: Optional[float] =
     peak_u = float(pos.peak_upl or 0)
     if peak_u < 40 or upl_now <= 0:
         return
-    # Leave a little bounce room: keep 88% → 95% of peak dollars.
-    if peak_u >= 300:
-        keep_u = 0.95
-    elif peak_u >= 150:
-        keep_u = 0.92
-    else:
-        keep_u = 0.88
-    # Never demand more locked $ than ~98% of *current* UPL (would stop out instantly).
-    floor_u = min(peak_u * keep_u, upl_now * 0.98)
-    mid = float(coin.mid or 0)
+    floor_u = peak_u * _dollar_keep_frac(peak_u)
     qty = 0.0
     if pos.side == "long" and mid > pos.entry_px:
         qty = upl_now / (mid - pos.entry_px)
@@ -307,16 +323,23 @@ def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS, live_upl: Optional[float] =
         return
     if pos.side == "long":
         stop_cand = pos.entry_px + floor_u / qty
-        # Must sit below mid so a pullback can hit it.
+        # Rest just under mid at the tip so a 1-tick pause does not eject.
         if mid > 0:
             stop_cand = min(stop_cand, mid * 0.999)
+        if stop_cand > 0:
+            _ratchet(pos, stop_cand)
     else:
         stop_cand = pos.entry_px - floor_u / qty
-        # Must sit above mid so a bounce can hit it.
         if mid > 0:
             stop_cand = max(stop_cand, mid * 1.001)
-    if stop_cand > 0:
-        _ratchet(pos, stop_cand)
+        if stop_cand <= 0:
+            return
+        # Corrupt % locks can leave short stop << mid (already pierced). Repair
+        # up to the dollar floor — normal ratchet only tightens downward.
+        if pos.stop_px <= 0 or pos.stop_px < mid:
+            pos.stop_px = stop_cand
+        else:
+            _ratchet(pos, stop_cand)
 
 
 def _ratchet(pos: Pos, cand: float) -> None:
@@ -523,8 +546,15 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
         mid = coin.mid if coin else pos.peak_px
         if coin:
             # Trail + profit locks for everyone (flip books included — still exit on signal flip).
+            # Pass live exchange UPL so dollar floors (Peak BZ ~$400 lock) arm on decide ticks.
             locks = PUMP_LOCKS if runner in PUMP_RUNNERS else LOCKS
-            mark(pos, coin, locks=locks)
+            live = getattr(pos, "last_upl", None)
+            mark(
+                pos,
+                coin,
+                locks=locks,
+                live_upl=float(live) if live is not None else None,
+            )
             mid = coin.mid
         reason = _exit_reason(runner, pos, coin, mid, book, now)
         if reason:

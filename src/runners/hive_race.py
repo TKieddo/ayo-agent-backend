@@ -1924,7 +1924,7 @@ def _implied_mid_from_upl(pos: Pos, live_upl: float) -> Optional[float]:
 
 def _stop_closes_from_upl(book: Book, upl_by_coin: Dict[str, float]) -> List[Action]:
     """Close any open whose live UPL mid has already pierced the locked stop."""
-    from src.runners.rules import stop_hit
+    from src.runners.rules import _dollar_keep_frac, stop_hit
 
     out: List[Action] = []
     for pos in book.positions:
@@ -1938,6 +1938,14 @@ def _stop_closes_from_upl(book: Book, upl_by_coin: Dict[str, float]) -> List[Act
         if stop_hit(pos, mid) or live_upl <= -float(ENTRY_MARGIN):
             reason = "stop" if stop_hit(pos, mid) else "disaster"
             out.append(Action("close", pos.coin, pos.side, reason=reason))
+            continue
+        # Peak-dollar floor (Peak BZ agreement): once peak UPL ≥ $40, never
+        # give back below keep% of that peak — even if price-stop was corrupt.
+        peak_u = float(getattr(pos, "peak_upl", 0) or 0)
+        if peak_u >= 40.0 and live_upl > 0:
+            floor_u = peak_u * _dollar_keep_frac(peak_u)
+            if live_upl < floor_u:
+                out.append(Action("close", pos.coin, pos.side, reason="dollar_lock"))
     return out
 
 
