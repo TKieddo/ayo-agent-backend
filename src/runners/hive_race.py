@@ -1076,6 +1076,7 @@ def _pos_from_dict(p: Dict[str, Any]) -> Pos:
         peak_px=float(p.get("peak_px") or p["entry_px"]),
         added=bool(p.get("added")),
         risk_usd=float(p.get("risk_usd") or 0),
+        peak_upl=float(p.get("peak_upl") or 0),
     )
 
 
@@ -1091,6 +1092,7 @@ def _pos_to_dict(p: Pos, live_upl: Optional[float] = None) -> dict:
         "peak_px": p.peak_px,
         "added": p.added,
         "risk_usd": p.risk_usd,
+        "peak_upl": round(float(getattr(p, "peak_upl", 0) or 0), 4),
     }
     if live_upl is not None:
         row["upl"] = round(float(live_upl), 4)
@@ -1786,6 +1788,7 @@ async def _reconcile_okx(
             opened_at = old.opened_at
             added = old.added or notional > ENTRY_NOTIONAL * 1.15
             risk = old.risk_usd
+            peak_upl = float(getattr(old, "peak_upl", 0) or 0)
             # Only clear a stop that claims "locked" while peak never left entry
             # (legacy wrong-way trail). Real profit locks are stop past entry with peak run.
             if entry > 0:
@@ -1800,11 +1803,14 @@ async def _reconcile_okx(
             opened_at = now
             added = notional > ENTRY_NOTIONAL * 1.15
             risk = abs(entry - stop) / entry * notional if entry else 0.0
+            peak_upl = 0.0
         # Never let peak sit on the wrong side of entry while UPL is winning.
         if side == "long" and mark_px > peak:
             peak = mark_px
         elif side == "short" and mark_px > 0 and (peak <= 0 or mark_px < peak):
             peak = mark_px
+        if live_upl > peak_upl:
+            peak_upl = live_upl
         row = Pos(
             coin=coin,
             side=side,
@@ -1816,6 +1822,7 @@ async def _reconcile_okx(
             peak_px=peak,
             added=added,
             risk_usd=risk,
+            peak_upl=peak_upl,
         )
         # Trail + profit locks for all hive books (flip runners still exit on signal).
         # If the name dropped off the scan list, still lock off exchange mark.
@@ -1830,7 +1837,7 @@ async def _reconcile_okx(
             else:
                 qmid = float(quote.mid or 0)
                 quote.mid = min(qmid, mark_for_lock) if qmid > 0 else mark_for_lock
-            ratchet_stop(row, quote, locks=locks)
+            ratchet_stop(row, quote, locks=locks, live_upl=live_upl)
         elif mark_for_lock > 0:
             synth = Coin(
                 coin=coin,
@@ -1847,7 +1854,7 @@ async def _reconcile_okx(
                 vol_z=0.0,
                 high24h=mark_for_lock,
             )
-            ratchet_stop(row, synth, locks=locks)
+            ratchet_stop(row, synth, locks=locks, live_upl=live_upl)
         positions.append(row)
 
     positions.sort(key=lambda r: r.notional, reverse=True)

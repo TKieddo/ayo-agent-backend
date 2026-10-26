@@ -140,6 +140,8 @@ class Pos:
     peak_px: float
     added: bool
     risk_usd: float
+    # Peak live exchange UPL ($) — dollar locks trail this, not just % price move.
+    peak_upl: float = 0.0
 
 
 @dataclass
@@ -234,16 +236,23 @@ def _run_atr(pos: Pos, coin: Coin) -> float:
     return direction * (coin.mid - pos.entry_px) / atr
 
 
-def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS) -> None:
-    """Ratchet the stop with the trail and the profit lock. Never loosens it."""
+def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS, live_upl: Optional[float] = None) -> None:
+    """Ratchet the stop with the trail and the profit lock. Never loosens it.
+
+    Flip books also trail a *dollar* floor off peak exchange UPL so a +$460
+    winner locks ~$400+, not a weak price-% stop that only banks ~$200.
+    """
     if pos.side == "long":
         if coin.mid > pos.peak_px:
             pos.peak_px = coin.mid
     elif coin.mid < pos.peak_px:
         pos.peak_px = coin.mid
 
-    # ATR trail — skip on pump books (ATR explodes mid-spike and fights the wide locks).
-    use_atr_trail = locks is not PUMP_LOCKS
+    # ATR trail — skip on pump books, and skip once dollar locks are active
+    # (ATR hugs price and would block a proper ~90%+ USD floor).
+    use_atr_trail = locks is not PUMP_LOCKS and (
+        live_upl is None or float(live_upl) < 40
+    )
     if use_atr_trail and coin.atr1h_pct and coin.atr1h_pct > 0:
         dist = coin.mid * TRAIL_ATR * coin.atr1h_pct / 100
         trail = coin.mid - dist if pos.side == "long" else coin.mid + dist
@@ -262,6 +271,50 @@ def mark(pos: Pos, coin: Coin, locks: tuple = LOCKS) -> None:
         # Pump hard floor: once +25% has printed, never surrender back under +12%.
         if locks is PUMP_LOCKS and gain >= PUMP_FLOOR_AFTER_PCT:
             _ratchet(pos, pos.entry_px * (1 + direction * PUMP_FLOOR_KEEP_PCT / 100))
+
+    # Dollar lock (flip / momentum books only — pumps keep wider % room).
+    # Uses UPL-implied size so a +$462 open locks ~$400+, with a little bounce room.
+    if locks is PUMP_LOCKS or live_upl is None or pos.entry_px <= 0:
+        return
+    upl_now = float(live_upl)
+    if upl_now > float(pos.peak_upl or 0):
+        pos.peak_upl = upl_now
+    peak_u = float(pos.peak_upl or 0)
+    if peak_u < 40 or upl_now <= 0:
+        return
+    # Leave a little bounce room: keep 88% → 95% of peak dollars.
+    if peak_u >= 300:
+        keep_u = 0.95
+    elif peak_u >= 150:
+        keep_u = 0.92
+    else:
+        keep_u = 0.88
+    # Never demand more locked $ than ~98% of *current* UPL (would stop out instantly).
+    floor_u = min(peak_u * keep_u, upl_now * 0.98)
+    mid = float(coin.mid or 0)
+    qty = 0.0
+    if pos.side == "long" and mid > pos.entry_px:
+        qty = upl_now / (mid - pos.entry_px)
+    elif pos.side == "short" and mid < pos.entry_px:
+        qty = upl_now / (pos.entry_px - mid)
+    if qty <= 0:
+        qty = abs(float(pos.coin_qty or 0))
+    if qty <= 0 and pos.notional > 0:
+        qty = abs(pos.notional / pos.entry_px)
+    if qty <= 0:
+        return
+    if pos.side == "long":
+        stop_cand = pos.entry_px + floor_u / qty
+        # Must sit below mid so a pullback can hit it.
+        if mid > 0:
+            stop_cand = min(stop_cand, mid * 0.999)
+    else:
+        stop_cand = pos.entry_px - floor_u / qty
+        # Must sit above mid so a bounce can hit it.
+        if mid > 0:
+            stop_cand = max(stop_cand, mid * 1.001)
+    if stop_cand > 0:
+        _ratchet(pos, stop_cand)
 
 
 def _ratchet(pos: Pos, cand: float) -> None:
