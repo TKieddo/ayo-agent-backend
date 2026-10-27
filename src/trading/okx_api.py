@@ -363,114 +363,167 @@ class OKXAPI:
             }
         return None
 
-    async def close_position_market(self, asset: str) -> Dict[str, Any]:
+    async def close_position_market(self, asset: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         """Fully flatten one SWAP. Prefer OKX close-position (no sz), then reduce-only market.
 
-        Tiny leftover margins ($0.01–$0.50) come from older coin→lot floors / partial
-        ladder fills. close-position closes the whole row; we verify flat afterward.
+        Hive may call ``close_position_market(coin, qty, is_long=...)`` — extra args ignored.
+        Tiny leftover margins (DOT −0.1 / margin $0) come from wrong posSide/mgnMode on
+        close-position or sub-lot scraps after partial algo fills. We try every
+        posSide × mgnMode combo before giving up (hive runners stay flat; AYO was not).
         """
+        _ = args, kwargs
         live = await self.get_swap_position(asset)
         if not live:
             return {"already_flat": True, "asset": asset}
         contracts = float(live["contracts"])
         mode = (live.get("mgn_mode") or self.td_mode or "isolated").lower()
         side = "buy" if live["side"] == "short" or float(live["pos"]) < 0 else "sell"
-        # Use the exchange row's posSide. Config defaults to net and was rejecting
-        # long/short-mode stubs, so close-position never flattened them.
         pos_side = str(live.get("pos_side") or "").lower()
         if pos_side not in ("long", "short", "net"):
             pos_side = self._pos_side_for(side, reduce_only=True) or "net"
 
-        # 1) Official full close — no contract size, so lot flooring cannot leave stubs.
-        close_body: Dict[str, Any] = {
-            "instId": live["inst_id"],
-            "mgnMode": mode,
-            "posSide": pos_side,
-            "autoCxl": True,
-        }
+        pos_sides: List[str] = []
+        for ps in (pos_side, "net", "short" if float(live["pos"]) < 0 else "long", "long", "short"):
+            if ps and ps not in pos_sides:
+                pos_sides.append(ps)
+        modes: List[str] = []
+        for m in (mode, "isolated", "cross"):
+            if m and m not in modes:
+                modes.append(m)
+
         close_err: Optional[str] = None
-        try:
-            result = await self._retry(
-                lambda: self._request("POST", "/api/v5/trade/close-position", json_body=close_body)
-            )
-            row = result[0] if isinstance(result, list) and result else (result or {})
-            if isinstance(row, dict) and str(row.get("sCode") or "0") not in ("0", ""):
-                raise RuntimeError(f"sCode={row.get('sCode')} {row.get('sMsg') or row}")
-            logger.info(
-                "OKX CLOSE-POSITION %s posSide=%s mgnMode=%s contracts=%.8f → %s",
-                asset,
-                pos_side,
-                mode,
-                contracts,
-                row,
-            )
-        except Exception as exc:
-            close_err = str(exc)
-            logger.warning("OKX close-position %s failed (%s); falling back to reduce-only market", asset, exc)
-            row = {}
+        row: Any = {}
 
-        # close-position is async — wait before deciding a stub is still there.
-        still = live
-        for _ in range(6):
-            await asyncio.sleep(0.5)
-            still = await self.get_swap_position(asset)
-            if not still or float(still.get("contracts") or 0) <= 0:
-                still = None
-                break
+        async def _wait_flat(retries: int = 6) -> Optional[Dict[str, Any]]:
+            still_local = live
+            for _ in range(retries):
+                await asyncio.sleep(0.45)
+                still_local = await self.get_swap_position(asset)
+                if not still_local or float(still_local.get("contracts") or 0) <= 0:
+                    return None
+            return still_local
 
-        # 2) Fallback only when the leftover is a legal order size. Sub-lot scraps
-        # cannot be closed with a normal market order.
-        if still and float(still.get("contracts") or 0) > 0:
-            specs = self.get_instrument_specs(asset)
-            min_sz = float(specs.get("min_sz") or specs.get("lot_sz") or 0)
-            leftover_contracts = float(still["contracts"])
-            if min_sz > 0 and leftover_contracts + 1e-12 < min_sz:
-                logger.warning(
-                    "OKX CLOSE %s leftover %.8f contracts is below min size %.8f; close-position err=%s",
-                    asset,
-                    leftover_contracts,
-                    min_sz,
-                    close_err,
-                )
-                out = row if isinstance(row, dict) else {"raw": row}
-                out["closed_contracts"] = contracts
-                out["closed_side"] = live["side"]
-                out["still_open"] = True
-                out["leftover_contracts"] = leftover_contracts
-                return out
-            sz = self._format_contract_sz(leftover_contracts)
-            if float(sz or 0) > 0:
-                body: Dict[str, Any] = {
-                    "instId": still["inst_id"],
-                    "tdMode": (still.get("mgn_mode") or mode).lower(),
-                    "side": "buy" if still["side"] == "short" or float(still["pos"]) < 0 else "sell",
-                    "ordType": "market",
-                    "sz": sz,
-                    "reduceOnly": True,
+        # 1) Official full close — try every posSide × mgnMode (wrong combo = stuck dust).
+        for ps in pos_sides:
+            for mgn in modes:
+                close_body: Dict[str, Any] = {
+                    "instId": live["inst_id"],
+                    "mgnMode": mgn,
+                    "posSide": ps,
+                    "autoCxl": True,
                 }
-                fallback_side = body["side"]
-                ps = str(still.get("pos_side") or pos_side or "").lower()
-                if ps not in ("long", "short", "net"):
-                    ps = self._pos_side_for(fallback_side, reduce_only=True) or "net"
-                body["posSide"] = ps
                 try:
                     result = await self._retry(
-                        lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
+                        lambda body=close_body: self._request(
+                            "POST", "/api/v5/trade/close-position", json_body=body
+                        )
                     )
                     row = result[0] if isinstance(result, list) and result else (result or {})
+                    if isinstance(row, dict) and str(row.get("sCode") or "0") not in ("0", ""):
+                        raise RuntimeError(f"sCode={row.get('sCode')} {row.get('sMsg') or row}")
                     logger.info(
-                        "OKX CLOSE-FALLBACK %s %s sz=%s contracts=%s ordId=%s",
+                        "OKX CLOSE-POSITION %s posSide=%s mgnMode=%s contracts=%.8f → %s",
                         asset,
-                        fallback_side.upper(),
-                        sz,
-                        still["contracts"],
-                        (row or {}).get("ordId") if isinstance(row, dict) else None,
+                        ps,
+                        mgn,
+                        contracts,
+                        row,
                     )
+                    if await _wait_flat() is None:
+                        out = row if isinstance(row, dict) else {"raw": row}
+                        out["closed_contracts"] = contracts
+                        out["closed_side"] = live["side"]
+                        out["already_flat"] = False
+                        return out
                 except Exception as exc:
-                    logger.warning("OKX close fallback %s failed: %s", asset, exc)
-                    if close_err:
-                        raise RuntimeError(f"close-position: {close_err}; market: {exc}") from exc
-                    raise
+                    close_err = str(exc)
+                    logger.warning(
+                        "OKX close-position %s posSide=%s mgnMode=%s failed: %s",
+                        asset,
+                        ps,
+                        mgn,
+                        exc,
+                    )
+
+        still = await self.get_swap_position(asset)
+        if not still or float(still.get("contracts") or 0) <= 0:
+            out = row if isinstance(row, dict) else {"raw": row}
+            out["closed_contracts"] = contracts
+            out["closed_side"] = live["side"]
+            out["already_flat"] = False
+            return out
+
+        # 2) Reduce-only market for leftovers that meet min size.
+        specs = self.get_instrument_specs(asset)
+        min_sz = float(specs.get("min_sz") or specs.get("lot_sz") or 0)
+        leftover_contracts = float(still["contracts"])
+        if min_sz > 0 and leftover_contracts + 1e-12 < min_sz:
+            # Sub-lot scrap: market order cannot help — one more close-position wave.
+            logger.warning(
+                "OKX CLOSE %s leftover %.8f < minSz %.8f — retrying close-position only",
+                asset,
+                leftover_contracts,
+                min_sz,
+            )
+            for ps in pos_sides:
+                for mgn in modes:
+                    try:
+                        await self._retry(
+                            lambda body={
+                                "instId": still["inst_id"],
+                                "mgnMode": mgn,
+                                "posSide": ps,
+                                "autoCxl": True,
+                            }: self._request("POST", "/api/v5/trade/close-position", json_body=body)
+                        )
+                    except Exception:
+                        continue
+                    if await _wait_flat(4) is None:
+                        out = row if isinstance(row, dict) else {"raw": row}
+                        out["closed_contracts"] = contracts
+                        out["closed_side"] = live["side"]
+                        return out
+            out = row if isinstance(row, dict) else {"raw": row}
+            out["closed_contracts"] = contracts
+            out["closed_side"] = live["side"]
+            out["still_open"] = True
+            out["leftover_contracts"] = leftover_contracts
+            out["close_err"] = close_err
+            return out
+
+        sz = self._format_contract_sz(leftover_contracts)
+        if float(sz or 0) > 0:
+            body: Dict[str, Any] = {
+                "instId": still["inst_id"],
+                "tdMode": (still.get("mgn_mode") or mode).lower(),
+                "side": "buy" if still["side"] == "short" or float(still["pos"]) < 0 else "sell",
+                "ordType": "market",
+                "sz": sz,
+                "reduceOnly": True,
+            }
+            fallback_side = body["side"]
+            ps = str(still.get("pos_side") or pos_side or "").lower()
+            if ps not in ("long", "short", "net"):
+                ps = self._pos_side_for(fallback_side, reduce_only=True) or "net"
+            body["posSide"] = ps
+            try:
+                result = await self._retry(
+                    lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
+                )
+                row = result[0] if isinstance(result, list) and result else (result or {})
+                logger.info(
+                    "OKX CLOSE-FALLBACK %s %s sz=%s contracts=%s ordId=%s",
+                    asset,
+                    fallback_side.upper(),
+                    sz,
+                    still["contracts"],
+                    (row or {}).get("ordId") if isinstance(row, dict) else None,
+                )
+            except Exception as exc:
+                logger.warning("OKX close fallback %s failed: %s", asset, exc)
+                if close_err:
+                    raise RuntimeError(f"close-position: {close_err}; market: {exc}") from exc
+                raise
 
         still = await self.get_swap_position(asset)
         if still and float(still.get("contracts") or 0) > 0:

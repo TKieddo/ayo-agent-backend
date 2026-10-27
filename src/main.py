@@ -1527,9 +1527,14 @@ def main():
         return closed_n
 
     async def _sweep_dust_positions(max_notional: float = None) -> int:
-        """Flatten leftover OKX stubs (~$5) that still count as open slots."""
+        """Flatten leftover OKX stubs (DOT −0.1 / margin $0) hive never leaves behind.
+
+        Hive always opens ~$400 and closes via close-position. AYO partial fills +
+        wrong posSide left sub-lot scraps and micro margins the $8 cap missed (AVAX $0.99).
+        """
         if max_notional is None:
-            max_notional = float(CONFIG.get("position_dust_notional_usd") or 8.0)
+            # Catch micro legs under ~¼ of a normal $60×10 book (~$150 notional).
+            max_notional = float(CONFIG.get("position_dust_notional_usd") or 25.0)
         swept = 0
         now_ts = time.time()
         try:
@@ -1549,14 +1554,30 @@ def main():
             if notional <= 0:
                 mark = _safe_float(pos.get("markPrice") or pos.get("current_price") or pos.get("entryPrice"), 0)
                 notional = qty * mark
-            if notional <= 0 or notional > max_notional:
+            margin = abs(
+                _safe_float(
+                    pos.get("initial_margin")
+                    or pos.get("initialMargin")
+                    or pos.get("margin")
+                    or pos.get("imr"),
+                    0,
+                )
+            )
+            # Real hive/AYO legs use ~$40–$60 margin — never sweep those.
+            if margin >= 15.0 or notional > max(max_notional * 3, 100.0):
+                continue
+            # Dust: tiny notional OR margin rounds to ~$0 (DOT −0.1 / AVAX $0.99).
+            is_dust = (0 < notional <= max_notional) or (qty > 0 and margin < 2.0 and notional <= 50.0)
+            if not is_dust:
                 continue
             until = float(_DUST_SWEEP_UNTIL.get(asset) or 0)
             if until > now_ts:
                 continue
             signed = _safe_float(pos.get("quantity") or pos.get("szi"), 0)
             is_long = signed > 0
-            add_event(f"🧹 Dust sweep {asset}: notional ${notional:.2f} ≤ ${max_notional:.0f} — flattening orphan")
+            add_event(
+                f"🧹 Dust sweep {asset}: notional ${notional:.2f} margin ${margin:.2f} — flattening orphan"
+            )
             ok = await _close_position_reduce_only(
                 asset,
                 is_long,
@@ -1567,9 +1588,8 @@ def main():
                 pnl_usd=_safe_float(pos.get("pnl") or pos.get("unrealized_pnl"), 0),
                 diary_action="close_dust",
             )
-            # Success → long cool-down. Still open → short cool-down so the new
-            # close-position path can retry without spamming every 20s.
-            _DUST_SWEEP_UNTIL[asset] = now_ts + (_DUST_SWEEP_COOLDOWN_S if ok else 5 * 60)
+            # Success → cool-down. Fail → retry in 60s (sub-lot close needs persistence).
+            _DUST_SWEEP_UNTIL[asset] = now_ts + (_DUST_SWEEP_COOLDOWN_S if ok else 60)
             if ok:
                 swept += 1
         return swept
@@ -1781,6 +1801,30 @@ def main():
         exit_style = str(pending.get("exit_style") or (pending.get("metrics") or {}).get("exit_style") or "book")
         if filled_coins <= 0 or avg_px <= 0:
             add_event(f"⚠️  Mechanical {asset}: cannot pin exits ({exit_label}; qty={filled_coins}, px={avg_px})")
+            return
+        # Hive opens full $400 notionals. AYO post-only partials were managed as
+        # $0.99-margin toys (AVAX) that never match book risk — flatten instead.
+        live_notional = float(filled_coins) * float(avg_px)
+        min_notional = max(
+            40.0,
+            float(cfg.get("mech_margin_usd") or 60.0) * max(int(cfg.get("mech_leverage") or 10), 1) * 0.35,
+        )
+        if not repair and live_notional + 1e-9 < min_notional:
+            add_event(
+                f"🧹 Mechanical {asset}: partial fill ${live_notional:.2f} < min ${min_notional:.0f} — "
+                f"flattening (hive-style full size only)"
+            )
+            try:
+                await _close_position_reduce_only(
+                    asset,
+                    is_long,
+                    filled_coins,
+                    f"partial fill ${live_notional:.2f}",
+                    entry_price=avg_px,
+                    diary_action="close_partial_reject",
+                )
+            except Exception as e:
+                add_event(f"⚠️  Mechanical {asset}: could not flatten partial: {e}")
             return
         struct_stop = _safe_float(pending.get("stop"), 0)
         struct_target = _safe_float(pending.get("target"), 0)
