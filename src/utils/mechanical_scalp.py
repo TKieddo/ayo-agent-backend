@@ -41,11 +41,19 @@ DEFAULTS: Dict[str, Any] = {
     "mech_take_profit_percent": 15.0,
     "mech_stop_loss_percent": 7.5,
     # Regime: real trends on liquid majors (hunter junk was the dark-book cause).
-    "mech_adx_min": 20.0,
+    # Slightly higher ADX — AYO was shorting mild "trends" on majors and dying at −$4.
+    "mech_adx_min": 23.0,
     "mech_adx_range_max": 22.0,
+    "mech_di_gap_min": 4.0,
     # Range fades are fee-hostile on OKX demo — keep impulse + breakout only.
     "mech_enable_range_mr": False,
-    "mech_ema_min_separation_pct": 0.04,
+    # Impulse shorts on ETH/XRP/DOT were 0/5 — Confetti/Peak win WITH momentum.
+    # Pullback shorts only via breakout_retest breakdowns.
+    "mech_allow_impulse_shorts": False,
+    # 15m HTF drift must agree (Peak/Confetti: don't fade a still-rising major).
+    "mech_htf_ret_bars": 8,
+    "mech_htf_ret_min_pct": 0.15,
+    "mech_ema_min_separation_pct": 0.08,
     # Middle-ground ATR band (15m %): move must clear fees; not meme chaos.
     # Universe quality matters more than ultra-loose ATR — keep a sane band.
     "mech_atr_min_pct": 0.45,
@@ -89,8 +97,13 @@ DEFAULTS: Dict[str, Any] = {
     "mech_pair_refresh_minutes": 10,
     "mech_min_size_risk_tolerance": 1.25,
     "mech_max_hold_hours": 12.0,
-    "mech_giveback_arm_pct": 3.0,
-    "mech_giveback_pct": 35.0,
+    "mech_giveback_arm_pct": 2.0,
+    "mech_giveback_pct": 40.0,
+    # Peak-style $ locks on open UPL (arm / keep fractions of peak).
+    "mech_dollar_lock_arm": 3.0,
+    "mech_dollar_lock_keep": 0.70,
+    "mech_dollar_lock_arm2": 8.0,
+    "mech_dollar_lock_keep2": 0.85,
     "max_daily_loss_usd": 25.0,
 }
 
@@ -271,12 +284,14 @@ def apply_mechanical_overrides(settings: Dict[str, Any]) -> Dict[str, Any]:
     settings["agent_manage_exits"] = True
     settings["enable_stop_loss_orders"] = True
     settings["take_profit_strict_enforcement"] = True
-    # Keep book TP/SL as primary exits, but don't let winners reverse for hours.
+    # Keep book TP/SL as primary exits; Peak-style giveback protects open winners.
     settings["enable_profit_ladder"] = False
     settings["enable_breakeven_stop"] = True
-    settings["enable_trailing_stop"] = False
+    settings["enable_trailing_stop"] = True
+    settings["trailing_stop_activation_pct"] = 8.0
+    settings["trailing_stop_distance_pct"] = 3.0
     settings["enable_drawdown_protection"] = True
-    settings["max_drawdown_from_peak_pct"] = float(cfg.get("mech_giveback_pct") or 2.5)
+    settings["max_drawdown_from_peak_pct"] = float(cfg.get("mech_giveback_pct") or 40.0)
     settings["drawdown_min_peak_profit_pct"] = float(cfg.get("mech_giveback_arm_pct") or 2.0)
     settings["max_position_hold_hours"] = float(cfg.get("mech_max_hold_hours") or 8.0)
     settings["reentry_cooldown_minutes"] = float(cfg["mech_win_cooldown_minutes"])
@@ -893,6 +908,8 @@ def _try_breakout_retest(
         and h5[confirm_i] >= prior_low * 0.999
         and confirm_close < prior_low
         and confirm_close < confirm_open
+        # Shorts need a clearer DI edge than longs (majors bounce hard).
+        and (minus_di - plus_di) >= float(cfg.get("mech_di_gap_min") or 4.0)
     ):
         side, level = "sell", prior_low
     if side is None:
@@ -986,12 +1003,33 @@ def evaluate(
 
     skips: List[str] = []
     min_sep = float(cfg["mech_ema_min_separation_pct"])
+    di_gap = abs(float(plus_di) - float(minus_di))
+    metrics["di_gap"] = round(di_gap, 2)
+    # HTF drift on 15m closes — same idea as Confetti impulse (ride the move).
+    htf_n = max(2, int(cfg.get("mech_htf_ret_bars") or 8))
+    htf_min = float(cfg.get("mech_htf_ret_min_pct") or 0.15)
+    if len(x15) > htf_n and x15[-1 - htf_n] > 0:
+        htf_ret = (x15[-1] / x15[-1 - htf_n] - 1.0) * 100.0
+    else:
+        htf_ret = 0.0
+    metrics["htf_ret_pct"] = round(htf_ret, 3)
+
     trend_side: Optional[str] = None
-    if adx_val >= float(cfg["mech_adx_min"]):
+    if adx_val >= float(cfg["mech_adx_min"]) and di_gap >= float(cfg.get("mech_di_gap_min") or 0):
         if sep_pct >= min_sep and plus_di > minus_di:
             trend_side = "buy"
         elif sep_pct <= -min_sep and minus_di > plus_di:
             trend_side = "sell"
+
+    if trend_side == "sell" and not bool(cfg.get("mech_allow_impulse_shorts", False)):
+        skips.append("impulse shorts disabled (long-bias)")
+        trend_side = None
+    elif trend_side == "buy" and htf_ret < htf_min:
+        skips.append(f"impulse HTF drift {htf_ret:.2f}% < +{htf_min}%")
+        trend_side = None
+    elif trend_side == "sell" and htf_ret > -htf_min:
+        skips.append(f"impulse HTF drift {htf_ret:.2f}% > −{htf_min}%")
+        trend_side = None
 
     if trend_side:
         fmax = float(cfg["mech_funding_max"])
@@ -1031,8 +1069,16 @@ def evaluate(
         metrics=dict(metrics), last_signal_ts=last_signal_ts, ts5=ts5,
     )
     if isinstance(res, ScalpSignal):
-        return res
-    skips.append(res.reason)
+        # Don't short a major that is still drifting up on 15m (fade trap).
+        if res.side == "sell" and htf_ret > -htf_min:
+            skips.append(f"breakout short blocked HTF {htf_ret:.2f}%")
+        elif res.side == "buy" and htf_ret < htf_min * 0.5:
+            skips.append(f"breakout long soft HTF {htf_ret:.2f}%")
+            # Still allow — breakouts can lead HTF; only hard-block shorts.
+            return res
+        else:
+            return res
+    skips.append(res.reason if isinstance(res, ScalpSkip) else "breakout filtered")
 
     metrics["setup_skips"] = skips[-3:]
     return ScalpSkip(asset, f"no setup ({'; '.join(skips[-2:])})", metrics)

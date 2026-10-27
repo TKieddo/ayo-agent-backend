@@ -1463,7 +1463,30 @@ def main():
 
             reason = None
             diary = "close_stop_loss"
-            if upl <= stop_usd:
+            # Peak-style dollar floor (same lesson as hive Peak BZ): once green,
+            # bank keep% of peak UPL instead of giving it all back to fixed SL.
+            mech_rec = dict(_MECH_STATE.get("open_trades") or {}).get(str(asset).upper()) or {}
+            if mech.is_mechanical_mode(settings) or mech_rec:
+                peak_u = float(mech_rec.get("peak_upl") or 0.0)
+                if upl > peak_u:
+                    peak_u = float(upl)
+                    mech_rec["peak_upl"] = peak_u
+                    _MECH_STATE.setdefault("open_trades", {})[str(asset).upper()] = mech_rec
+                cfg_m = mech.resolve_config(settings, CONFIG)
+                arm1 = float(cfg_m.get("mech_dollar_lock_arm") or 3.0)
+                keep1 = float(cfg_m.get("mech_dollar_lock_keep") or 0.70)
+                arm2 = float(cfg_m.get("mech_dollar_lock_arm2") or 8.0)
+                keep2 = float(cfg_m.get("mech_dollar_lock_keep2") or 0.85)
+                keep = keep2 if peak_u >= arm2 else (keep1 if peak_u >= arm1 else 0.0)
+                if keep > 0 and upl > 0 and upl < peak_u * keep:
+                    reason = (
+                        f"dollar lock ${upl:.2f} < keep {keep:.0%} of peak ${peak_u:.2f}"
+                    )
+                    diary = "close_dollar_lock"
+
+            if reason:
+                pass
+            elif upl <= stop_usd:
                 reason = f"USD stop ${upl:.2f} <= ${stop_usd:.2f}"
             elif roi <= -ui_sl:
                 reason = f"ROI stop {roi:.2f}% <= -{ui_sl:g}%"
