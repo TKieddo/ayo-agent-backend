@@ -1533,8 +1533,7 @@ def main():
         wrong posSide left sub-lot scraps and micro margins the $8 cap missed (AVAX $0.99).
         """
         if max_notional is None:
-            # Catch micro legs under ~¼ of a normal $60×10 book (~$150 notional).
-            max_notional = float(CONFIG.get("position_dust_notional_usd") or 25.0)
+            max_notional = max(30.0, float(CONFIG.get("position_dust_notional_usd") or 30.0))
         swept = 0
         now_ts = time.time()
         try:
@@ -1613,6 +1612,11 @@ def main():
                 )
                 exit_check_s = max(5.0, exit_check_s)
                 n_closed = await _mechanical_exit_sweep(settings)
+                # Drop stale dust cooldowns older than 2m so stubborn stubs keep retrying.
+                now_cd = time.time()
+                for _a, _until in list(_DUST_SWEEP_UNTIL.items()):
+                    if float(_until or 0) > now_cd + 120:
+                        _DUST_SWEEP_UNTIL[_a] = now_cd + 60
                 n_dust = await _sweep_dust_positions()
                 if n_closed or n_dust:
                     add_event(f"⚡ Exit watcher closed {n_closed} position(s), swept {n_dust} dust stub(s)")
@@ -1955,7 +1959,8 @@ def main():
         leverage = int(cfg["mech_leverage"])
         td_mode = "isolated"
 
-        dust_cap = float(CONFIG.get("position_dust_notional_usd") or 8.0)
+        # Same threshold as sweep — never pass the old $8 default (AVAX $9.50 stuck forever).
+        dust_cap = max(30.0, float(CONFIG.get("position_dust_notional_usd") or 30.0))
         await _sweep_dust_positions(dust_cap)
 
         def _pos_notional(p: dict) -> float:
@@ -2670,7 +2675,18 @@ def main():
         last_cache_update = {}  # asset -> timestamp
         pair_hunter_stats_loaded = False
         exit_watcher_task = asyncio.create_task(_exit_watcher_loop())
-        
+        # Boot: clear dust cooldowns and flatten leftovers (DOT −0.1 / AVAX $0.99)
+        # so a redeploy actually cleans the book — do not wait for a manual Close.
+        try:
+            _DUST_SWEEP_UNTIL.clear()
+            n_boot = await _sweep_dust_positions()
+            if n_boot:
+                add_event(f"🧹 Boot dust sweep flattened {n_boot} stub(s)")
+            else:
+                add_event("🧹 Boot dust sweep ran (no stubs closed or already flat)")
+        except Exception as e:
+            logging.warning("Boot dust sweep failed: %s", e)
+
         while True:
             if not pair_hunter_stats_loaded:
                 await _load_pair_hunter_stats()
@@ -6015,6 +6031,36 @@ def main():
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    async def handle_mechanical_sweep_dust(request):
+        """Force-flatten micro/dust stubs now (clears cooldown). Used after redeploy."""
+        try:
+            _DUST_SWEEP_UNTIL.clear()
+            n = await _sweep_dust_positions()
+            # Re-read so response shows what is still stuck.
+            try:
+                st = await hyperliquid.get_user_state()
+                left = []
+                for p in st.get("positions") or []:
+                    au = str(p.get("symbol") or p.get("coin") or "").upper()
+                    qty = abs(_safe_float(p.get("quantity") or p.get("szi"), 0))
+                    if not au or qty <= 0:
+                        continue
+                    notion = abs(_safe_float(p.get("notional") or p.get("notionalUsd"), 0))
+                    if notion <= 0:
+                        notion = qty * _safe_float(
+                            p.get("markPrice") or p.get("current_price") or p.get("entryPrice"), 0
+                        )
+                    left.append({"asset": au, "qty": qty, "notional": round(notion, 4)})
+            except Exception:
+                left = []
+            return web.json_response(
+                {"ok": True, "swept": n, "still_open": left},
+                dumps=lambda o: json.dumps(o, default=json_default),
+            )
+        except Exception as e:
+            logging.error("mechanical sweep-dust failed: %s", e, exc_info=True)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
     async def handle_hive_race(request):
         """Five mechanical demo runners plus the AYO row. No AYO keys are used."""
         try:
@@ -7182,6 +7228,7 @@ def main():
         app.router.add_get('/api/trading-info', handle_trading_info)  # Add trading info endpoint
         app.router.add_get('/api/trades', handle_trades)  # Add trades endpoint
         app.router.add_get('/api/mechanical', handle_mechanical)  # Mechanical scalp book status
+        app.router.add_post('/api/mechanical/sweep-dust', handle_mechanical_sweep_dust)
         app.router.add_get('/api/hive-race', handle_hive_race)
         app.router.add_post('/api/hive-race/reset', handle_hive_race_reset)
         app.router.add_post('/api/test', handle_status)  # Alias for compatibility

@@ -483,6 +483,28 @@ class OKXAPI:
                         out["closed_contracts"] = contracts
                         out["closed_side"] = live["side"]
                         return out
+            # Last resort: reduce-only market at minSz — OKX usually clips to live size.
+            try:
+                sz = self._format_contract_sz(max(min_sz, leftover_contracts))
+                body = {
+                    "instId": still["inst_id"],
+                    "tdMode": (still.get("mgn_mode") or mode).lower(),
+                    "side": "buy" if still["side"] == "short" or float(still["pos"]) < 0 else "sell",
+                    "ordType": "market",
+                    "sz": sz,
+                    "reduceOnly": True,
+                    "posSide": pos_side if pos_side in ("long", "short", "net") else "net",
+                }
+                await self._retry(
+                    lambda: self._request("POST", "/api/v5/trade/order", json_body=body)
+                )
+                if await _wait_flat(4) is None:
+                    out = row if isinstance(row, dict) else {"raw": row}
+                    out["closed_contracts"] = contracts
+                    out["closed_side"] = live["side"]
+                    return out
+            except Exception as exc:
+                logger.warning("OKX sub-min reduceOnly close %s failed: %s", asset, exc)
             out = row if isinstance(row, dict) else {"raw": row}
             out["closed_contracts"] = contracts
             out["closed_side"] = live["side"]
