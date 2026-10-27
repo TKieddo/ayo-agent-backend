@@ -144,6 +144,9 @@ _MECH_STATS = mech.ScalpStats()
 # Prevents AVAX/LINK/NEAR/DOGE stubs from logging a $0 "mechanical" close every poll.
 _DUST_SWEEP_UNTIL: dict[str, float] = {}
 _DUST_SWEEP_COOLDOWN_S = 45 * 60
+# Debounce Telegram "exchange algo fill" EXIT spam (DOT exit=0 / $0 loops).
+_MECH_EXIT_NOTIFY_UNTIL: dict[str, float] = {}
+_MECH_EXIT_NOTIFY_COOLDOWN_S = 30 * 60
 
 # Store original stdout/stderr BEFORE creating handlers (Railway logging fix)
 # This ensures handlers write to the original streams, not redirected ones
@@ -1623,8 +1626,14 @@ def main():
             logging.debug(f"mechanical diary write failed: {e}")
 
     async def _mech_reconcile_closed(open_assets: set) -> None:
-        """A TP/SL algo may have closed a book position on the exchange; book the result."""
+        """A TP/SL algo may have closed a book position on the exchange; book the result.
+
+        ``open_assets`` must include ANY live qty (including dust). Using only
+        notional>$8 made dust stubs look flat → Telegram EXIT spam every cycle
+        with exit=0 / $0 PnL ("exchange algo fill").
+        """
         ex = hyperliquid
+        now_ts = time.time()
         for asset in list(_MECH_STATE["managed_assets"]):
             if asset in open_assets:
                 continue
@@ -1634,6 +1643,9 @@ def main():
             record = _MECH_STATE["open_trades"].get(asset) or next(
                 (tr for tr in active_trades if tr.get("asset") == asset), None
             )
+            # Drop bookkeeping first so a failed notify cannot re-fire next cycle.
+            _MECH_STATE["managed_assets"].discard(asset)
+            _MECH_STATE["open_trades"].pop(asset, None)
             opened_at = None
             if record and record.get("opened_at"):
                 try:
@@ -1666,6 +1678,16 @@ def main():
                     continue
             was_long = bool(record.get("is_long", True)) if record else True
             entry_px = record.get("entry_price") if record else None
+            noop = abs(float(pnl or 0)) < 0.01 and not exit_px
+            if noop:
+                logging.info(
+                    "Skip noop exchange-algo reconcile for %s (no fill / $0) — no Telegram",
+                    asset,
+                )
+                for tr in active_trades[:]:
+                    if tr.get("asset") == asset:
+                        active_trades.remove(tr)
+                continue
             add_event(f"🧾 Mechanical {asset} closed on exchange (algo TP/SL) — realised ${pnl:.2f}, fees ${fee:.2f}")
             for tr in active_trades[:]:
                 if tr.get("asset") == asset:
@@ -1683,21 +1705,34 @@ def main():
                 "pnl": round(pnl, 4),
                 "fee": round(fee, 4),
             })
-            _MECH_STATE["open_trades"].pop(asset, None)
             try:
                 await _record_pair_hunter_outcome(asset, pnl, 0.0, "close_exchange_algo", was_long=was_long)
             except Exception:
-                _MECH_STATE["managed_assets"].discard(asset)
+                pass
+            # Debounce identical EXIT bubbles (redeploy / dust flicker).
+            until = float(_MECH_EXIT_NOTIFY_UNTIL.get(asset) or 0)
+            if now_ts < until:
+                logging.info("Telegram EXIT %s suppressed (cooldown %.0fs left)", asset, until - now_ts)
+                continue
+            _MECH_EXIT_NOTIFY_UNTIL[asset] = now_ts + _MECH_EXIT_NOTIFY_COOLDOWN_S
             try:
+                size = float(record.get("amount") or 0) if record else 0.0
+                entry_f = float(entry_px or 0) or float(exit_px or 0)
+                exit_f = float(exit_px or 0)
+                pnl_pct = 0.0
+                if entry_f > 0 and exit_f > 0 and size > 0:
+                    pnl_pct = ((exit_f - entry_f) / entry_f) * 100.0
+                    if not was_long:
+                        pnl_pct = -pnl_pct
                 await webhook_notifier.notify_exit(
                     asset=asset,
                     side="LONG" if was_long else "SHORT",
-                    entry_price=float(entry_px or exit_px or 0),
-                    exit_price=float(exit_px or 0),
-                    pnl_percent=0.0,
+                    entry_price=entry_f,
+                    exit_price=exit_f,
+                    pnl_percent=pnl_pct,
                     pnl_usd=pnl,
                     reason="exchange algo fill",
-                    size=float(record.get("amount") or 0) if record else 0.0,
+                    size=size,
                 )
             except Exception:
                 pass
@@ -1916,18 +1951,34 @@ def main():
                 _MECH_STATE.get("open_trades", {}).pop(_sym, None)
 
         crypto_positions = [p for p in positions if _is_crypto_pos(p)]
-        open_assets = {
+        # Any live qty counts as still-open for reconcile (dust included).
+        # Slot / new-entry capacity still ignores dust below dust_cap.
+        still_open_any = {
             str(p.get("symbol") or p.get("coin") or "").upper()
             for p in crypto_positions
-            if abs(_safe_float(p.get("quantity") or p.get("szi"), 0)) > 0 and _pos_notional(p) > dust_cap
+            if abs(_safe_float(p.get("quantity") or p.get("szi"), 0)) > 0
         }
-        await _mech_reconcile_closed(open_assets)
+        open_assets = {
+            au
+            for au in still_open_any
+            if any(
+                str(p.get("symbol") or p.get("coin") or "").upper() == au
+                and _pos_notional(p) > dust_cap
+                for p in crypto_positions
+            )
+        }
+        await _mech_reconcile_closed(still_open_any)
 
         # Repair open legs when exit targets change (e.g. $2 → 5% ROI).
         for pos in crypto_positions:
             asset = str(pos.get("symbol") or pos.get("coin") or "").upper()
             qty = abs(_safe_float(pos.get("quantity") or pos.get("szi"), 0))
             if not asset or qty <= 0:
+                continue
+            # Never re-pin / re-manage dust stubs — that re-armed EXIT spam.
+            if _pos_notional(pos) <= dust_cap:
+                _MECH_STATE["managed_assets"].discard(asset)
+                _MECH_STATE.get("open_trades", {}).pop(asset, None)
                 continue
             rec = _MECH_STATE["open_trades"].get(asset) or {}
             same_tp = abs(float(rec.get("tp_usd") or 0) - tp_usd) < 1e-9
