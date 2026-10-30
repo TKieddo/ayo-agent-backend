@@ -24,6 +24,9 @@ STOP_ATR = 2.5
 TRAIL_ATR = 2.0
 # Cap adverse move ≈ $20 on $400 notional (was 8% ≈ $32, near full $40 margin).
 MAX_STOP_PCT = 5.0
+# Hard dollar floor vs notional — never lose more than ~15% of the $400 slot (~$60).
+# ≈ 15% margin ROI at 10x when price moves ~1.5%; pairs with tighter Peak/Orakelia stops.
+MAX_LOSS_FRAC_NOTIONAL = 0.15
 MIN_HOLD_S = 30 * 60
 TIME_STOP_S = 0  # disabled — crypto 24/7, no position time stops
 COOLDOWN_S = 10 * 60
@@ -59,9 +62,9 @@ SS_ATR_LEN = 14
 SS_RSI_FAST = 25
 SS_RSI_SLOW = 100
 SS_STOP_PCT = 5.0
-# Peak Ichimoku blend.
+# Peak Ichimoku blend — tighter disaster stop (~2% price ≈ 20% of $40 margin @ 10x).
 ICHI_RUNNERS = frozenset({"peaksting"})
-ICHI_STOP_PCT = 5.0
+ICHI_STOP_PCT = 2.0
 # Oppo UT Bot (ATR trail flip; Heikin Ashi off).
 UT_RUNNERS = frozenset({"oppo_mayhem"})
 UT_KEY = 1.0
@@ -75,22 +78,33 @@ MZ_RSI_SMOOTH = 5
 MZ_RSI5_OB = 80
 MZ_RSI5_OS = 20
 MZ_STOP_PCT = 5.0
-# Windward — hunt explosive 1h/24h pumps (IRYS-class), long-only, tight stop + aggressive locks.
-# Own scan (not shared Pine top-20): lower liquidity floor so mid-cap pumps can appear.
+# Windward — hunt explosive 1h/24h pumps (IRYS-class), long-only.
+# Keep pair breadth (low $ vol floor); raise *quality* bars so weak pumps don't enter.
 PUMP_RUNNERS = frozenset({"windward"})
-PUMP_MIN_RET1H = 2.5
-PUMP_MIN_RET24H = 8.0
-PUMP_MIN_VOL_Z = 0.25
+PUMP_MIN_RET1H = 4.0          # was 2.5 — need a real impulse hour
+PUMP_MIN_RET24H = 12.0        # was 8 — trend already in force
+PUMP_MIN_VOL_Z = 0.85         # was 0.25 — volume must actually expand
 PUMP_MIN_VOL_USD = 5_000_000.0
 PUMP_MAX_SPREAD_BP = 12.0
-PUMP_STOP_PCT = 4.0  # ≈ $16 on $400 — leave room for spike, cut hard if wrong
+PUMP_MAX_RSI = 82.0           # skip blow-off tops
+PUMP_STOP_PCT = 3.5           # slightly tighter cut when wrong
+# Orakelia — simple trend + pullback (multi-horizon return proxy for EMA trend).
+# No fade spam: enter dips in an uptrend, exit on stop / trend break only.
+ORA_RUNNERS = frozenset({"orakelia"})
+ORA_STOP_PCT = 2.0
+ORA_MIN_RET24H = 1.5
+ORA_MIN_RET7D = 0.0
+ORA_PULLBACK_RET1H_MIN = -2.0
+ORA_PULLBACK_RET1H_MAX = 0.6
+ORA_RSI_MIN = 35.0
+ORA_RSI_MAX = 62.0
 # Pine flip books: still exit on opposite signal, but NOW trail + profit-lock (no naked ride).
 FLIP_RUNNERS = SS_RUNNERS | ICHI_RUNNERS | UT_RUNNERS
 RUNNERS = ("mayhem", "windward", "orakelia", "peaksting", "oppo_mayhem", "confetti")
 RUNNER_LABELS = {
     "mayhem": "Mayhem · Super Scalper",
     "windward": "Windward · Pump Hunter",
-    "orakelia": "Orakelia",
+    "orakelia": "Orakelia · Trend Pullback",
     "peaksting": "Peak · Ichimoku Hull",
     "oppo_mayhem": "Oppo · UT Bot",
     "confetti": "Confetti · Momentum",
@@ -179,6 +193,8 @@ class Action:
 def stop_pct(coin: Coin, runner: str = "") -> Optional[float]:
     if runner in PUMP_RUNNERS:
         return min(PUMP_STOP_PCT, MAX_STOP_PCT)
+    if runner in ORA_RUNNERS:
+        return min(ORA_STOP_PCT, MAX_STOP_PCT)
     if runner in FLIP_RUNNERS:
         # Disaster stop (tightened) — trail/locks ratchet from here via mark().
         if runner in SS_RUNNERS:
@@ -362,8 +378,17 @@ def _super_scalper(coins: List[Coin]) -> List[Coin]:
 
 
 def _ichi_hull(coins: List[Coin]) -> List[Coin]:
-    """Pine Ichimoku + daily open + Hull MA + Hull-MACD — full signal only."""
-    rows = [c for c in coins if _tradable(c, "peaksting") and c.ichi_side in ("long", "short")]
+    """Pine Ichimoku + Hull — require HTF return to agree with signal side."""
+    rows = []
+    for c in coins:
+        if not _tradable(c, "peaksting") or c.ichi_side not in ("long", "short"):
+            continue
+        # Filter: don't short a still-rising 24h tape / don't long a dumping tape.
+        if c.ichi_side == "long" and c.ret24h < 0:
+            continue
+        if c.ichi_side == "short" and c.ret24h > 0:
+            continue
+        rows.append(c)
     return sorted(rows, key=lambda c: abs(c.ret24h), reverse=True)
 
 
@@ -391,15 +416,22 @@ def pump_score(coin: Coin) -> float:
 
 
 def _pump_hunter(coins: List[Coin]) -> List[Coin]:
-    """Windward: long explosive pumps (strong 1h + 24h + volume attention)."""
+    """Windward: long explosive pumps — breadth kept, quality bars raised.
+
+    Still scans the full mid-cap universe (rare names can appear). Rejects weak
+    1h/24h pops, quiet volume, and RSI blow-offs that were the −$14 epoch bleed.
+    """
     rows = []
     for c in coins:
         if not _pump_liquid(c):
             continue
+        rsi = 50.0 if c.rsi14 is None else float(c.rsi14)
         if (
             c.ret1h >= PUMP_MIN_RET1H
             and c.ret24h >= PUMP_MIN_RET24H
             and float(c.vol_z or 0) >= PUMP_MIN_VOL_Z
+            and rsi <= PUMP_MAX_RSI
+            and float(c.oi_chg_1h or 0) >= -1.0  # avoid pure short-covering dumps
             and stop_pct(c, runner="windward") is not None
         ):
             rows.append(c)
@@ -407,16 +439,28 @@ def _pump_hunter(coins: List[Coin]) -> List[Coin]:
 
 
 def _orakelia(coins: List[Coin], blacklist: Dict[str, bool]) -> List[Coin]:
-    ranked = sorted((c for c in coins if liquid(c)), key=lambda c: c.ret7d, reverse=True)
-    if ranked and ranked[0].vol_z > 0:
-        blacklist.pop(ranked[0].coin, None)
+    """Simple trend + pullback (EMA-style via multi-horizon returns).
+
+    Classic playbook: only long liquid names in a 24h/7d uptrend on a mild 1h
+    dip with RSI mid-range. No fade, no chase. Blacklist cleared when trend heals.
+    """
+    del blacklist  # kept in signature for call-site compat; no longer used to block
     rows = []
-    for c in ranked:
-        if blacklist.get(c.coin):
+    for c in coins:
+        if not liquid(c) or not _tradable(c, "orakelia"):
             continue
-        if c.ret24h > 0 and c.vol_z > 0 and _tradable(c):
-            rows.append(c)
-    return rows
+        rsi = 50.0 if c.rsi14 is None else float(c.rsi14)
+        if c.ret24h < ORA_MIN_RET24H or c.ret7d < ORA_MIN_RET7D:
+            continue
+        if not (ORA_PULLBACK_RET1H_MIN <= c.ret1h <= ORA_PULLBACK_RET1H_MAX):
+            continue
+        if not (ORA_RSI_MIN <= rsi <= ORA_RSI_MAX):
+            continue
+        if float(c.vol_z or 0) < 0:
+            continue
+        rows.append(c)
+    # Prefer stronger 24h trend, then deeper (but valid) pullback.
+    return sorted(rows, key=lambda c: (c.ret24h, -abs(c.ret1h)), reverse=True)
 
 
 def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
@@ -428,7 +472,7 @@ def candidates(runner: str, coins: List[Coin], book: Book) -> List[Coin]:
         return _ut_bot(coins)
     if runner in PUMP_RUNNERS:
         return _pump_hunter(coins)
-    if runner == "orakelia":
+    if runner in ORA_RUNNERS:
         return _orakelia(coins, book.blacklist)
     return []
 
@@ -447,7 +491,7 @@ def _side_for(runner: str, coin: Coin) -> str:
         return coin.ut_side or "long"
     if runner in PUMP_RUNNERS:
         return "long"
-    if runner == "orakelia":
+    if runner in ORA_RUNNERS:
         return "long"
     return impulse(coin) or "long"
 
@@ -470,9 +514,23 @@ def _open_slots(book: Book) -> List[Pos]:
     return []
 
 
+def _live_upl(pos: Pos, mid: float) -> float:
+    live = getattr(pos, "last_upl", None)
+    if live is not None:
+        try:
+            return float(live)
+        except (TypeError, ValueError):
+            pass
+    return float(upl(pos, mid))
+
+
 def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: Book, now: float) -> Optional[str]:
     if stop_hit(pos, mid):
         return "stop"
+    # Hard backstop: never bleed more than ~15% of slot notional (~$60 on $400).
+    notion = float(pos.notional or 0) or ENTRY_NOTIONAL
+    if _live_upl(pos, mid) <= -MAX_LOSS_FRAC_NOTIONAL * notion:
+        return "max_loss"
     hold_s = TIME_STOP_S
     if hold_s > 0 and now - pos.opened_at >= hold_s:
         return "time_stop"
@@ -504,10 +562,12 @@ def _exit_reason(runner: str, pos: Pos, coin: Optional[Coin], mid: float, book: 
         elif coin.ret1h < 0:
             return "pump_fade"
         return None
-    if runner == "orakelia":
-        if coin.ret1h < 0 or coin.vol_z < 0:
-            book.blacklist[pos.coin] = True
-            return "momentum_fade"
+    if runner in ORA_RUNNERS:
+        # Trend break only — mild red 1h is noise on a pullback book.
+        rsi = 50.0 if coin.rsi14 is None else float(coin.rsi14)
+        if coin.ret24h < 0 or coin.ret7d < -2.0 or rsi < 30.0:
+            return "trend_break"
+        return None
     return None
 
 
@@ -576,7 +636,7 @@ def decide_actions(runner: str, book: Book, coins: List[Coin], now: float) -> Li
             and upl(pos, mid) > 0
             and _run_atr(pos, coin) >= 1.5
             and pos.notional + ADD_NOTIONAL <= MAX_SLOT_NOTIONAL + 1e-6
-            and (runner != "orakelia" or coin.ret1h >= 0)
+            and (runner not in ORA_RUNNERS or coin.ret1h >= 0)
             and (runner not in PUMP_RUNNERS or coin.ret1h >= 0)
         ):
             return [Action("add", pos.coin, pos.side, ADD_NOTIONAL, "pyramid")]

@@ -19,6 +19,7 @@ from src.runners.rules import (
     Book,
     Coin,
     ENTRY_NOTIONAL,
+    MAX_LOSS_FRAC_NOTIONAL,
     MAX_OPENS,
     MAX_SLOT_NOTIONAL,
     MAX_STOP_PCT,
@@ -38,10 +39,10 @@ TRAIL_ATR1H = 2.0
 BOOZY_PROFIT_LOCK = ((1.5, 0.4), (3.0, 0.6), (5.0, 0.75))
 
 CONFETTI_RULES = (
-    "Each tick, scan liquid coins for the strongest 7-day gainer, meme coins included, "
-    "and go long it. Add to the position while it keeps making new highs and momentum "
-    "stays positive. Rotate out when a stronger mover appears or momentum flips negative. "
-    "Cut fast on a sharp reversal against the trend, and stay flat when nothing is clearly pumping."
+    "Scan liquid names for clear 24h momentum (long and short). Enter only with a real "
+    "impulse hour and non-dying volume. Ride with ATR trail + profit locks. Bail only on "
+    "a meaningful against-trend hour while underwater (or the 15% notional max-loss floor) — "
+    "not on every tiny red tick. Rotate when a stronger mover appears; stay flat otherwise."
 )
 
 # Hourly #1 streak for SWITCH (bee.top1 in BeeBots engine).
@@ -72,15 +73,17 @@ def atr1h_px(coin: Coin) -> Optional[float]:
 
 
 def impulse_side(coin: Coin) -> Optional[str]:
-    """boozy impulseSide — long and short."""
+    """boozy impulseSide — long and short; slightly stricter than stock BeeBots."""
     r24 = float(coin.ret24h or 0)
     r1 = float(coin.ret1h or 0)
     oi1 = float(coin.oi_chg_1h or 0)
     rsi = 50.0 if coin.rsi14 is None else float(coin.rsi14)
     fz = float(coin.funding_z or 0)
-    if r24 >= 1.5 and r1 >= 0 and oi1 >= 0 and rsi <= 78 and fz <= 1.5:
+    vz = float(coin.vol_z or 0)
+    # Need a real 24h trend + non-negative 1h + volume not dying; skip RSI blow-offs.
+    if r24 >= 2.0 and r1 >= 0.15 and oi1 >= 0 and rsi <= 75 and fz <= 1.2 and vz >= -0.25:
         return "long"
-    if r24 <= -1.5 and r1 < 0 and rsi >= 22:
+    if r24 <= -2.0 and r1 <= -0.15 and rsi >= 25 and vz >= -0.25:
         return "short"
     return None
 
@@ -261,21 +264,27 @@ def _menu_held(
     if u == 0.0:
         u = upl(pos, coin.mid)
     # Min-hold blocks chop exits — but not deep red (Q sat through the whole dump).
-    deep_red = u < -min(25.0, max(10.0, 0.04 * float(pos.notional or 0)))
+    notion = float(pos.notional or 0) or ENTRY_NOTIONAL
+    deep_red = u < -min(25.0, max(10.0, 0.04 * notion))
     can_exit = (not committed) or deep_red
+    # Bail only on real fade: against-side 1h AND underwater, or hard max-loss.
+    # Old `u < 0` alone churned green→red noise into death-by-a-thousand-bails.
+    against = direction * r1h < -0.25
+    max_loss_hit = u <= -MAX_LOSS_FRAC_NOTIONAL * notion
+    bail_ok = max_loss_hit or (against and u < -0.015 * notion) or deep_red
 
     if can_exit:
         if upl_r is not None and upl_r >= 1.5:
             m["TAKE_PROFIT"] = ("close", pos.coin, pos.side, "take_profit")
-        if direction * r1h < 0 or u < 0:
-            m["BAIL"] = ("close", pos.coin, pos.side, "bail")
+        if bail_ok:
+            m["BAIL"] = ("close", pos.coin, pos.side, "bail" if not max_loss_hit else "max_loss")
         best = switch_target(pos, top, ranked)
         if best and best.impulse:
             m["SWITCH_COIN"] = ("switch", best.coin.coin, best.impulse, "switch")
-        # Flip on momentum reverse — don't require OI dump (that blocked most flips).
-        if pos.side == "long" and (coin.ret1h < 0 or u < 0):
+        # Flip only when momentum clearly reversed — not on a tiny red tick.
+        if pos.side == "long" and against and u <= 0:
             m["FLIP_SHORT"] = ("switch", pos.coin, "short", "flip_short")
-        elif pos.side == "short" and (coin.ret1h > 0 or u < 0):
+        elif pos.side == "short" and against and u <= 0:
             m["FLIP_LONG"] = ("switch", pos.coin, "long", "flip_long")
 
     if (
@@ -365,6 +374,9 @@ def decide_confetti(book: Book, coins: List[Coin], now: float) -> List[Action]:
                     mid = max(mid, implied) if mid > 0 else implied
             if mid > 0 and stop_hit(pos, mid):
                 return [Action("close", pos.coin, pos.side, reason="stop")]
+            notion = float(pos.notional or 0) or ENTRY_NOTIONAL
+            if live_upl <= -MAX_LOSS_FRAC_NOTIONAL * notion:
+                return [Action("close", pos.coin, pos.side, reason="max_loss")]
         elif (pos.side == "long" and pos.stop_px > pos.entry_px) or (
             pos.side == "short" and 0 < pos.stop_px < pos.entry_px
         ):

@@ -2131,7 +2131,15 @@ async def _act(
         # Short backoff only — never skip the exchange flatten when a stop is pierced
         # (Confetti Q sat at −$160 with stop still green because we returned early).
         pending = float(_PENDING_CLOSE_AT.get(idem) or 0)
-        stop_reason = str(action.reason or "") in ("stop", "pump_giveback", "bail", "disaster")
+        stop_reason = str(action.reason or "") in (
+            "stop",
+            "pump_giveback",
+            "bail",
+            "disaster",
+            "max_loss",
+            "trend_break",
+            "pump_fade",
+        )
         # Pierced / disaster: no backoff — Confetti Q bled to −$400 while waiting.
         backoff = 0.0 if stop_reason else _PENDING_CLOSE_BACKOFF_S
         if pending and backoff > 0 and now - pending < backoff:
