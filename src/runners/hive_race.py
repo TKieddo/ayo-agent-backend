@@ -29,6 +29,7 @@ from src.runners.rules import (
     ENTRY_MARGIN,
     ENTRY_NOTIONAL,
     LEVERAGE,
+    MAX_LOSS_FRAC_NOTIONAL,
     MAX_OPENS,
     RUNNER_LABELS,
     RUNNERS,
@@ -1858,7 +1859,8 @@ def _open_pos(coin: Coin, side: str, notional: float, qty: float, now: float, ru
 
         stop = boozy_stop_px(side, coin.mid, coin)
     else:
-        pct = stop_pct(coin, runner=runner) or 8.0
+        # Never arm a book stop wider than the 15% notional max-loss floor.
+        pct = min(stop_pct(coin, runner=runner) or 8.0, MAX_LOSS_FRAC_NOTIONAL * 100.0)
         stop = stop_price(side, coin.mid, pct)
         # Momentum ZZ: Pine pivot SL, clamped to disaster max (never wider than MZ_STOP_PCT).
         if runner in MZ_RUNNERS and coin.mz_sl_px and coin.mid > 0:
@@ -1934,10 +1936,18 @@ def _stop_closes_from_upl(book: Book, upl_by_coin: Dict[str, float]) -> List[Act
         mid = _implied_mid_from_upl(pos, live_upl)
         if mid is None or mid <= 0:
             continue
-        # Soft stop OR disaster: blown past ~full $40 race margin.
-        if stop_hit(pos, mid) or live_upl <= -float(ENTRY_MARGIN):
-            reason = "stop" if stop_hit(pos, mid) else "disaster"
-            out.append(Action("close", pos.coin, pos.side, reason=reason))
+        notion = float(pos.notional or 0) or ENTRY_NOTIONAL
+        max_loss = -MAX_LOSS_FRAC_NOTIONAL * notion  # −$60 on a $400 slot
+        margin_blow = -float(ENTRY_MARGIN)  # −$40 race margin
+        # Soft stop, 15% notional floor, or full-margin disaster — every mark tick.
+        if stop_hit(pos, mid):
+            out.append(Action("close", pos.coin, pos.side, reason="stop"))
+            continue
+        if live_upl <= max_loss:
+            out.append(Action("close", pos.coin, pos.side, reason="max_loss"))
+            continue
+        if live_upl <= margin_blow:
+            out.append(Action("close", pos.coin, pos.side, reason="disaster"))
             continue
         # Peak-dollar floor (Peak BZ agreement): once peak UPL ≥ $40, never
         # give back below keep% of that peak — even if price-stop was corrupt.
@@ -2245,8 +2255,8 @@ async def _act(
         opened = _open_pos(coin, action.side, notional, qty, now, runner=runner)
         book.positions.append(opened)
         book.sync_primary()
-        if runner in BINANCE_RUNNERS:
-            await _pin_binance_exchange_stop(runner, client, opened, live_mid=coin.mid)
+        # OKX + Binance: rest a real exchange SL so PEPE-class dumps cannot outrun the loop.
+        await _pin_exchange_stop(runner, client, opened, live_mid=coin.mid)
         return
     if action.kind == "add":
         # Pine flip books: no pyramids.
@@ -2271,14 +2281,14 @@ async def _act(
         pos.added = True
         pct = stop_pct(coin, runner=runner)
         if pct:
+            pct = min(pct, MAX_LOSS_FRAC_NOTIONAL * 100.0)
             fresh = stop_price(pos.side, pos.entry_px, pct)
             if pos.side == "long":
                 pos.stop_px = max(pos.stop_px, min(fresh, pos.entry_px))
             else:
                 pos.stop_px = min(pos.stop_px, max(fresh, pos.entry_px))
         book.sync_primary()
-        if runner in BINANCE_RUNNERS:
-            await _pin_binance_exchange_stop(runner, client, pos, live_mid=coin.mid)
+        await _pin_exchange_stop(runner, client, pos, live_mid=coin.mid)
         return
     if action.kind == "switch":
         # Handled as close+open action lists from decide_actions.
@@ -2421,26 +2431,25 @@ async def _refresh_universe_caches() -> Optional[str]:
     return "; ".join(errors)[:240] if errors else None
 
 
-# Last Binance STOP_MARKET we rested per runner:coin — avoid re-placing every mark.
+# Last exchange SL we rested per runner:coin — avoid re-placing every mark.
 _PINNED_EXCHANGE_STOP: Dict[str, float] = {}
 
 
-async def _pin_binance_exchange_stop(
+async def _pin_exchange_stop(
     runner: str,
     client: Any,
     pos: Pos,
     *,
     live_mid: Optional[float] = None,
 ) -> None:
-    """Rest a real Binance STOP_MARKET at the book stop (normal guide).
+    """Rest a real exchange stop at the book stop (Binance STOP_MARKET / OKX algo SL).
 
-    Skips when already pierced (software close handles that). Uses a lightweight
-    pin API — never futures_exchange_info (that hung the hive lock and left Q open).
+    OKX PEPE-class dumps outran the software loop yesterday (−$70+) because only
+    Confetti pinned an exchange guide. Now every hive book gets one. Skips when
+    already pierced (software close handles that). Never futures_exchange_info.
     """
     from src.runners.rules import stop_hit
 
-    if runner not in BINANCE_RUNNERS:
-        return
     pin_fn = getattr(client, "place_protective_stop", None) or getattr(client, "place_stop_loss", None)
     if not pin_fn:
         return
@@ -2480,9 +2489,13 @@ async def _pin_binance_exchange_stop(
                 timeout=12.0,
             )
         _PINNED_EXCHANGE_STOP[key] = sl
-        logger.info("hive %s exchange STOP_MARKET %s @ %.6f", runner, pos.coin, sl)
+        logger.info("hive %s exchange SL %s @ %.8g", runner, pos.coin, sl)
     except Exception as exc:
         logger.warning("hive %s exchange stop pin failed %s: %s", runner, pos.coin, exc)
+
+
+# Backward-compatible alias (older call sites / hot-reload).
+_pin_binance_exchange_stop = _pin_exchange_stop
 
 
 async def _runners_tick(*, decide_entries: bool) -> None:
@@ -2544,16 +2557,13 @@ async def _runners_tick(*, decide_entries: bool) -> None:
             # Exchange blips sometimes return 0 — keep last good wallet so cards don't flicker.
             if (not wallet_eq or wallet_eq <= 0) and prev_wallet > 0:
                 wallet_eq = prev_wallet
-            # Binance: keep a real STOP_MARKET on the exchange at the book stop
-            # so guides exist even if the hive loop stalls (software close still runs).
-            if runner in BINANCE_RUNNERS:
-                for pos in list(book.positions):
-                    mid = _implied_mid_from_upl(
-                        pos, float(upl_by_coin.get(pos.coin, pos.last_upl or 0))
-                    )
-                    await _pin_binance_exchange_stop(
-                        runner, client, pos, live_mid=mid
-                    )
+            # Keep a real exchange SL (OKX algo / Binance STOP_MARKET) at the book
+            # stop so PEPE-class dumps cannot bleed past software ticks.
+            for pos in list(book.positions):
+                mid = _implied_mid_from_upl(
+                    pos, float(upl_by_coin.get(pos.coin, pos.last_upl or 0))
+                )
+                await _pin_exchange_stop(runner, client, pos, live_mid=mid)
             # Every tick (mark + decide): honor locked stops off live UPL mid.
             stop_acts = _stop_closes_from_upl(book, upl_by_coin)
             if stop_acts:
